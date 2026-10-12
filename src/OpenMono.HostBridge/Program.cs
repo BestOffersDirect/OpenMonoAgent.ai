@@ -43,19 +43,27 @@ if (!string.IsNullOrWhiteSpace(passwordFile))
     }
 }
 
-// ── Sudo opt-in (requirement 2): never granted silently. Explicit flags win;
-// otherwise the installer (--init) or the first run asks once and persists.
-// Non-interactive without an explicit choice fails closed (no sudo).
-bool? allowSudo = options.AllowSudoOverride ?? config.AllowSudo;
+// ── Sudo policy (requirement 2): never granted silently. Explicit per-run
+// flags (--allow-sudo/--no-sudo) win over config. Config default is "ask":
+// every elevation confirms with y/N at run time, and a yes is in-memory only
+// for that one command — it is NEVER persisted. Persisted values only come
+// from an explicit --init answer or `openmono config host.sudo_policy`.
+var sudoPolicy = options.AllowSudoOverride switch
+{
+    true => SudoPolicy.Allow,
+    false => SudoPolicy.Deny,
+    _ => config.SudoPolicy,
+};
 var sudoExplicit = options.AllowSudoOverride.HasValue;
-if (options.Init || allowSudo is null)
+if (options.Init)
 {
     if (interactive)
     {
         if (options.RunAs is null &&
             string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("OPENMONO_HOST_RUN_AS")))
         {
-            Console.Error.Write($"Run host commands as user [{(string.IsNullOrWhiteSpace(runAs) ? HostIdentity.CurrentUser : runAs)}]: ");
+            var shown = string.IsNullOrWhiteSpace(runAs) ? HostIdentity.CurrentUser : runAs;
+            Console.Error.Write($"Run host commands as user [default: {shown}] (Enter=keep, type a username to change): ");
             var typed = Console.ReadLine();
             if (!string.IsNullOrWhiteSpace(typed))
                 runAs = typed.Trim();
@@ -67,48 +75,60 @@ if (options.Init || allowSudo is null)
         }
         if (!sudoExplicit)
         {
-            Console.Error.Write("Allow this sub-agent to use sudo for host commands that need root? [y/N] ");
-            var answer = Console.ReadLine();
-            allowSudo = answer is not null &&
-                (answer.Trim().Equals("y", StringComparison.OrdinalIgnoreCase) ||
-                 answer.Trim().Equals("yes", StringComparison.OrdinalIgnoreCase));
-            sudoExplicit = true;
+            var current = config.AllowSudo ?? "ask";
+            Console.Error.Write(
+                $"Sudo policy for host commands that need root:\n" +
+                $"  ask   = confirm each escalation (y/N per command)\n" +
+                $"  allow = run without asking\n" +
+                $"  deny  = never escalate\n" +
+                $"Choose (a)sk / (l)allow / (d)eny [default: {current}]: ");
+            var answer = (Console.ReadLine() ?? "").Trim().ToLowerInvariant();
+            var mapped = answer switch
+            {
+                "" => current,
+                "ask" or "a" => "ask",
+                "allow" or "l" => "allow",
+                "deny" or "d" => "deny",
+                "y" or "yes" => "allow",   // legacy y/N: yes meant "allow sudo"
+                "n" or "no" => "deny",
+                _ => null,
+            };
+            if (mapped is null)
+            {
+                Console.Error.WriteLine($"[bridge] ERROR: '{answer}' is not a sudo policy (use ask, allow, or deny).");
+                return 1;
+            }
+            config.AllowSudo = mapped;
+        }
+        else
+        {
+            config.AllowSudo = options.AllowSudoOverride == true ? "allow" : "deny";
         }
         config.RunAs = runAs;
-        config.AllowSudo = allowSudo;
         BridgeConfig.Save(options.ConfigPath, config);
         Console.Error.WriteLine(
             $"[bridge] saved identity: run_as={(string.IsNullOrWhiteSpace(runAs) ? HostIdentity.CurrentUser : runAs)}, " +
-            $"allow_sudo={allowSudo!.Value.ToString().ToLowerInvariant()}");
-        if (options.Init)
-            return 0;
+            $"allow_sudo={config.AllowSudo}");
+        return 0;
     }
     else
     {
-        if (options.Init)
-        {
-            // Fail closed when nothing can be asked: persist only an explicit
-            // choice, never an assumed Yes.
-            config.RunAs = runAs;
-            if (sudoExplicit)
-                config.AllowSudo = allowSudo;
-            else
-                Console.Error.WriteLine("[bridge] --init non-interactive: leaving allow_sudo unasked (first run will ask).");
-            BridgeConfig.Save(options.ConfigPath, config);
-            return 0;
-        }
-        allowSudo ??= false;
+        // Fail closed when nothing can be asked: persist only an explicit
+        // choice (flag or env preset), never an assumed one.
+        config.RunAs = runAs;
+        if (sudoExplicit)
+            config.AllowSudo = options.AllowSudoOverride == true ? "allow" : "deny";
+        else
+            Console.Error.WriteLine(
+                "[bridge] --init non-interactive: sudo policy left as " +
+                $"'{config.AllowSudo ?? "ask"}' — the bridge confirms it on the first real run. " +
+                "Change later with: openmono config host.sudo_policy <ask|allow|deny>");
+        BridgeConfig.Save(options.ConfigPath, config);
+        return 0;
     }
 }
-else if (options.Init)
-{
-    config.RunAs = runAs;
-    BridgeConfig.Save(options.ConfigPath, config);
-    Console.Error.WriteLine("[bridge] saved identity (sudo choice unchanged).");
-    return 0;
-}
 
-using HostIdentity identity = new(runAs, allowSudo ?? false, password);
+using HostIdentity identity = new(runAs, sudoPolicy, password);
 password = null; // owned by identity now (zeroed on dispose)
 
 if (!string.IsNullOrWhiteSpace(runAs) && !HostIdentity.IsValidUsername(runAs))
@@ -119,12 +139,14 @@ if (!string.IsNullOrWhiteSpace(runAs) && !HostIdentity.IsValidUsername(runAs))
 }
 
 // Fail fast on the wrong-user trap: HOST_EXEC as another user needs sudo,
-// and without it every host command would fail one by one mid-session.
-if (!identity.RunAsUser.Equals(HostIdentity.CurrentUser, StringComparison.Ordinal) && !identity.AllowSudo)
+// and with sudo denied every host command would fail one by one mid-session.
+// Ask does not fail fast: it confirms per escalation at run time.
+if (!identity.RunAsUser.Equals(HostIdentity.CurrentUser, StringComparison.Ordinal) &&
+    identity.Sudo == SudoPolicy.Deny)
 {
     Console.Error.WriteLine(
-        $"[bridge] ERROR: run_as='{identity.RunAsUser}' but you are '{HostIdentity.CurrentUser}' and allow_sudo=false. " +
-        "Host commands would fail. Run the bridge as that user, re-run --init to change run_as, or enable sudo.");
+        $"[bridge] ERROR: run_as='{identity.RunAsUser}' but you are '{HostIdentity.CurrentUser}' and sudo is denied (allow_sudo=deny). " +
+        "Host commands would fail. Run the bridge as that user, change run_as (openmono config host.run_as), or set sudo to ask/allow (openmono config host.sudo_policy).");
     return 1;
 }
 
@@ -202,20 +224,21 @@ try
     // workspace — all host work goes through HOST_EXEC as the run-as user.
     // Attached sessions already have them; never repeat mid-conversation.
     var preamble = freshSession
-        ? OperatorPreamble.Build(workDir, identity.RunAsUser, HostLogDirFor(identity.RunAsUser), identity.AllowSudo)
+        ? OperatorPreamble.Build(workDir, identity.RunAsUser, HostLogDirFor(identity.RunAsUser), identity.Sudo)
         : "";
 
     Console.Error.WriteLine($"[bridge] session {sessionId} on {baseUrl} (workdir {workDir})");
     var endpointHint = AgentContainer.ReadSettings().Endpoint;
     if (string.IsNullOrWhiteSpace(endpointHint))
         endpointHint = "llm endpoint (see ~/.openmono/settings.json)";
-    var statusLine = $"host session · {workDir} · run as {identity.RunAsUser} · {(buildMode ? "BUILD" : "PLAN")} · {endpointHint}";
+    var sudoMode = identity.Sudo.ToString().ToLowerInvariant();
+    var statusLine = $"host session · {workDir} · run as {identity.RunAsUser} · sudo={sudoMode} · {(buildMode ? "BUILD" : "PLAN")} · {endpointHint}";
     if (options.Verbose)
     {
         Console.Error.WriteLine(
             $"[bridge] policy: tools default={config.ToolDefault}, host-exec default={config.HostExec.Default}, " +
             $"timeout={config.TimeoutMs}ms, logs={config.ResolvedLogDir}, " +
-            $"run_as={identity.RunAsUser}, allow_sudo={identity.AllowSudo.ToString().ToLowerInvariant()}, " +
+            $"run_as={identity.RunAsUser}, allow_sudo={identity.Sudo.ToString().ToLowerInvariant()}, " +
             $"ui={(useTui ? "tui" : "line")}");
     }
 
@@ -232,6 +255,15 @@ try
         ui = new LineUi(options.NonInteractive, Console.Out, Console.Error);
     }
     var bridge = new Bridge(acp, config, executor, identity, ui, workDir, options.NonInteractive, buildMode);
+
+    // Line mode: surface the effective sudo policy without --verbose so an
+    // operator can confirm the mode at a glance (TUI shows it in the status line).
+    if (!useTui)
+    {
+        ui.Info(
+            $"[bridge] policy: run_as={identity.RunAsUser}, " +
+            $"host-exec default={config.HostExec.Default}, allow_sudo={sudoMode}");
+    }
 
     var task = options.TaskText;
     if (task is null && options.TaskFile is not null)

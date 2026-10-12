@@ -4,6 +4,23 @@ using System.Security.Cryptography;
 namespace OpenMono.HostBridge;
 
 /// <summary>
+/// Privilege-escalation policy for the bridge (config key: allow_sudo).
+/// Mirrors host_exec.default.
+/// </summary>
+public enum SudoPolicy
+{
+    /// <summary>Every elevation asks the operator per command (y/N). A "yes"
+    /// is in-memory only for that command — the config stays ask until the
+    /// operator explicitly changes it. Non-interactive runs fail closed (deny).</summary>
+    Ask,
+    /// <summary>Elevations run without prompting (password still prompted
+    /// once in memory when needed).</summary>
+    Allow,
+    /// <summary>Hard refusal of every elevation.</summary>
+    Deny,
+}
+
+/// <summary>
 /// Who bare-metal commands run as. The username is ordinary config; the
 /// password (when elevation needs one) lives ONLY in this object, in memory,
 /// zeroed on dispose. It is never serialized, never logged, and never passed
@@ -15,13 +32,13 @@ public sealed class HostIdentity : IDisposable
     private bool _disposed;
 
     public string RunAsUser { get; }
-    public bool AllowSudo { get; }
+    public SudoPolicy Sudo { get; }
     public bool HasPassword => _password is { Length: > 0 };
 
-    public HostIdentity(string runAsUser, bool allowSudo, char[]? password)
+    public HostIdentity(string runAsUser, SudoPolicy sudo, char[]? password)
     {
         RunAsUser = string.IsNullOrWhiteSpace(runAsUser) ? Environment.UserName : runAsUser;
-        AllowSudo = allowSudo;
+        Sudo = sudo;
         _password = password;
     }
 

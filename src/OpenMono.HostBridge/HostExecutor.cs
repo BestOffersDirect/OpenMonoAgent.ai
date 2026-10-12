@@ -193,7 +193,7 @@ public enum HostPolicyDecision { Allow, Deny, Ask }
 /// Executes approved commands on bare metal: the bridge's half of the deal.
 /// The model loop stays in the container; this is the only piece that touches
 /// the host. Elevation goes through sudo with the run-as identity — and only
-/// when the operator opted in (<c>allow_sudo</c>). Every run and every denial
+/// when the operator opted in (<c>allow_sudo=allow</c>). Every run and every denial
 /// is appended to the shared agent audit log; passwords never are.
 /// </summary>
 public sealed class HostExecutor
@@ -263,19 +263,20 @@ public sealed class HostExecutor
             AuditLog.WriteCommand(targetUser, request.AsRoot, command, -1, stopwatch.ElapsedMilliseconds, false, badUser);
             return $"ERROR: {badUser}";
         }
-        var needsSudo = request.AsRoot ||
-            explicitEscalation ||
-            !targetUser.Equals(HostIdentity.CurrentUser, StringComparison.Ordinal);
+        var needsSudo = RequiresElevation(request);
 
-        if (needsSudo && !_identity.AllowSudo)
+        if (needsSudo && _identity.Sudo == SudoPolicy.Deny)
         {
+            // Deny = hard refusal. Ask = already approved per-command by the
+            // bridge (the operator said yes to exactly this command, in memory
+            // only); Allow = policy. Anything else reaching this line is a bug.
             var reason = request.AsRoot
-                ? "as_root requested but sudo is not allowed for this bridge (allow_sudo=false)."
+                ? "as_root requested but sudo is denied for this bridge (allow_sudo=deny)."
                 : explicitEscalation
-                    ? $"privilege escalation detected but sudo is not allowed for this bridge (allow_sudo=false). " +
-                      "Remove sudo/su/doas/pkexec/run0 from the command, or enable allow_sudo."
-                    : $"must run as '{targetUser}' but sudo is not allowed for this bridge (allow_sudo=false). " +
-                      "Run the bridge as that user, or enable allow_sudo.";
+                    ? $"privilege escalation detected but sudo is denied for this bridge (allow_sudo=deny). " +
+                      "Remove sudo/su/doas/pkexec/run0 from the command, or set allow_sudo=allow (openmono config host.sudo_policy allow)."
+                    : $"must run as '{targetUser}' but sudo is denied for this bridge (allow_sudo=deny). " +
+                      "Run the bridge as that user, or set allow_sudo=allow (openmono config host.sudo_policy allow).";
             AuditLog.WriteCommand(targetUser, request.AsRoot, command, -1, stopwatch.ElapsedMilliseconds, false, reason);
             return $"ERROR: {reason}";
         }
@@ -307,6 +308,20 @@ public sealed class HostExecutor
     }
 
     /// <summary>
+    /// True when this request would run with privilege escalation (as_root,
+    /// an escalation keyword, or a run-as user that is not the current user).
+    /// </summary>
+    public bool RequiresElevation(HostExecRequest request)
+    {
+        var targetUser = request.AsRoot ? "root" : _identity.RunAsUser;
+        if (!HostIdentity.IsValidUsername(targetUser))
+            return false;
+        return request.AsRoot ||
+            ContainsEscalation(request.Command) ||
+            !targetUser.Equals(HostIdentity.CurrentUser, StringComparison.Ordinal);
+    }
+
+    /// <summary>
     /// True when this request would elevate AND sudo would demand a password we
     /// do not have — the caller can prompt the operator before executing.
     /// </summary>
@@ -315,10 +330,7 @@ public sealed class HostExecutor
         var targetUser = request.AsRoot ? "root" : _identity.RunAsUser;
         if (!HostIdentity.IsValidUsername(targetUser))
             return false;
-        var needsSudo = request.AsRoot ||
-            ContainsEscalation(request.Command) ||
-            !targetUser.Equals(HostIdentity.CurrentUser, StringComparison.Ordinal);
-        if (!needsSudo || !_identity.AllowSudo || !SudoPresent() || _identity.HasPassword)
+        if (!RequiresElevation(request) || _identity.Sudo == SudoPolicy.Deny || !SudoPresent() || _identity.HasPassword)
             return false;
         return !SudoProbe(targetUser);
     }

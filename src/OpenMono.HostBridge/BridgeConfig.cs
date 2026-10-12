@@ -41,12 +41,29 @@ public sealed class BridgeConfig
     public string RunAs { get; set; } = "";
 
     /// <summary>
-    /// Whether host commands may escalate with sudo. Null = never asked:
-    /// the bridge prompts once on first run (or <c>--init</c>) and persists
-    /// the answer. False = sudo is never used, period.
+    /// Privilege-escalation policy for host commands. One of
+    /// "ask" (default: confirm each elevation with y/N — a yes is in-memory
+    /// only for that command), "allow" (elevate without prompting), or
+    /// "deny" (never escalate). Legacy JSON values are mapped on load:
+    /// missing/null → ask, true → allow, false → deny.
     /// </summary>
     [JsonPropertyName("allow_sudo")]
-    public bool? AllowSudo { get; set; }
+    public string? AllowSudo { get; set; } = "ask";
+
+    /// <summary>
+    /// <see cref="AllowSudo"/> as an enum, with legacy bool/null back-compat.
+    /// </summary>
+    [JsonIgnore]
+    public SudoPolicy SudoPolicy
+    {
+        get => AllowSudo?.Trim() switch
+        {
+            null or "" => SudoPolicy.Ask,
+            var s when s.Equals("allow", StringComparison.OrdinalIgnoreCase) => SudoPolicy.Allow,
+            var s when s.Equals("deny", StringComparison.OrdinalIgnoreCase) => SudoPolicy.Deny,
+            _ => SudoPolicy.Ask,
+        };
+    }
 
     public static string DefaultPath =>
         Path.Combine(
@@ -62,8 +79,37 @@ public sealed class BridgeConfig
         try
         {
             var json = File.ReadAllText(resolved);
-            return JsonSerializer.Deserialize<BridgeConfig>(json, WebOptions())
+            // Legacy configs hold allow_sudo as a JSON boolean (or omit it).
+            // Pull the raw token out BEFORE deserializing: a bool token in a
+            // string property throws, and we must survive it to normalize.
+            string? rawAllowSudo = null;
+            var boolToken = false;
+            using (var doc = JsonDocument.Parse(json))
+            {
+                if (doc.RootElement.TryGetProperty("allow_sudo", out var v))
+                {
+                    rawAllowSudo = v.ValueKind switch
+                    {
+                        JsonValueKind.True => "allow",
+                        JsonValueKind.False => "deny",
+                        JsonValueKind.String => v.GetString(),
+                        _ => null,
+                    };
+                    boolToken = v.ValueKind is JsonValueKind.True or JsonValueKind.False;
+                }
+            }
+            // Neutralize a legacy bool token so the typed deserializer accepts it
+            // (whitespace-tolerant: the file may be pretty-printed).
+            if (boolToken)
+                json = System.Text.RegularExpressions.Regex.Replace(
+                    json, "\"allow_sudo\"\\s*:\\s*(true|false)",
+                    "\"allow_sudo\":\"ask\"",
+                    System.Text.RegularExpressions.RegexOptions.Singleline);
+            var cfg = JsonSerializer.Deserialize<BridgeConfig>(json, WebOptions())
                 ?? new BridgeConfig();
+            if (!string.IsNullOrWhiteSpace(rawAllowSudo))
+                cfg.AllowSudo = rawAllowSudo;
+            return cfg;
         }
         catch (Exception ex) when (ex is JsonException or IOException or UnauthorizedAccessException)
         {
@@ -83,8 +129,10 @@ public sealed class BridgeConfig
             Directory.CreateDirectory(Path.GetDirectoryName(resolved)!);
             var sample = new BridgeConfig
             {
-                // allow_sudo intentionally left unset (null): the bridge asks
-                // once on first run / --init and persists the answer.
+                // allow_sudo = "ask": every elevation confirms with y/N; a
+                // yes is in-memory only for that command (config stays "ask"
+                // until the operator runs openmono config host.sudo_policy).
+                AllowSudo = "ask",
                 RunAs = "",
                 Tools = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
                 {

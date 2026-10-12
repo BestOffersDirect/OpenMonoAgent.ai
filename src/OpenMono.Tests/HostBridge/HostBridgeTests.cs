@@ -122,7 +122,7 @@ public class HostPolicyTests
             Deny = ["rm -rf *", "shutdown *"],
             Default = def,
         }, Path.GetTempPath(), Path.GetTempPath(),
-        new HostIdentity("", allowSudo: false, password: null));
+        new HostIdentity("", SudoPolicy.Deny, password: null));
 
     [Fact]
     public void Deny_WinsOverAllow()
@@ -133,7 +133,7 @@ public class HostPolicyTests
             Deny = ["rm -rf *"],
             Default = "allow",
         }, Path.GetTempPath(), Path.GetTempPath(),
-        new HostIdentity("", allowSudo: false, password: null));
+        new HostIdentity("", SudoPolicy.Deny, password: null));
         executor.CheckPolicy("rm -rf /tmp/x").Should().Be(HostPolicyDecision.Deny);
     }
 
@@ -192,7 +192,7 @@ public class HostPolicyTests
                 Allow = [.. HostExecPolicy.SampleAllow],
                 Deny = [.. HostExecPolicy.SampleDeny],
                 Default = "allow",
-            }, dir, dir, new HostIdentity("", allowSudo: false, password: null));
+            }, dir, dir, new HostIdentity("", SudoPolicy.Deny, password: null));
             var output = await executor.ExecuteAsync(request!, 30_000, CancellationToken.None);
             output.Should().NotStartWith("ERROR:");
             new FileInfo(target).Length.Should().BeGreaterThan(8192);
@@ -275,7 +275,7 @@ public class OperatorPreambleTests
     public void Build_NamesRunAsUserLogDirAndWorkspace()
     {
         var preamble = OperatorPreamble.Build(
-            "/home/operator/srv", "operator", "/home/operator/.openmono/logs", allowSudo: false);
+            "/home/operator/srv", "operator", "/home/operator/.openmono/logs", SudoPolicy.Deny);
         preamble.Should().Contain("HOST_EXEC:");
         preamble.Should().Contain("operator");
         preamble.Should().Contain("/home/operator/.openmono/logs");
@@ -287,14 +287,14 @@ public class OperatorPreambleTests
     [Fact]
     public void Build_AllowsSudoVariant()
     {
-        var preamble = OperatorPreamble.Build("/w", "operator", "/home/operator/.openmono/logs", allowSudo: true);
+        var preamble = OperatorPreamble.Build("/w", "operator", "/home/operator/.openmono/logs", SudoPolicy.Allow);
         preamble.Should().Contain("Sudo IS allowed");
     }
 
     [Fact]
     public void Build_ForbidsContainerPathsForHostWork()
     {
-        var preamble = OperatorPreamble.Build("/w", "operator", "/home/operator/.openmono/logs", allowSudo: false);
+        var preamble = OperatorPreamble.Build("/w", "operator", "/home/operator/.openmono/logs", SudoPolicy.Deny);
         preamble.Should().Contain("/root/.openmono");
         preamble.Should().Contain("NEVER Grep");
     }
@@ -302,7 +302,7 @@ public class OperatorPreambleTests
     [Fact]
     public void Build_TellsModelNotToNarrateOrders()
     {
-        var preamble = OperatorPreamble.Build("/w", "operator", "/home/operator/.openmono/logs", allowSudo: false);
+        var preamble = OperatorPreamble.Build("/w", "operator", "/home/operator/.openmono/logs", SudoPolicy.Deny);
         preamble.Should().Contain("Do not quote");
     }
 }
@@ -388,7 +388,7 @@ public class HostExecPolicyMigrationTests
             Deny = [.. HostExecPolicy.SampleDeny],
             Default = "allow",
         }, Path.GetTempPath(), Path.GetTempPath(),
-        new HostIdentity("", allowSudo: false, password: null));
+        new HostIdentity("", SudoPolicy.Deny, password: null));
         executor.CheckPolicy("rm -rf /tmp/x").Should().Be(HostPolicyDecision.Deny);
         executor.CheckPolicy("ls -la /home/operator/srv/").Should().Be(HostPolicyDecision.Allow);
     }
@@ -403,7 +403,7 @@ public class HostPolicyHardeningTests
             Deny = deny ?? ["rm -rf *", "shutdown *"],
             Default = def,
         }, Path.GetTempPath(), Path.GetTempPath(),
-        new HostIdentity("", allowSudo: false, password: null));
+        new HostIdentity("", SudoPolicy.Deny, password: null));
 
     [Fact]
     public void AskMode_AllowListedSimpleCommand_Prompts()
@@ -488,7 +488,7 @@ public class EscalationDetectionTests
             Deny = [],
             Default = "allow",
         }, Path.GetTempPath(), Path.GetTempPath(),
-        new HostIdentity("", allowSudo: false, password: null));
+        new HostIdentity("", SudoPolicy.Deny, password: null));
 
     [Theory]
     [InlineData("sudo id")]

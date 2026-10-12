@@ -89,10 +89,15 @@ public sealed class LineUi : IBridgeUi
     {
         if (_nonInteractive)
         {
-            _err.WriteLine($"[bridge] --non-interactive: answering No: {question}");
+            _err.WriteLine($"[bridge] --non-interactive: answering No (fail closed): {question}");
             return Task.FromResult(false);
         }
-        _err.Write($"{question} [y/N] ");
+        // Always render the [y/N] affordance — but only once: callers may
+        // already include one in the question text.
+        var shown = question.Contains("[y/N]") || question.Contains("[Y/N]")
+            ? question
+            : question + " [y/N]";
+        _err.Write($"{shown} ");
         var answer = Console.ReadLine();
         return Task.FromResult(answer is not null &&
             (answer.Trim().Equals("y", StringComparison.OrdinalIgnoreCase) ||
@@ -102,7 +107,7 @@ public sealed class LineUi : IBridgeUi
     public Task<string> InputAsync(string question, CancellationToken ct)
     {
         _err.WriteLine($"\n[agent asks] {question}");
-        _err.Write("> ");
+        _err.Write("Your answer (type it and press Enter; Enter alone = empty): ");
         return Task.FromResult(Console.ReadLine() ?? "");
     }
 

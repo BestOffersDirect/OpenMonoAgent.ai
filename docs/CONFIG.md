@@ -371,6 +371,46 @@ Override via env vars: `OPENMONO_WEB_SEARCH=1` / `OPENMONO_WEB_SCRAPE=1` (truthy
 
 ---
 
+## Host bridge (`openmono agent --host`)
+
+The bare-metal host sub-agent has its **own** config file: `~/.openmono/host-bridge.json`
+(0600, never holds secrets). It is *not* part of `settings.json`. `openmono config`
+routes `host.*` keys to that file; every other key still goes to `settings.json`.
+
+```bash
+openmono config host.sudo_policy allow      # escalation policy
+openmono config host.exec_default ask       # default policy for host commands
+openmono config host.run_as dimnd           # account host commands run as
+openmono config host.allow_list "git *,docker *,systemctl status *"
+openmono config host.deny_list "rm *,dd *,mkfs *"
+openmono config host.timeout_ms 600000      # foreground command timeout
+openmono config get host.sudo_policy
+openmono config unset host.run_as
+```
+
+### Key → JSON path mapping
+
+| `openmono config` key | JSON path in `host-bridge.json` | Type | Default |
+|-----------------------|--------------------------------|------|---------|
+| `host.exec_default` | `.host_exec.default` | `ask` \| `allow` \| `deny` | `ask` |
+| `host.sudo_policy` | `.allow_sudo` | `ask` \| `allow` \| `deny` | `ask` |
+| `host.run_as` | `.run_as` | username (empty = whoever runs the bridge) | *(empty)* |
+| `host.allow_list` | `.host_exec.allow` | string array (comma-separated on the CLI) | `git *`, `systemctl status *`, `journalctl *` |
+| `host.deny_list` | `.host_exec.deny` | string array (comma-separated on the CLI) | *(sample deny list)* |
+| `host.timeout_ms` | `.timeout_ms` | integer (milliseconds) | `300000` |
+
+Policy semantics (`ask`/`allow`/`deny`) are shared between both policy keys:
+`ask` prompts y/N per command (or per escalation, for `host.sudo_policy`); a **yes
+is in-memory only for that one command and is never persisted**. Non-interactive
+runs fail closed (an `ask` that cannot be confirmed is denied). See
+[Deployment modes — host sub-agent](DEPLOYMENT-MODES.md#run-as-identity-sudo-and-the-paper-trail)
+for the full behavior.
+
+Install-time presets (non-interactive): `OPENMONO_HOST_BRIDGE`, `OPENMONO_HOST_EXEC_DEFAULT`,
+`OPENMONO_HOST_SUDO`, `OPENMONO_HOST_RUN_AS`, `OPENMONO_HOST_PASSWORD_FILE`.
+
+---
+
 ## Top-level flags
 
 | Key | Type | Default | Description |

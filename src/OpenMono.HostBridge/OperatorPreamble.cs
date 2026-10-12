@@ -16,11 +16,17 @@ public static class OperatorPreamble
         string workDir,
         string runAsUser,
         string hostLogDir,
-        bool allowSudo)
+        SudoPolicy sudo)
     {
-        var sudoLine = allowSudo
-            ? "Sudo IS allowed for this bridge: commands needing root may set \"as_root\": true. The bridge prompts for the sudo password on first use."
-            : "Sudo is NOT allowed for this bridge (the operator said no): never set \"as_root\": true — the bridge will refuse. If a step truly needs root, stop and tell the operator to enable sudo instead of working around it.";
+        var sudoLine = sudo switch
+        {
+            SudoPolicy.Allow =>
+                "Sudo IS allowed for this bridge: commands needing root may set \"as_root\": true. The bridge prompts for the sudo password on first use.",
+            SudoPolicy.Ask =>
+                "Sudo is in ASK mode for this bridge: commands needing root may set \"as_root\": true, but the OPERATOR is asked y/N for every escalation. A yes only covers that one command. If the operator declines, stop and explain what needs root instead of retrying the same escalation.",
+            _ =>
+                "Sudo is NOT allowed for this bridge (deny policy): never set \"as_root\": true — the bridge will refuse. If a step truly needs root, stop and tell the operator to enable sudo (openmono config host.sudo_policy allow) instead of working around it.",
+        };
         return $$"""
             [HOST OPERATOR CONTEXT — standing orders for this whole session, higher priority than any playbook's tool defaults. You are managing a Linux server through a host sub-agent. Your own Bash/Grep/FileRead/Glob tools run INSIDE a container and see only the bind-mounted workspace below — they CANNOT see host files, host logs, the host docker daemon state beyond the mount, or systemd.]
 

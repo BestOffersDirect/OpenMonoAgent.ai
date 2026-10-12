@@ -836,10 +836,49 @@ if [ "$OPENMONO_ROLE" != "inference" ]; then
                         [Aa]llow) export OPENMONO_HOST_EXEC_DEFAULT="allow" ;;
                         *) export OPENMONO_HOST_EXEC_DEFAULT="ask" ;;
                     esac
+                    # Sudo policy preset (never silent): OPENMONO_HOST_SUDO presets
+                    # it non-interactively. When unset and on a TTY, ask; fail
+                    # closed to the default (ask) otherwise. install-host-bridge.sh
+                    # turns this into the --allow-sudo / --no-sudo --init flag.
+                    _bridge_sudo="${OPENMONO_HOST_SUDO:-}"
+                    if [[ -z "$_bridge_sudo" && -t 0 ]]; then
+                        echo "  The agent may need sudo for host commands that require it"
+                        echo "  (service restarts, package installs, log reads). Choose how"
+                        echo "  to handle privilege escalation:"
+                        echo "    1) Ask (recommended) — confirm each escalation with [y/N];"
+                        echo "       non-interactive sessions fail closed to No"
+                        echo "    2) Allow — run escalations without confirming (still audited)"
+                        echo "    3) Deny — never escalate; host commands run as your user only"
+                        echo ""
+                        printf "  Sudo policy? [1/2/3] (Default 1=Ask): "
+                        read -r _bridge_sudo_answer || _bridge_sudo_answer=""
+                        echo ""
+                        case "${_bridge_sudo_answer:-}" in
+                            2|[Aa]llow|[Yy]|[Yy]es) _bridge_sudo="1" ;;
+                            3|[Dd]eny|[Nn]|[Nn]o)  _bridge_sudo="0" ;;
+                            *) _bridge_sudo="" ;;   # default: ask
+                        esac
+                    fi
+                    case "${_bridge_sudo:-}" in
+                        1|[Yy]|[Yy]es) export OPENMONO_HOST_SUDO="1" ;;
+                        0|[Nn]|[Nn]o)  export OPENMONO_HOST_SUDO="0" ;;
+                        *) : ;;   # leave unset → bridge defaults to "ask"
+                    esac
                     info "Installing host sub-agent (host-exec default: $OPENMONO_HOST_EXEC_DEFAULT)..."
                     if bash "$SCRIPT_DIR/install-host-bridge.sh"; then
                         ok "Host sub-agent installed"
                         export OPENMONO_HOST_BRIDGE=1
+                        case "${OPENMONO_HOST_SUDO:-}" in
+                            1|[Yy]|[Yy]es)
+                                info "Sudo: allow — privilege escalations run without confirming (still audited)." ;;
+                            0|[Nn]|[Nn]o)
+                                info "Sudo: deny — host commands run as your user only; escalation is refused." ;;
+                            *)
+                                info "Sudo: ask — each escalation is confirmed [y/N]; non-interactive sessions fail closed to No." ;;
+                        esac
+                        info "First run of 'openmono agent --host' confirms the run-as user."
+                        info "Change later with: openmono config host.sudo_policy ask|allow|deny"
+                        info "Host settings: openmono config host.exec_default / host.run_as / host.timeout_ms"
                     else
                         warn "Host sub-agent install failed — container agent still works; retry: bash scripts/install-host-bridge.sh"
                         export OPENMONO_HOST_BRIDGE=0

@@ -56,11 +56,11 @@ Project layout (`src/OpenMono.HostBridge/`, .NET 10, references the CLI project 
 
 | File | Responsibility |
 |---|---|
-| `Program.cs` / `BridgeOptions.cs` | CLI (`--task`, `--session`, `--acp`, `--port`, `--keep`, `--non-interactive`, `--tui`, `--classic`, `--plan`, …), TUI/line loops, discovery wait, mode ensure |
+| `Program.cs` / `BridgeOptions.cs` | CLI (`--task`, `--session`, `--acp`, `--port`, `--keep`, `--init`, `--run-as`, `--allow-sudo`, `--no-sudo`, `--non-interactive`, `--tui`, `--classic`, `--plan`, …), TUI/line loops, discovery wait, mode ensure |
 | `AcpClient.cs` | HTTP + SSE client for the stock ACP API (+ `{"mode":…}` ensure) |
 | `AgentContainer.cs` | Spawns the unmodified `agent` service detached (`--acp-only`, loopback port publish, git passthrough, endpoint mapping), stops what it started |
 | `HostExecutor.cs` | `HOST_EXEC` envelope parse, allow → deny → default policy, foreground/background bare-metal execution, sudo via run-as identity, audit |
-| `HostIdentity.cs` | Run-as identity: username (config) + password (memory-only, zeroed on dispose; `--password-file` / `OPENMONO_HOST_PASSWORD_FILE`) |
+| `HostIdentity.cs` | Run-as identity: username (config) + sudo policy (`ask`/`allow`/`deny`) + password (memory-only, zeroed on dispose; `--password-file` / `OPENMONO_HOST_PASSWORD_FILE`) |
 | `AuditLog.cs` / `LogRedactor` | Paper trail: every host command appended to the existing agent log |
 | `Bridge.cs` | Turn pump: renders stream, auto-resolves policy pauses, prompts the operator otherwise |
 | `BridgeUi.cs` / `TuiFrontend.cs` | Operator surface: full-screen agent TUI on a TTY, plain lines otherwise |
@@ -87,8 +87,10 @@ Project layout (`src/OpenMono.HostBridge/`, .NET 10, references the CLI project 
   `/root/...` or `~/.openmono/...`). Attached (`--session`) conversations are
   never re-preambled.
 - **Wrong-user fail-fast.** If `run_as` differs from the bridge process user and
-  sudo is off, the bridge exits immediately with how to fix it (run as that user
-  or enable sudo) instead of failing command by command mid-session.
+  sudo is **denied** (`allow_sudo: "deny"`), the bridge exits immediately with how
+  to fix it (run as that user or change the sudo policy) instead of failing command
+  by command mid-session. `ask` does not fail fast - it confirms per escalation
+  at run time.
 
 ### Failure modes walked
 
@@ -102,28 +104,38 @@ Project layout (`src/OpenMono.HostBridge/`, .NET 10, references the CLI project 
 | Turn error 400 "must contain either 'content' or 'tool_calls'" | A turn that produced no text and no calls stored an empty assistant message, rejected on the next request | Empty assistant messages are never stored (warn-logged); the per-request sanitizer drops any already in history, so old sessions heal |
 | Agent stays in Plan, proposes but never acts | New ACP sessions default to plan | Bridge sets `build` explicitly unless `--plan` |
 | Host commands fail as the wrong user | Bridge run as root (or another user) while `run_as` is the login user | Fail-fast startup check; run the bridge as the login user |
-| `as_root` refused | Sudo never opted in | Expected: enable via `--init`/first-run prompt, or keep off and do root steps by hand |
+| `as_root` refused | Sudo policy is `deny` | Expected: change with `openmono config host.sudo_policy ask` (or `allow`), or keep off and do root steps by hand |
 | Sudo password prompt mid-turn | Timestamp expired and no password in memory | Masked prompt (TUI stands down fullscreen so the secret never touches its input box), or pre-seed `--password-file` / `OPENMONO_HOST_PASSWORD_FILE` |
 | VS Code driving the host | Extension integration is sandbox-only by design | `openmono agent --host --acp-only …` is refused; run without `--host` for the extension |
 
 ### Run-as identity, sudo, and the paper trail
 
 - **Identity.** Host commands run as `run_as` from `~/.openmono/host-bridge.json`
-  (empty = whoever runs the bridge). Set it at install, with `host-bridge --init`,
-  `--run-as <user>`, or `OPENMONO_HOST_RUN_AS`. The password for that account is
+  (empty = whoever runs the bridge). Set it with `host-bridge --init` (interactive),
+  `--run-as <user>`, `OPENMONO_HOST_RUN_AS` at install, or `openmono config
+  host.run_as <user>` any time after. The password for that account is
   **never** stored in settings, logs, or the repo: it lives only in bridge memory
   (masked prompt when an escalation first needs it, zeroed on exit), optionally
   pre-seeded from a root-owned-or-owner-only `0600` file via `--password-file` /
   `OPENMONO_HOST_PASSWORD_FILE` (loose permissions are refused). It travels to
   sudo over piped stdin, never a command line.
-- **Sudo.** The installer / `--init` / first run asks once whether sudo is allowed
-  (default **No**); the answer persists as `allow_sudo`. `false` means sudo is never
-  used: `as_root` requests, cross-user runs, and any command segment whose
-  program is `sudo`, `su`, `doas`, `pkexec`, or `run0` (including
-  path-prefixed, backslash-escaped, or quoted forms such as `/usr/bin/sudo`
-  or `\sudo`) are refused with how to enable it.
-  `--allow-sudo` / `--no-sudo` override per run (explicit, never silent).
-  `run_as` is validated against `^[a-z_][a-z0-9_-]*[$]?$` before use in `sudo -u`.
+- **Sudo policy (`allow_sudo`: `ask` / `allow` / `deny`).** The escalation policy
+  is a three-state value, not a bool. Default is **`ask`**: every elevation
+  (`as_root` requests, cross-user runs, any command segment whose program is
+  `sudo`, `su`, `doas`, `pkexec`, or `run0` - including path-prefixed,
+  backslash-escaped, or quoted forms such as `/usr/bin/sudo` or `\sudo`) prompts
+  the operator with y/N, and a **yes is in-memory only for that one command** -
+  it is never persisted. The config stays `ask` until the operator explicitly
+  runs `openmono config host.sudo_policy <ask|allow|deny>` or re-runs an
+  interactive `host-bridge --init`. Non-interactive runs (piped stdin, no TTY)
+  can never be asked, so an `ask` escalation is **denied** there (fail closed).
+  `allow` escalates without prompting; `deny` refuses every escalation with how
+  to change the policy. `--allow-sudo` / `--no-sudo` override per run (explicit,
+  never silent) and win over the config. `run_as` is validated against
+  `^[a-z_][a-z0-9_-]*[$]?$` before use in `sudo -u`.
+- **Legacy bool configs.** Old `host-bridge.json` files stored `allow_sudo` as a
+  JSON boolean; it is mapped on load (`true` → `allow`, `false` → `deny`,
+  missing/null → `ask`) and normalized to the string form on the next save.
 - **Timeouts.** A timed-out foreground command is killed (whole process tree;
   via passwordless sudo when the command ran elevated) and the report says
   `was terminated` only when the process is confirmed gone. Otherwise it says
@@ -168,11 +180,22 @@ OPENMONO_HOST_BRIDGE=1 openmono setup --agent   # non-interactive: include it
 ```
 
 Answering yes runs `scripts/install-host-bridge.sh`, which publishes
-`src/OpenMono.HostBridge` to `~/.openmono/bin/host-bridge`. .NET 10 is
+`src/OpenMono.HostBridge` to `~/.openmono/bin/host-bridge` and writes a sample
+`~/.openmono/host-bridge.json` (0600) when one does not exist. .NET 10 is
 required: when it is missing, the script reuses the **existing** prerequisite
 path (`scripts/install_prereqs.sh` - the same installer that provides .NET 10
 for the main agent) instead of inventing a second one, then publishes. Add it
 to any existing agent box later with `bash scripts/install-host-bridge.sh`.
+
+The install itself is strictly **non-interactive and on-demand**: it never
+starts or runs the bridge, and it never prompts. `--init` is only ever invoked
+as `--non-interactive` from the installer (with `--allow-sudo` / `--no-sudo`
+only when `OPENMONO_HOST_SUDO` was set at install); an interactive `--init`
+prompt would look like a hang, because `openmono setup` redirects the installer's
+stderr to the setup log. The run-as user and the sudo policy are confirmed
+**interactively on the first real `openmono agent --host` run** (or by hand
+any time with `host-bridge --init` or `openmono config host.*` - see
+[Configuration](CONFIG.md#host-bridge-host-sub-agent)).
 
 ## Mode A - single-box (inference + agent on one machine)
 

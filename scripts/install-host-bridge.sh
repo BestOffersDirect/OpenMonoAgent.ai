@@ -5,6 +5,15 @@
 # Publishes src/OpenMono.HostBridge (Release) to $HOME/.openmono/bin/host-bridge
 # and writes a sample ~/.openmono/host-bridge.json when none exists.
 #
+# The bridge is ON-DEMAND: installing it never starts or runs it. This script
+# only publishes the binary and writes the sample config. The run-as identity
+# and sudo policy are chosen at install time by scripts/install.sh (which
+# prompts and exports OPENMONO_HOST_SUDO); the run-as user is confirmed on the
+# first real `openmono agent --host` run if it was left blank. Everything
+# below is therefore strictly non-interactive — a prompt here would look like
+# a hang when this script is run from `openmono setup`, which redirects stderr
+# to the install log.
+#
 # .NET 10 is required. When it is missing, this script reuses the EXISTING
 # prerequisite path (scripts/install_prereqs.sh — the same installer that
 # provides .NET 10 for the main agent) instead of inventing a second one.
@@ -60,9 +69,11 @@ fi
 
 "$BIN_DIR/host-bridge" --version
 
-# Sudo opt-in (never silent): configure run-as identity + sudo choice now when
-# interactive; otherwise leave allow_sudo unasked so the bridge asks once on
-# first run. OPENMONO_HOST_SUDO=1/0 presets it for non-interactive installs.
+# Sudo policy preset (never interactive at install time): OPENMONO_HOST_SUDO
+# writes allow_sudo into the config; install.sh prompts for it and exports this
+# (1/yes→--allow-sudo, 0/no→--no-sudo). When unset the config keeps its default
+# ("ask") and the bridge confirms the run-as user on the first real
+# `openmono agent --host` run.
 # Host-exec policy (never silent): OPENMONO_HOST_EXEC_DEFAULT=allow|ask selects
 # the default. Anything but an explicit "allow" stays "ask" (fail closed).
 # install.sh prompts for this; direct script runs default to ask.
@@ -74,22 +85,18 @@ _HOST_BRIDGE_PREEXISTED=0
 [[ -f "$_HOST_BRIDGE_CONFIG" ]] && _HOST_BRIDGE_PREEXISTED=1
 case "${OPENMONO_HOST_SUDO:-}" in
     1|[Yy]|[Yy]es)
-        "$BIN_DIR/host-bridge" --init --allow-sudo --non-interactive
+        # Always --non-interactive: --init must never prompt here.
+        "$BIN_DIR/host-bridge" --init --allow-sudo --non-interactive 2>&1
         ;;
     0|[Nn]|[Nn]o)
-        "$BIN_DIR/host-bridge" --init --no-sudo --non-interactive
+        "$BIN_DIR/host-bridge" --init --no-sudo --non-interactive 2>&1
         ;;
     *)
-        if [[ -t 0 ]]; then
-            "$BIN_DIR/host-bridge" --init \
-                || echo "[host-bridge] identity setup skipped — first run will ask." >&2
-        else
-            echo "[host-bridge] non-interactive: leaving sudo unasked (first run will ask)."
-        fi
+        echo "[host-bridge] sudo policy left as default (ask) — the bridge will confirm run-as user + sudo on first run."
         ;;
 esac
 
-echo "[host-bridge] OK — run it with: openmono agent --host"
+echo "[host-bridge] OK — run it with: openmono agent --host (first run confirms the run-as user if left blank; change later with: openmono config host.run_as / host.sudo_policy)"
 
 # Apply the host-exec default. Fresh configs get a default (ask unless
 # OPENMONO_HOST_EXEC_DEFAULT=allow). Existing configs are preserved as-is

@@ -232,12 +232,38 @@ public sealed class Bridge
     {
         var stopwatch = System.Diagnostics.Stopwatch.StartNew();
         var decision = _executor.CheckPolicy(request.Command);
+        var targetUser = request.AsRoot ? "root" : _identity.RunAsUser;
+
+        // Sudo escalation check (allow_sudo policy). The executor's sudo gate
+        // refuses Deny; Allow passes; Ask confirms here, per command. The yes
+        // is in-memory only for THIS command — config stays ask until the
+        // operator explicitly changes it (openmono config host.sudo_policy).
+        if (_executor.RequiresElevation(request) && _identity.Sudo == SudoPolicy.Ask)
+        {
+            var interactive = !_nonInteractive && !Console.IsInputRedirected;
+            if (!interactive)
+            {
+                // Non-interactive fail closed: an ask policy can never
+                // escalate without a human at the keyboard.
+                AuditLog.WriteCommand(targetUser, request.AsRoot, request.Command,
+                    -1, stopwatch.ElapsedMilliseconds, false,
+                    "sudo ask policy in a non-interactive bridge (fail closed)");
+                return "Host execution denied by bridge policy (sudo ask policy, non-interactive): " + request.Command;
+            }
+            var yes = await _ui.ConfirmAsync($"Run '{Truncate(request.Command, 200)}' as {targetUser} with sudo? [y/N]", ct);
+            if (!yes)
+            {
+                AuditLog.WriteCommand(targetUser, request.AsRoot, request.Command,
+                    -1, stopwatch.ElapsedMilliseconds, false, "operator declined sudo ask");
+                return $"Host execution denied by operator (sudo ask policy): {request.Command}";
+            }
+        }
+
         if (decision == HostPolicyDecision.Ask && !_nonInteractive)
         {
             var yes = await _ui.ConfirmAsync($"Run on host? {request.Command}", ct);
             decision = yes ? HostPolicyDecision.Allow : HostPolicyDecision.Deny;
         }
-        var targetUser = request.AsRoot ? "root" : _identity.RunAsUser;
         if (decision != HostPolicyDecision.Allow)
         {
             var denial = decision == HostPolicyDecision.Ask
@@ -257,7 +283,7 @@ public sealed class Bridge
                 return $"ERROR: elevation to '{targetUser}' needs a sudo password and none is in memory. " +
                     "Restart interactively to provide it, or set OPENMONO_HOST_PASSWORD_FILE.";
             _ui.Info($"[host] elevation to '{targetUser}' needs the sudo password.");
-            _identity.SetPassword(await _ui.PasswordAsync($"sudo password for {targetUser}: ", ct));
+            _identity.SetPassword(await _ui.PasswordAsync($"Sudo password for '{targetUser}' (type it — nothing is logged): ", ct));
         }
 
         _ui.HostStart(request.Command);
