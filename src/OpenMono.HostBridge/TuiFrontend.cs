@@ -81,13 +81,15 @@ internal sealed class BridgeTerminal : ITerminal
 internal sealed class TuiFrontend
 {
     private readonly AnsiTuiRenderer _tui;
+    private readonly AppConfig _config;
     private readonly SessionState _session;
     private bool _responseOpen;
 
     public TuiFrontend(string model)
     {
+        _config = new AppConfig();
         _session = new SessionState { Model = model ?? "" };
-        _tui = new AnsiTuiRenderer(new AppConfig(), _session, new BridgeTerminal());
+        _tui = new AnsiTuiRenderer(_config, _session, new BridgeTerminal());
     }
 
     public bool BuildMode
@@ -97,6 +99,27 @@ internal sealed class TuiFrontend
     }
 
     public void SetTokens(long totalUsed) => _session.TotalTokensUsed = (int)Math.Min(totalUsed, int.MaxValue);
+
+    /// <summary>
+    /// Feeds the status-bar context gauge. It reads
+    /// <c>TokenTracker.LastPromptTokens / AppConfig.Llm.ContextSize</c> — so
+    /// the bridge must feed both: the tracker's display-only estimate (never
+    /// touches cumulative cost totals) and the window the server reported.
+    /// </summary>
+    public void SetUsage(long contextTokens, long contextWindow)
+    {
+        _session.Meta.TokenTracker ??= new TokenTracker();
+        if (contextTokens > 0)
+            _session.Meta.TokenTracker.SetEstimatedPromptTokens((int)Math.Min(contextTokens, int.MaxValue));
+        if (contextWindow > 0)
+            _config.Llm.ContextSize = (int)Math.Min(contextWindow, int.MaxValue);
+    }
+
+    /// <summary>
+    /// Commits streamed prose before any committed render, keeping the
+    /// transcript chronological (see <c>AnsiPainter.CommitStreamSegment</c>).
+    /// </summary>
+    public void FlushResponse() => _tui.CommitStreamSegment();
 
     public void Enter(string model, string endpoint, string statusLine)
     {
@@ -165,17 +188,30 @@ internal sealed class TuiFrontend
         _tui.WriteInfo($"Mode: {mode}");
     }
 
-    public Task<bool> ConfirmAsync(string question, CancellationToken ct) =>
-        _tui.AskUserAsync(question + " [y/N]", ct).ContinueWith(
+    public Task<bool> ConfirmAsync(string question, CancellationToken ct)
+    {
+        FlushResponse();
+        return _tui.AskUserAsync(question + " [y/N]", ct).ContinueWith(
             t => t.Result.Trim().Equals("y", StringComparison.OrdinalIgnoreCase) ||
                  t.Result.Trim().Equals("yes", StringComparison.OrdinalIgnoreCase),
             CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+    }
 
-    public Task<string> InputAsync(string question, CancellationToken ct) =>
-        _tui.AskUserAsync(question, ct);
+    public Task<string> InputAsync(string question, CancellationToken ct)
+    {
+        FlushResponse();
+        return _tui.AskUserAsync(question, ct);
+    }
 
-    public Task<(bool Allow, string Scope)> PermissionAsync(string tool, string summary, CancellationToken ct) =>
-        _tui.AskPermissionAsync(tool, summary, ct).ContinueWith(
+    public Task<(bool Allow, string Scope)> PermissionAsync(string tool, string summary, CancellationToken ct)
+    {
+        // Defensive fail-closed: the TUI is only constructed on an interactive
+        // terminal (see Program.cs useTui), but a redirected stdin here would
+        // park ReadPermissionMenu on TryReadKey forever — never block.
+        if (Console.IsInputRedirected)
+            return Task.FromResult((false, "once"));
+        FlushResponse();
+        return _tui.AskPermissionAsync(tool, summary, ct).ContinueWith(
             t => t.Result switch
             {
                 PermissionResponse.Allow => (true, "once"),
@@ -185,6 +221,7 @@ internal sealed class TuiFrontend
                 _ => (false, "once"),
             },
             CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+    }
 
     public Task<bool> PlaybookAsync(
         string name,
@@ -210,6 +247,7 @@ internal sealed class TuiFrontend
             }).ToList(),
             RequiresModeSwitch = requiresModeSwitch,
         };
+        FlushResponse();
         return _tui.RequestPlaybookApprovalAsync(plan, ct);
     }
 
@@ -221,6 +259,7 @@ internal sealed class TuiFrontend
     /// </summary>
     public Task<char[]> PasswordAsync(string prompt, CancellationToken ct)
     {
+        FlushResponse();
         ResponseEnd();
         EndTurn();
         Exit();
@@ -257,25 +296,47 @@ internal sealed class TuiUi : IBridgeUi
     public void ResponseEnd() => _tui.ResponseEnd();
     public void Text(string content) => _tui.StreamText(content);
     public void Thinking(string content) => _tui.AppendThinking(content);
-    public void ToolStart(string name, string summary) => _tui.ToolStart(name, summary);
+    public void ToolStart(string name, string summary)
+    {
+        _tui.FlushResponse();
+        _tui.ToolStart(name, summary);
+    }
 
     public void ToolEnd(string name, bool ok, string reason)
     {
+        _tui.FlushResponse();
         if (ok)
             _tui.ToolSuccess(name);
         else
             _tui.ToolError(name, reason);
     }
 
-    public void Usage(long contextTokens, long contextWindow) => _tui.SetTokens(contextTokens);
-    public void Info(string message) => _tui.Info(message);
-    public void Error(string message) => _tui.Error(message);
-    public void Markdown(string markdown) => _tui.Markdown(markdown);
+    public void Usage(long contextTokens, long contextWindow) => _tui.SetUsage(contextTokens, contextWindow);
+    public void Info(string message)
+    {
+        _tui.FlushResponse();
+        _tui.Info(message);
+    }
+    public void Error(string message)
+    {
+        _tui.FlushResponse();
+        _tui.Error(message);
+    }
+    public void Markdown(string markdown)
+    {
+        _tui.FlushResponse();
+        _tui.Markdown(markdown);
+    }
 
-    public void HostStart(string command) => _tui.ToolStart("host-exec", command);
+    public void HostStart(string command)
+    {
+        _tui.FlushResponse();
+        _tui.ToolStart("host-exec", command);
+    }
 
     public void HostDone(string command, string output)
     {
+        _tui.FlushResponse();
         var failed = output.StartsWith("ERROR:", StringComparison.Ordinal) ||
             output.StartsWith("Exit code:", StringComparison.Ordinal);
         if (failed)
@@ -284,13 +345,23 @@ internal sealed class TuiUi : IBridgeUi
             _tui.ToolSuccess("host-exec");
     }
 
-    public void PlaybookDecision(string name, bool allow) =>
+    public void PlaybookDecision(string name, bool allow)
+    {
+        _tui.FlushResponse();
         _tui.Info($"Playbook '{name}' {(allow ? "approved" : "denied")}.");
+    }
 
-    public void ModeNotice(string mode) => _tui.ModeNotice(mode);
+    public void ModeNotice(string mode)
+    {
+        _tui.FlushResponse();
+        _tui.ModeNotice(mode);
+    }
 
     public Task<bool> ConfirmAsync(string question, CancellationToken ct) =>
         _tui.ConfirmAsync(question, ct);
+
+    public Task<(bool Allow, string Scope)> PermissionAsync(string tool, string summary, CancellationToken ct) =>
+        _tui.PermissionAsync(tool, summary, ct);
 
     public Task<string> InputAsync(string question, CancellationToken ct) =>
         _tui.InputAsync(question, ct);

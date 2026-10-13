@@ -192,9 +192,11 @@ starts or runs the bridge, and it never prompts. `--init` is only ever invoked
 as `--non-interactive` from the installer (with `--allow-sudo` / `--no-sudo`
 only when `OPENMONO_HOST_SUDO` was set at install); an interactive `--init`
 prompt would look like a hang, because `openmono setup` redirects the installer's
-stderr to the setup log. The run-as user and the sudo policy are confirmed
-**interactively on the first real `openmono agent --host` run** (or by hand
-any time with `host-bridge --init` or `openmono config host.*` - see
+stderr to the setup log. The sudo policy is chosen at install time
+(`OPENMONO_HOST_SUDO`, prompted by `scripts/install.sh`) and defaults to `ask`
+when unset; the run-as user defaults to whoever runs the bridge. Either can be
+changed by hand any time with `host-bridge --init` (interactive) or
+`openmono config host.*` - see
 [Configuration](CONFIG.md#host-bridge-host-sub-agent)).
 
 ## Mode A - single-box (inference + agent on one machine)

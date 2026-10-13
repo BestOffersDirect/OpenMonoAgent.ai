@@ -121,7 +121,7 @@ if (options.Init)
         else
             Console.Error.WriteLine(
                 "[bridge] --init non-interactive: sudo policy left as " +
-                $"'{config.AllowSudo ?? "ask"}' — the bridge confirms it on the first real run. " +
+                $"'{config.AllowSudo ?? "ask"}' — each escalation is confirmed [y/N] at run time. " +
                 "Change later with: openmono config host.sudo_policy <ask|allow|deny>");
         BridgeConfig.Save(options.ConfigPath, config);
         return 0;

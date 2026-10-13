@@ -22,6 +22,14 @@ public sealed class Bridge
     private readonly string _workDir;
     private readonly bool _nonInteractive;
     private bool _buildMode;
+    // Session-scoped answers from the permission menu ("allow all" / "deny
+    // all"): in-memory only, mirroring the regular agent's PermissionEngine.
+    // Keyed by tool name ("sudo", "host-exec", or the ACP tool name).
+    private readonly HashSet<string> _sessionAllow = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _sessionDeny = new(StringComparer.OrdinalIgnoreCase);
+    // In-container AskUser call ids whose tool cards are swallowed because
+    // they carry a HOST_EXEC envelope (the bridge renders that action itself).
+    private readonly HashSet<string> _suppressedToolCalls = new(StringComparer.Ordinal);
 
     public Bridge(
         AcpClient acp,
@@ -90,10 +98,29 @@ public sealed class Bridge
                 _ui.Thinking(Str(evt.Data, "content"));
                 return null;
             case "tool_start":
-                _ui.ToolStart(Str(evt.Data, "name"), Str(evt.Data, "summary"));
+            {
+                var name = Str(evt.Data, "name");
+                var suppressId = HostExecSuppressionId(name, evt.Data);
+                if (suppressId is not null)
+                {
+                    // The in-container AskUser call carrying a HOST_EXEC
+                    // envelope: the bridge renders its own host-exec card +
+                    // prompt for the same action, so the raw-JSON card would be
+                    // a duplicate. Swallow it (and its tool_end, correlated
+                    // below by call id).
+                    if (_suppressedToolCalls.Count > 64)
+                        _suppressedToolCalls.Clear();
+                    _suppressedToolCalls.Add(suppressId);
+                    return null;
+                }
+                _ui.ToolStart(name, Str(evt.Data, "summary"));
                 return null;
+            }
             case "tool_end":
             {
+                var id = Str(evt.Data, "id");
+                if (id.Length > 0 && _suppressedToolCalls.Remove(id))
+                    return null;
                 var ok = evt.Data.TryGetProperty("ok", out var okEl) && okEl.ValueKind == JsonValueKind.True;
                 var reason = Str(evt.Data, "reason");
                 _ui.ToolEnd(Str(evt.Data, "name"), ok, reason);
@@ -101,7 +128,16 @@ public sealed class Bridge
             }
             case "usage":
             {
-                _ui.Usage(Num(evt.Data, "contextTokens"), Num(evt.Data, "contextWindow"));
+                // The server emits snake_case (context_tokens/context_window);
+                // accept camelCase too in case the wire format ever changes.
+                _ui.Usage(NumAny(evt.Data, "context_tokens", "contextTokens"), NumAny(evt.Data, "context_window", "contextWindow"));
+                return null;
+            }
+            case "sub_agent_log":
+            {
+                var line = Str(evt.Data, "line");
+                if (line.Length > 0)
+                    _ui.Thinking(line.EndsWith('\n') ? line : line + "\n");
                 return null;
             }
             case "permission_request":
@@ -235,34 +271,68 @@ public sealed class Bridge
         var targetUser = request.AsRoot ? "root" : _identity.RunAsUser;
 
         // Sudo escalation check (allow_sudo policy). The executor's sudo gate
-        // refuses Deny; Allow passes; Ask confirms here, per command. The yes
+        // refuses Deny; Allow passes; Ask confirms here, per command, through
+        // the same 4-option permission menu the regular agent uses
+        // ([y] Allow / [a] Allow all / [n] Deny / [!] Deny all). A once-answer
         // is in-memory only for THIS command — config stays ask until the
         // operator explicitly changes it (openmono config host.sudo_policy).
         if (_executor.RequiresElevation(request) && _identity.Sudo == SudoPolicy.Ask)
         {
-            var interactive = !_nonInteractive && !Console.IsInputRedirected;
-            if (!interactive)
+            if (_sessionDeny.Contains("sudo"))
             {
-                // Non-interactive fail closed: an ask policy can never
-                // escalate without a human at the keyboard.
                 AuditLog.WriteCommand(targetUser, request.AsRoot, request.Command,
                     -1, stopwatch.ElapsedMilliseconds, false,
-                    "sudo ask policy in a non-interactive bridge (fail closed)");
-                return "Host execution denied by bridge policy (sudo ask policy, non-interactive): " + request.Command;
+                    "sudo ask policy denied for session (deny all)");
+                return $"Host execution denied by operator (sudo denied for session): {request.Command}";
             }
-            var yes = await _ui.ConfirmAsync($"Run '{Truncate(request.Command, 200)}' as {targetUser} with sudo? [y/N]", ct);
-            if (!yes)
+            if (!_sessionAllow.Contains("sudo"))
             {
-                AuditLog.WriteCommand(targetUser, request.AsRoot, request.Command,
-                    -1, stopwatch.ElapsedMilliseconds, false, "operator declined sudo ask");
-                return $"Host execution denied by operator (sudo ask policy): {request.Command}";
+                var interactive = !_nonInteractive && !Console.IsInputRedirected;
+                if (!interactive)
+                {
+                    // Non-interactive fail closed: an ask policy can never
+                    // escalate without a human at the keyboard.
+                    AuditLog.WriteCommand(targetUser, request.AsRoot, request.Command,
+                        -1, stopwatch.ElapsedMilliseconds, false,
+                        "sudo ask policy in a non-interactive bridge (fail closed)");
+                    return "Host execution denied by bridge policy (sudo ask policy, non-interactive): " + request.Command;
+                }
+                var (allow, scope) = await _ui.PermissionAsync(
+                    "sudo", $"Run '{Truncate(request.Command, 200)}' as {targetUser} with sudo?", ct);
+                if (scope == "session")
+                {
+                    if (allow) _sessionAllow.Add("sudo");
+                    else _sessionDeny.Add("sudo");
+                }
+                if (!allow)
+                {
+                    AuditLog.WriteCommand(targetUser, request.AsRoot, request.Command,
+                        -1, stopwatch.ElapsedMilliseconds, false, "operator declined sudo ask");
+                    return $"Host execution denied by operator (sudo ask policy): {request.Command}";
+                }
             }
         }
 
         if (decision == HostPolicyDecision.Ask && !_nonInteractive)
         {
-            var yes = await _ui.ConfirmAsync($"Run on host? {request.Command}", ct);
-            decision = yes ? HostPolicyDecision.Allow : HostPolicyDecision.Deny;
+            if (_sessionDeny.Contains("host-exec"))
+            {
+                decision = HostPolicyDecision.Deny;
+            }
+            else if (_sessionAllow.Contains("host-exec"))
+            {
+                decision = HostPolicyDecision.Allow;
+            }
+            else
+            {
+                var (allow, scope) = await _ui.PermissionAsync("host-exec", request.Command, ct);
+                if (scope == "session")
+                {
+                    if (allow) _sessionAllow.Add("host-exec");
+                    else _sessionDeny.Add("host-exec");
+                }
+                decision = allow ? HostPolicyDecision.Allow : HostPolicyDecision.Deny;
+            }
         }
         if (decision != HostPolicyDecision.Allow)
         {
@@ -297,10 +367,26 @@ public sealed class Bridge
         _config.Tools.TryGetValue(tool, out var rule);
         rule = (rule ?? _config.ToolDefault).Trim().ToLowerInvariant();
         var explicitAllow = _config.Tools.ContainsKey(tool) && rule == "allow";
+        if (_sessionDeny.Contains(tool))
+        {
+            _ui.Info($"[bridge] session-deny {tool} ({Truncate(summary, 120)})");
+            return false;
+        }
+        if (_sessionAllow.Contains(tool))
+        {
+            _ui.Info($"[bridge] session-allow {tool} ({Truncate(summary, 120)}) [{_config.PermissionScope}]");
+            return true;
+        }
         if (dangerous && !explicitAllow)
         {
             _ui.Info($"[bridge] dangerous {tool} ({Truncate(summary, 120)}) — asking operator.");
-            return await _ui.ConfirmAsync($"Allow dangerous {tool}? {Truncate(summary, 200)}", ct);
+            var (allow, scope) = await _ui.PermissionAsync(tool, $"Allow dangerous {tool}? {Truncate(summary, 200)}", ct);
+            if (scope == "session")
+            {
+                if (allow) _sessionAllow.Add(tool);
+                else _sessionDeny.Add(tool);
+            }
+            return allow;
         }
         if (rule == "allow")
         {
@@ -312,7 +398,13 @@ public sealed class Bridge
             _ui.Info($"[bridge] auto-deny {tool} ({Truncate(summary, 120)})");
             return false;
         }
-        return await _ui.ConfirmAsync($"Allow {tool}? {Truncate(summary, 200)}", ct);
+        var (ok, okScope) = await _ui.PermissionAsync(tool, $"Allow {tool}? {Truncate(summary, 200)}", ct);
+        if (okScope == "session")
+        {
+            if (ok) _sessionAllow.Add(tool);
+            else _sessionDeny.Add(tool);
+        }
+        return ok;
     }
 
     private static List<PlaybookStep> ParseSteps(JsonElement data)
@@ -353,6 +445,46 @@ public sealed class Bridge
     private static bool IsDangerous(JsonElement data) =>
         data.TryGetProperty("dangerous", out var el) && el.ValueKind == JsonValueKind.True;
 
+    /// <summary>
+    /// The call id to suppress when this tool_start is the in-container
+    /// AskUser call carrying a HOST_EXEC envelope (its summary is the raw
+    /// AskUser args JSON, e.g. <c>{"question":"HOST_EXEC: ..."}</c>), else
+    /// null. Genuine AskUser questions are never suppressed.
+    /// </summary>
+    private static string? HostExecSuppressionId(string name, JsonElement data)
+    {
+        if (!name.Equals("AskUser", StringComparison.OrdinalIgnoreCase))
+            return null;
+        var id = Str(data, "id");
+        if (id.Length == 0)
+            return null;
+        if (HostExecRequest.LooksLikeHostExec(Str(data, "summary")))
+            return id;
+        if (data.TryGetProperty("arguments", out var argsEl) &&
+            argsEl.ValueKind == JsonValueKind.String &&
+            LooksLikeHostExecArgs(argsEl.GetString()))
+            return id;
+        return null;
+    }
+
+    private static bool LooksLikeHostExecArgs(string? args)
+    {
+        if (string.IsNullOrWhiteSpace(args))
+            return false;
+        try
+        {
+            using var doc = JsonDocument.Parse(args);
+            if (doc.RootElement.TryGetProperty("question", out var q) &&
+                q.ValueKind == JsonValueKind.String &&
+                HostExecRequest.LooksLikeHostExec(q.GetString() ?? ""))
+                return true;
+        }
+        catch (JsonException)
+        {
+        }
+        return args.Contains(HostExecRequest.Prefix, StringComparison.Ordinal);
+    }
+
     private static string Str(JsonElement data, string name) =>
         data.ValueKind == JsonValueKind.Object &&
         data.TryGetProperty(name, out var el) && el.ValueKind == JsonValueKind.String
@@ -364,6 +496,16 @@ public sealed class Bridge
         data.TryGetProperty(name, out var el) && el.TryGetInt64(out var v)
             ? v
             : 0;
+
+    /// <summary>
+    /// First positive value wins: prefers the server's snake_case usage field,
+    /// falls back to camelCase. A missing field reads 0 either way.
+    /// </summary>
+    private static long NumAny(JsonElement data, string first, string second)
+    {
+        var v = Num(data, first);
+        return v > 0 ? v : Num(data, second);
+    }
 
     private static string Truncate(string s, int max) =>
         string.IsNullOrEmpty(s) || s.Length <= max ? s ?? "" : s[..max] + "...";

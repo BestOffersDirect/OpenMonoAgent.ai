@@ -833,6 +833,24 @@ internal sealed partial class AnsiPainter(AppConfig config, SessionState session
         Paint();
     }
 
+    /// <summary>
+    /// Commits whatever text has streamed so far as a finished assistant
+    /// segment and starts a fresh one. The host bridge calls this before any
+    /// committed mid-turn render (tool cards, prompts, notices): streamed text
+    /// lives in the buffer until <see cref="EndAssistantResponse"/>, so without
+    /// a commit the prose would land AFTER cards that chronologically follow
+    /// it. No-op when nothing has streamed since the last commit.
+    /// </summary>
+    internal void CommitStreamSegment()
+    {
+        string pending;
+        lock (_streamLock) { pending = _streamBuf.ToString(); }
+        if (pending.Length == 0)
+            return;
+        EndAssistantResponse(null);
+        StartAssistantResponse();
+    }
+
     internal void AppendThinking(string text) => AppendThinking(text, null);
 
     internal void AppendThinking(string text, string? agentLabel)

@@ -92,7 +92,13 @@ case "${OPENMONO_HOST_SUDO:-}" in
         "$BIN_DIR/host-bridge" --init --no-sudo --non-interactive 2>&1
         ;;
     *)
-        echo "[host-bridge] sudo policy left as default (ask) — the bridge will confirm run-as user + sudo on first run."
+        # Ensure the config exists even on the default path: a flag-less
+        # --non-interactive --init only writes the sample when missing and
+        # preserves every existing value — so the host-exec default block
+        # below always has a file to update (a fresh exec=allow answer would
+        # otherwise be silently dropped).
+        "$BIN_DIR/host-bridge" --init --non-interactive 2>&1
+        echo "[host-bridge] sudo policy left as default (ask) — each escalation is confirmed [y/N] at run time."
         ;;
 esac
 
