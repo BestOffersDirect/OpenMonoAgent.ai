@@ -70,7 +70,7 @@ if (options.Init)
         }
         if (!string.IsNullOrWhiteSpace(runAs) && !HostIdentity.IsValidUsername(runAs))
         {
-            Console.Error.WriteLine($"[bridge] ERROR: invalid username '{runAs}' (expected ^[a-z_][a-z0-9_-]*[$]?$).");
+            Console.Error.WriteLine($"[bridge] ERROR: invalid username '{runAs}' (expected ^[A-Za-z_][A-Za-z0-9_-]*[$]?$).");
             return 1;
         }
         if (!sudoExplicit)
@@ -134,7 +134,7 @@ password = null; // owned by identity now (zeroed on dispose)
 if (!string.IsNullOrWhiteSpace(runAs) && !HostIdentity.IsValidUsername(runAs))
 {
     Console.Error.WriteLine(
-        $"[bridge] ERROR: invalid run_as username '{runAs}' (expected ^[a-z_][a-z0-9_-]*[$]?$).");
+        $"[bridge] ERROR: invalid run_as username '{runAs}' (expected ^[A-Za-z_][A-Za-z0-9_-]*[$]?$).");
     return 1;
 }
 

@@ -5,7 +5,7 @@ namespace OpenMono.HostBridge;
 /// session (never on --session attach — that conversation already has them).
 /// Why this exists: the model loop runs in a container whose Bash/Grep/
 /// FileRead tools see only /workspace. Every host action — shell, files,
-/// logs, git, docker, systemctl, installs, health checks — must go through
+/// logs, git, docker, service managers, installs, health checks — must go through
 /// the host sub-agent as <c>HOST_EXEC</c> via AskUser, running on bare metal
 /// as the run-as user. Without this preamble the agent guesses container
 /// paths (e.g. Grep /root/.openmono/...) and fails.
@@ -18,6 +18,11 @@ public static class OperatorPreamble
         string hostLogDir,
         SudoPolicy sudo)
     {
+        // macOS hosts speak launchd/unified-log, not systemd: keep the model
+        // from suggesting systemctl/journalctl (and container paths) there.
+        var macOS = OperatingSystem.IsMacOS();
+        var hostKind = macOS ? "Mac host" : "Linux server";
+        var svcExamples = macOS ? "launchd (launchctl list/print), log show" : "systemctl, journalctl";
         var sudoLine = sudo switch
         {
             SudoPolicy.Allow =>
@@ -28,10 +33,10 @@ public static class OperatorPreamble
                 "Sudo is NOT allowed for this bridge (deny policy): never set \"as_root\": true — the bridge will refuse. If a step truly needs root, stop and tell the operator to enable sudo (openmono config host.sudo_policy allow) instead of working around it.",
         };
         return $$"""
-            [HOST OPERATOR CONTEXT — standing orders for this whole session, higher priority than any playbook's tool defaults. You are managing a Linux server through a host sub-agent. Your own Bash/Grep/FileRead/Glob tools run INSIDE a container and see only the bind-mounted workspace below — they CANNOT see host files, host logs, the host docker daemon state beyond the mount, or systemd.]
+            [HOST OPERATOR CONTEXT — standing orders for this whole session, higher priority than any playbook's tool defaults. You are managing a {{hostKind}} through a host sub-agent. Your own Bash/Grep/FileRead/Glob tools run INSIDE a container and see only the bind-mounted workspace below — they CANNOT see host files, host logs, the host docker daemon state beyond the mount, or service state.]
 
             - Workspace (the only place your container tools work): {{workDir}}
-            - For ANY host action — shell commands, reading/writing ANY file outside the workspace, logs, git, docker/docker compose, systemctl/journalctl, installs, curl health checks — call AskUser with a question of exactly this form and NOTHING else on the question line:
+            - For ANY host action — shell commands, reading/writing ANY file outside the workspace, logs, git, docker/docker compose, {{svcExamples}}, installs, curl health checks — call AskUser with a question of exactly this form and NOTHING else on the question line:
               HOST_EXEC: {"command": "<shell command>", "timeout_ms": 300000, "background": false}
               The host sub-agent runs it on bare metal as user '{{runAsUser}}' and answers with its output. Set "background": true for servers/watchers that never exit (answer carries PID + log path to tail with a later HOST_EXEC call). {{sudoLine}}
             - Inside the JSON envelope the command MUST be valid JSON: escape every newline as \n and every double-quote as \". Or skip JSON entirely and put raw shell after HOST_EXEC: (heredocs welcome). Split payloads over ~4 KB into several append calls (cat >> file <<'EOF') rather than one giant envelope.

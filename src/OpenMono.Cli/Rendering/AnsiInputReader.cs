@@ -399,6 +399,184 @@ internal sealed class AnsiInputReader(
         return Task.FromResult(ans);
     }
 
+    /// <summary>
+    /// Masked secret prompt that stays inside the full-screen TUI chat lane.
+    /// Echoes <c>*</c> only, never writes the value to the transcript,
+    /// history, suggestions, or background buffer. Returns chars owned by
+    /// the caller (hand to <c>HostIdentity</c> or zero them).
+    /// </summary>
+    public Task<char[]> AskSecretAsync(string question, CancellationToken ct)
+    {
+        var saved = _bgInputBuf.ToString();
+        painter.AddMessage(new AnsiPainter.Msg("sys", $"? {question}"));
+        StopBackgroundInput();
+        painter.Sz();
+        var wrapped = AnsiPainter.Wrap($"? {question}", Math.Max(1, painter.ComputeLayout("").MainW - 2));
+        painter.PaintActionLaneLines(wrapped,
+            $"  {AnsiPainter.Fk}Secret input — masked, Enter confirm · Esc cancel{AnsiPainter.R}");
+        painter.PaintConvThrottled(force: true);
+
+        char[] secret;
+        try
+        {
+            secret = ReadSecretCore(ct);
+        }
+        finally
+        {
+            painter.PaintActionLane("", "", "");
+            painter.Paint();
+            StartBackgroundInput(saved);
+        }
+        if (secret.Length > 0)
+            painter.AddMessage(new AnsiPainter.Msg("sys", "• hidden input provided (not shown)"));
+        else
+            painter.AddMessage(new AnsiPainter.Msg("sys", "• hidden input cancelled"));
+        painter.Paint();
+        return Task.FromResult(secret);
+    }
+
+    private char[] ReadSecretCore(CancellationToken ct)
+    {
+        painter.Sz();
+        painter.Write($"{AnsiPainter.E}[?25h");
+        painter.Write($"{AnsiPainter.E}[?2004h");
+
+        var buf = new List<char>(64);
+        var cur = 0;
+        // The paint thread reads this for the context gauge — stars only,
+        // never the secret itself.
+        _liveMainInput = () => new string('*', buf.Count);
+
+        void Draw() => painter.DrawInputText(new string('*', buf.Count), cur);
+        Draw();
+        AnsiPainter.Flush();
+
+        var prev = Console.TreatControlCAsInput;
+        Console.TreatControlCAsInput = true;
+        try
+        {
+            while (true)
+            {
+                ct.ThrowIfCancellationRequested();
+                var result = terminal.TryReadKey();
+                if (result is null)
+                {
+                    Thread.Sleep(20);
+                    continue;
+                }
+                var k = result.Value;
+
+                if (k.Key == ConsoleKey.PageUp) { painter.ScrollPageUp(); painter.Paint(); continue; }
+                if (k.Key == ConsoleKey.PageDown) { painter.ScrollPageDown(); painter.Paint(); continue; }
+
+                if (k.Key == ConsoleKey.C && k.Modifiers.HasFlag(ConsoleModifiers.Control))
+                {
+                    var now = DateTime.UtcNow;
+                    var isDouble = (now - _lastCtrlCTime).TotalSeconds <= 1.5;
+                    if (isDouble)
+                    {
+                        ProcessWatchdog.ScheduleHardKill();
+                        OnSafeExit();
+                        Environment.Exit(0);
+                    }
+                    _lastCtrlCTime = now;
+                    buf.Clear(); cur = 0;
+                    Draw();
+                    continue;
+                }
+
+                if (k.Key == ConsoleKey.Escape)
+                {
+                    if (!Console.KeyAvailable) { var ms = 0; while (!Console.KeyAvailable && ms < 50) { Thread.Sleep(1); ms++; } }
+                    if (Console.KeyAvailable)
+                    {
+                        var (scroll, paste, _, _) = TryReadEscapeSequence();
+                        if (paste is not null)
+                        {
+                            var c = paste.Replace("\r\n", "\n").Replace('\r', '\n');
+                            foreach (var ch in c)
+                            {
+                                if (ch == '\n' || ch == '\r') continue;
+                                buf.Insert(cur++, ch);
+                            }
+                            Draw();
+                        }
+                        else if (scroll != 0) { ApplyScroll(scroll); }
+                        continue;
+                    }
+                    // Esc alone = cancel. Wipe what was typed.
+                    for (var i = 0; i < buf.Count; i++) buf[i] = '\0';
+                    buf.Clear();
+                    return [];
+                }
+
+                if (k.Key == ConsoleKey.Enter)
+                {
+                    var secret = buf.ToArray();
+                    for (var i = 0; i < buf.Count; i++) buf[i] = '\0';
+                    buf.Clear();
+                    painter.Write($"{AnsiPainter.E}[?25l{AnsiPainter.R}");
+                    AnsiPainter.Flush();
+                    return secret;
+                }
+
+                if (k.Key == ConsoleKey.Backspace)
+                {
+                    if (cur > 0) { buf.RemoveAt(cur - 1); cur--; Draw(); }
+                    continue;
+                }
+
+                if (k.Key == ConsoleKey.Delete)
+                {
+                    if (cur < buf.Count) { buf.RemoveAt(cur); Draw(); }
+                    continue;
+                }
+
+                if (k.Key == ConsoleKey.LeftArrow) { if (cur > 0) cur--; Draw(); continue; }
+                if (k.Key == ConsoleKey.RightArrow) { if (cur < buf.Count) cur++; Draw(); continue; }
+                if (k.Key == ConsoleKey.Home) { cur = 0; Draw(); continue; }
+                if (k.Key == ConsoleKey.End) { cur = buf.Count; Draw(); continue; }
+
+                if (k.Key == ConsoleKey.U && k.Modifiers.HasFlag(ConsoleModifiers.Control))
+                {
+                    for (var i = 0; i < buf.Count; i++) buf[i] = '\0';
+                    buf.Clear(); cur = 0;
+                    Draw();
+                    continue;
+                }
+
+                if ((k.Key == ConsoleKey.V && k.Modifiers.HasFlag(ConsoleModifiers.Control)) ||
+                    (k.Key == ConsoleKey.Insert && k.Modifiers.HasFlag(ConsoleModifiers.Shift)))
+                {
+                    var p = ReadClipboard();
+                    if (p is not null)
+                    {
+                        foreach (var ch in p.Replace("\r\n", "\n").Replace('\r', '\n'))
+                        {
+                            if (ch == '\n' || ch == '\r') continue;
+                            buf.Insert(cur++, ch);
+                        }
+                        Draw();
+                    }
+                    continue;
+                }
+
+                if (k.KeyChar != '\0' && !char.IsControl(k.KeyChar))
+                {
+                    buf.Insert(cur++, k.KeyChar);
+                    Draw();
+                }
+            }
+        }
+        finally
+        {
+            _liveMainInput = null;
+            Console.TreatControlCAsInput = prev;
+            painter.Write($"{AnsiPainter.E}[?2004l");
+            AnsiPainter.Flush();
+        }
+    }
+
     public Task<string> AskUserAsync(string question, IReadOnlyList<string>? options, CancellationToken ct)
     {
         if (options is not { Count: > 0 })

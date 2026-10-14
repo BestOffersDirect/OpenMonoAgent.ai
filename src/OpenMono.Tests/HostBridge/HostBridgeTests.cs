@@ -305,6 +305,23 @@ public class OperatorPreambleTests
         var preamble = OperatorPreamble.Build("/w", "operator", "/home/operator/.openmono/logs", SudoPolicy.Deny);
         preamble.Should().Contain("Do not quote");
     }
+
+    [Fact]
+    public void Build_MatchesHostOS()
+    {
+        var preamble = OperatorPreamble.Build("/w", "operator", "/home/operator/.openmono/logs", SudoPolicy.Deny);
+        if (OperatingSystem.IsMacOS())
+        {
+            preamble.Should().Contain("Mac host");
+            preamble.Should().Contain("launchctl");
+            preamble.Should().NotContain("systemctl");
+        }
+        else
+        {
+            preamble.Should().Contain("Linux server");
+            preamble.Should().Contain("systemctl");
+        }
+    }
 }
 
 public class TuiInputFilterTests
@@ -377,6 +394,22 @@ public class HostExecPolicyMigrationTests
         var config = StockAskConfig();
         config.HostExec.Default = "allow";
         BridgeConfig.MigrateStockAskToAllow(null, config, new StringWriter()).Should().BeFalse();
+    }
+
+    [Fact]
+    public void MacOSSampleTwin_CountsAsUncustomized()
+    {
+        var config = StockAskConfig();
+        config.HostExec.Allow = [.. HostExecPolicy.SampleAllowMacOS];
+        config.HostExec.IsUncustomizedAskSample().Should().BeTrue();
+    }
+
+    [Fact]
+    public void MacOSSampleTwin_StaysReadOnly()
+    {
+        HostExecPolicy.SampleAllowMacOS.Should().Contain("git *");
+        HostExecPolicy.SampleAllowMacOS.Should().NotContain("docker *");
+        HostExecPolicy.SampleAllowMacOS.Should().NotContain("curl *");
     }
 
     [Fact]
@@ -546,7 +579,8 @@ public class EscalationDetectionTests
     [InlineData("user$", true)]
     [InlineData("", false)]
     [InlineData("   ", false)]
-    [InlineData("Deploy", false)]
+    [InlineData("Deploy", true)]
+    [InlineData("JohnDoe", true)]
     [InlineData("0user", false)]
     [InlineData("bad;user", false)]
     [InlineData("a b", false)]

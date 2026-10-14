@@ -149,8 +149,11 @@ public sealed class BridgeConfig
                     // list still blocks destructive patterns, sudo still needs
                     // its own opt-in, and every command is audited. Install
                     // flips this to "allow" only on explicit opt-in — never
-                    // silently.
-                    Allow = [.. HostExecPolicy.SampleAllow],
+                    // silently. macOS samples ship read-only launchd/log
+                    // patterns instead of the Linux systemctl/journalctl ones.
+                    Allow = [.. (OperatingSystem.IsMacOS()
+                        ? HostExecPolicy.SampleAllowMacOS
+                        : HostExecPolicy.SampleAllow)],
                     Deny = [.. HostExecPolicy.SampleDeny],
                     Default = "ask",
                 },
@@ -232,6 +235,14 @@ public sealed class HostExecPolicy
     public static readonly IReadOnlyList<string> SampleAllow =
         ["git *", "systemctl status *", "journalctl *"];
 
+    /// <summary>
+    /// macOS sample-config twin: read-only launchd/log patterns instead of
+    /// the Linux systemctl/journalctl ones. Ask-by-default still prompts for
+    /// each; this list only matters under an explicit allow default.
+    /// </summary>
+    public static readonly IReadOnlyList<string> SampleAllowMacOS =
+        ["git *", "launchctl list *", "log show *"];
+
     /// <summary>Deny patterns shipped in the sample config.</summary>
     public static readonly IReadOnlyList<string> SampleDeny =
         ["rm -rf *", "shutdown *", "reboot *", "mkfs *"];
@@ -246,12 +257,13 @@ public sealed class HostExecPolicy
     public string Default { get; set; } = "ask";
 
     /// <summary>
-    /// True when this policy is byte-for-byte the OLD shipped sample (default
+    /// True when this policy is byte-for-byte a shipped sample (default
     /// ask): the operator never customized it, so upgrades may move it to the
-    /// new allow default. Anything customized is left strictly alone.
+    /// new allow default. Anything customized is left strictly alone. Accepts
+    /// the macOS sample twin as well as the Linux one.
     /// </summary>
     public bool IsUncustomizedAskSample() =>
         Default.Trim().Equals("ask", StringComparison.OrdinalIgnoreCase) &&
-        Allow.SequenceEqual(SampleAllow) &&
+        (Allow.SequenceEqual(SampleAllow) || Allow.SequenceEqual(SampleAllowMacOS)) &&
         Deny.SequenceEqual(SampleDeny);
 }

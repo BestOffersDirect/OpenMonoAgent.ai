@@ -252,32 +252,25 @@ internal sealed class TuiFrontend
     }
 
     /// <summary>
-    /// Masked sudo-password prompt. Fullscreen + background input are stood
-    /// down first (the partial response is committed so nothing is lost), then
-    /// restored — the TUI input box echoes, so it cannot ask for secrets
-    /// itself. Nothing typed here is logged.
+    /// Masked sudo-password prompt inside the TUI chat lane. Stays in
+    /// fullscreen: the input box shows <c>*</c> only and the secret never
+    /// touches the transcript, history, or suggestion overlay.
+    /// Falls back to the console prompt when stdin is redirected.
+    /// Nothing typed here is logged.
     /// </summary>
     public Task<char[]> PasswordAsync(string prompt, CancellationToken ct)
     {
         FlushResponse();
-        ResponseEnd();
-        EndTurn();
-        Exit();
+        if (Console.IsInputRedirected)
+            return Task.FromResult(HostIdentity.PromptPassword(prompt, Console.Error));
         try
         {
-            return Task.FromResult(HostIdentity.PromptPassword(prompt, Console.Error));
+            return _tui.AskSecretAsync(prompt, ct);
         }
-        finally
+        catch (OperationCanceledException)
         {
-            EnterAgain();
-            BeginTurn();
-            ResponseBegin();
+            return Task.FromResult(Array.Empty<char>());
         }
-    }
-
-    private void EnterAgain()
-    {
-        _tui.EnterFullScreen();
     }
 }
 

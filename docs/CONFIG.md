@@ -395,7 +395,7 @@ openmono config unset host.run_as
 | `host.exec_default` | `.host_exec.default` | `ask` \| `allow` \| `deny` | `ask` |
 | `host.sudo_policy` | `.allow_sudo` | `ask` \| `allow` \| `deny` | `ask` |
 | `host.run_as` | `.run_as` | username (empty = whoever runs the bridge) | *(empty)* |
-| `host.allow_list` | `.host_exec.allow` | string array (comma-separated on the CLI) | `git *`, `systemctl status *`, `journalctl *` |
+| `host.allow_list` | `.host_exec.allow` | string array (comma-separated on the CLI) | `git *`, `systemctl status *`, `journalctl *` (Linux; macOS samples ship `git *`, `launchctl list *`, `log show *`) |
 | `host.deny_list` | `.host_exec.deny` | string array (comma-separated on the CLI) | *(sample deny list)* |
 | `host.timeout_ms` | `.timeout_ms` | integer (milliseconds) | `300000` |
 

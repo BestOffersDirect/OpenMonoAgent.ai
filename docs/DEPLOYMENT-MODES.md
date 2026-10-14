@@ -132,7 +132,18 @@ Project layout (`src/OpenMono.HostBridge/`, .NET 10, references the CLI project 
   `allow` escalates without prompting; `deny` refuses every escalation with how
   to change the policy. `--allow-sudo` / `--no-sudo` override per run (explicit,
   never silent) and win over the config. `run_as` is validated against
-  `^[a-z_][a-z0-9_-]*[$]?$` before use in `sudo -u`.
+  `^[A-Za-z_][A-Za-z0-9_-]*[$]?$` before use in `sudo -u` (capitals allowed
+  for macOS short names; shell metacharacters never are).
+- **Wrong password: retry + wipe.** A failed elevation zeroes and drops the
+  in-memory secret immediately, then re-prompts in the same surface (TUI chat
+  lane, masked — or a masked line-mode prompt), up to 3 entries per command.
+  After the third failure the secret is wiped and the command reports
+  authentication failure; re-run it to try again. Non-interactive and
+  background runs fail fast instead of prompting.
+- **macOS + Touch ID.** If this Mac unlocks sudo with Touch ID (`pam_tid.so`
+  in `/etc/pam.d/sudo`), bridge elevations still need the typed password:
+  the bridge feeds sudo over piped stdin (`sudo -S`), which bypasses Touch ID
+  — Touch ID only answers TTY prompts. Type the password when asked.
 - **Legacy bool configs.** Old `host-bridge.json` files stored `allow_sudo` as a
   JSON boolean; it is mapped on load (`true` → `allow`, `false` → `deny`,
   missing/null → `ask`) and normalized to the string form on the next save.

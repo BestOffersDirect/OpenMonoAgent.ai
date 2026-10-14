@@ -15,10 +15,11 @@
 # to the install log.
 #
 # .NET 10 is required. When it is missing, this script reuses the EXISTING
-# prerequisite path (scripts/install_prereqs.sh — the same installer that
-# provides .NET 10 for the main agent) instead of inventing a second one.
-# That path also ensures Docker, git, curl, and jq, which the server role
-# needs for its in-container agent.
+# prerequisite path (scripts/install_prereqs.sh on Linux, or
+# scripts/install_prereqs_macos.sh with OPENMONO_ROLE=agent on macOS — the
+# same installers that provide .NET 10 for the main agent) instead of
+# inventing a second one. That path also ensures Docker, git, curl, and jq,
+# which the server role needs for its in-container agent.
 # ──────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -36,8 +37,16 @@ dotnet10_present() {
 
 if ! dotnet10_present; then
     echo "[host-bridge] .NET 10 SDK not found — running the existing prerequisites installer..."
-    bash "$SCRIPT_DIR/install_prereqs.sh" \
-        || { echo "ERROR: prerequisites installer failed." >&2; exit 1; }
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        # macOS: the Ubuntu/apt prereqs path cannot run here. The macOS
+        # prereqs installer covers the server role with OPENMONO_ROLE=agent
+        # (Homebrew, Xcode CLT, core tools, Docker, .NET — no llama.cpp).
+        OPENMONO_ROLE="${OPENMONO_ROLE:-agent}" bash "$SCRIPT_DIR/install_prereqs_macos.sh" \
+            || { echo "ERROR: prerequisites installer failed." >&2; exit 1; }
+    else
+        bash "$SCRIPT_DIR/install_prereqs.sh" \
+            || { echo "ERROR: prerequisites installer failed." >&2; exit 1; }
+    fi
     # prereqs installs the SDK under ~/.dotnet and updates rc files, neither of
     # which affects this shell — pick it up explicitly.
     if [[ -x "$HOME/.dotnet/dotnet" ]]; then

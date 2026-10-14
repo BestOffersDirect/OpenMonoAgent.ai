@@ -357,15 +357,26 @@ public sealed class Bridge : IHostExecPrompter
         }
 
         // Lazy password: only when this exact escalation needs one we do not
-        // have. Masked prompt, memory-only, never logged. The TUI briefly
-        // stands down fullscreen so the secret never touches its input box.
+        // have. Masked prompt, memory-only, never logged. Up to 3 entries:
+        // a wrong password is zeroed + dropped immediately so the next
+        // attempt re-prompts instead of reusing a known-bad secret.
+        const int maxPasswordAttempts = 3;
+        var passwordAttempts = 0;
         if (_executor.NeedsPassword(request))
         {
             if (_nonInteractive || Console.IsInputRedirected)
                 return $"ERROR: elevation to '{targetUser}' needs a sudo password and none is in memory. " +
                     "Restart interactively to provide it, or set OPENMONO_HOST_PASSWORD_FILE.";
             _ui.Info($"[host] elevation to '{targetUser}' needs the sudo password.");
-            _identity.SetPassword(await _ui.PasswordAsync($"Sudo password for '{targetUser}' (type it — nothing is logged): ", ct));
+            var first = await _ui.PasswordAsync($"Sudo password for '{targetUser}' (type it — nothing is logged): ", ct);
+            if (first.Length == 0)
+            {
+                Array.Clear(first);
+                _identity.ForgetPassword();
+                return $"ERROR: sudo password entry cancelled for '{targetUser}': {request.Command}";
+            }
+            _identity.SetPassword(first);
+            passwordAttempts = 1;
         }
 
         // Pre-exec hint only (never blocking): warn about TTY-direct secrets
@@ -385,6 +396,43 @@ public sealed class Bridge : IHostExecPrompter
 
         _ui.HostStart(request.Command);
         var output = await _executor.ExecuteAsync(request, _config.TimeoutMs, ct, this);
+
+        // Wrong-password retry: wipe the bad secret, re-prompt in the same
+        // surface (TUI chat lane or line-mode masked prompt), re-run.
+        // Non-interactive and background runs fail fast — no one to ask.
+        var canReprompt = !_nonInteractive && !Console.IsInputRedirected && !request.Background
+            && _executor.RequiresElevation(request) && _identity.Sudo != SudoPolicy.Deny;
+        while (HostExecutor.IsPasswordFailure(output) && canReprompt && passwordAttempts < maxPasswordAttempts)
+        {
+            _identity.ForgetPassword();
+            HostExecutor.NoteAuthenticationFailure(targetUser);
+            _ui.Error($"[host] sudo authentication failed for '{targetUser}' (attempt {passwordAttempts}/{maxPasswordAttempts}). Try again — the old password was wiped from memory.");
+            char[] retry;
+            try
+            {
+                retry = await _ui.PasswordAsync($"Sudo password for '{targetUser}' (attempt {passwordAttempts + 1}/{maxPasswordAttempts}, nothing is logged): ", ct);
+            }
+            catch (OperationCanceledException)
+            {
+                return $"[host-exec on {_workDir}]\n$ {request.Command}\nERROR: sudo password entry cancelled for '{targetUser}'.";
+            }
+            if (retry.Length == 0)
+            {
+                Array.Clear(retry);
+                _identity.ForgetPassword();
+                return $"[host-exec on {_workDir}]\n$ {request.Command}\nERROR: sudo password entry cancelled for '{targetUser}'.";
+            }
+            _identity.SetPassword(retry);
+            passwordAttempts++;
+            _ui.HostStart(request.Command);
+            output = await _executor.ExecuteAsync(request, _config.TimeoutMs, ct, this);
+        }
+        if (HostExecutor.IsPasswordFailure(output) && passwordAttempts >= maxPasswordAttempts)
+        {
+            _identity.ForgetPassword();
+            output = $"ERROR: sudo authentication failed for '{targetUser}' after {maxPasswordAttempts} attempts. The wrong password was wiped from memory — re-run the command to try again.";
+        }
+
         _ui.HostDone(request.Command, output);
         return $"[host-exec on {_workDir}]\n$ {request.Command}\n{output}";
     }

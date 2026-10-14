@@ -44,8 +44,11 @@ public sealed class HostIdentity : IDisposable
 
     public static string CurrentUser => Environment.UserName;
 
+    // Linux accounts are lowercase by convention, but macOS short names may
+    // contain capitals — accept both. Still rejects shell metacharacters,
+    // whitespace, and paths so the value can never escape `sudo -u`.
     private static readonly System.Text.RegularExpressions.Regex ValidUsername =
-        new(@"^[a-z_][a-z0-9_-]*[$]?$", System.Text.RegularExpressions.RegexOptions.Compiled);
+        new(@"^[A-Za-z_][A-Za-z0-9_-]*[$]?$", System.Text.RegularExpressions.RegexOptions.Compiled);
 
     /// <summary>
     /// Validates a run-as username before it is interpolated into
@@ -137,6 +140,16 @@ public sealed class HostIdentity : IDisposable
     {
         ClearPassword();
         _password = password;
+    }
+
+    /// <summary>
+    /// Zeroes and drops the in-memory sudo password (e.g. after an
+    /// authentication failure) so the next elevation re-prompts instead of
+    /// reusing a known-bad secret.
+    /// </summary>
+    public void ForgetPassword()
+    {
+        ClearPassword();
     }
 
     private void ClearPassword()

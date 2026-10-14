@@ -132,6 +132,10 @@ public sealed class AnsiTuiRenderer : IRenderer
     public Task<string> AskUserAsync(string question, IReadOnlyList<string>? options, CancellationToken ct)
         => _inputReader.AskUserAsync(question, options, ct);
 
+    /// <summary>Masked secret prompt inside the TUI chat lane (no echo, no transcript).</summary>
+    public Task<char[]> AskSecretAsync(string question, CancellationToken ct)
+        => _inputReader.AskSecretAsync(question, ct);
+
     public Task<PermissionResponse> AskPermissionAsync(string toolName, string summary, CancellationToken ct)
         => _inputReader.AskPermissionAsync(toolName, summary, ct);
 

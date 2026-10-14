@@ -384,12 +384,10 @@ public sealed class HostExecutor
                 "Restart the bridge interactively to provide it, or set OPENMONO_HOST_PASSWORD_FILE.";
 
         var result = await RunSudoAttemptAsync(command, targetUser, usePassword: true, timeoutMs, prompter, ct);
-        if (IsPasswordFailure(result))
-        {
-            // Timestamp may have expired between probe and run — one retry.
-            ForgetSudoProbe(targetUser);
-            result = await RunSudoAttemptAsync(command, targetUser, usePassword: true, timeoutMs, prompter, ct);
-        }
+        // No same-password retry here: a password failure means the in-memory
+        // secret is wrong (or sudo policy changed). The caller (Bridge) owns
+        // the retry loop: wipe + re-prompt. Retrying with identical bytes
+        // only burns sudo's limited attempts and risks lockout.
         return result;
     }
 
@@ -555,10 +553,18 @@ public sealed class HostExecutor
         return int.TryParse(digits, out var code) ? code : 1;
     }
 
-    private static bool IsPasswordFailure(string result) =>
+    /// <summary>
+    /// True when sudo rejected the authentication: wrong password, missing
+    /// password, or policy refusal. The caller should wipe the in-memory
+    /// secret and re-prompt rather than retry with identical bytes.
+    /// </summary>
+    internal static bool IsPasswordFailure(string result) =>
         result.Contains("a password is required", StringComparison.OrdinalIgnoreCase) ||
         result.Contains("no tty present", StringComparison.OrdinalIgnoreCase) ||
-        result.Contains("incorrect password attempts", StringComparison.OrdinalIgnoreCase);
+        result.Contains("incorrect password", StringComparison.OrdinalIgnoreCase) ||
+        result.Contains("sorry, try again", StringComparison.OrdinalIgnoreCase) ||
+        result.Contains("authentication failure", StringComparison.OrdinalIgnoreCase) ||
+        result.Contains("sudo: a password is required", StringComparison.OrdinalIgnoreCase);
 
     private static bool SudoPresent()
     {
@@ -614,6 +620,13 @@ public sealed class HostExecutor
             SudoProbeCache.Remove(targetUser);
         }
     }
+
+    /// <summary>
+    /// Drops a cached passwordless-probe entry after an authentication
+    /// failure so the next <c>NeedsPassword</c> check re-probes instead of
+    /// trusting a stale "no password needed" result.
+    /// </summary>
+    internal static void NoteAuthenticationFailure(string targetUser) => ForgetSudoProbe(targetUser);
 
     private static bool SudoProbeOnce(string targetUser)
     {
@@ -731,6 +744,8 @@ public sealed class HostExecutor
     {
         // TERM first (pid and process group), then KILL. Passwordless only
         // (-n): never prompt, fail closed when no timestamp/NOPASSWD.
+        // Negative-PID group kill verified on macOS (Darwin) as well as
+        // Linux; pkill -P is supported by both procps and Darwin pkill.
         foreach (var signal in new[] { "-TERM", "-KILL" })
         {
             RunSudoKillOnce(signal, pid.ToString(System.Globalization.CultureInfo.InvariantCulture));
