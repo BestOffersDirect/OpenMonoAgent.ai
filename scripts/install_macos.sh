@@ -18,6 +18,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_DIR="$(dirname "$SCRIPT_DIR")"  # repo root (parent of scripts/)
 # shellcheck source=lib/log.sh
 source "$SCRIPT_DIR/lib/log.sh"
+# shellcheck source=lib/prism.sh
+source "$SCRIPT_DIR/lib/prism.sh"
 
 # ── Context size presets (tokens) — edit here to change globally ──────────────
 CTX_48G=196608       # >=48 GB Metal  q8_0 KV
@@ -75,6 +77,68 @@ select_model() {
         _CTX_SIZE=$CTX_8G
     fi
     MODEL_ALIAS="${MODEL_NAME%.gguf}"
+}
+
+# Bonsai picker for Apple Silicon. Called AFTER unified-memory detection in
+# Step 2 (TOTAL_MEM must be set). Sets IS_BONSAI=1 and overrides
+# MODEL_*/_MODEL_LABEL/_CTX_SIZE when Bonsai is chosen.
+#
+# Tiering (unified memory is shared with the OS, so budget ~6-8GB for macOS):
+#   ≥24GB → PQ2_0 (7.2GB weights leave ample room for KV + mmproj)
+#   16-23GB → PTQ1_0 only (5.95GB; PQ2_0 would swap-thrash)
+# Conservative by design: Qwen is the default on TTY and non-TTY alike until
+# the Metal ternary path has a confirmed good run. An explicit --model=bonsai-*
+# that doesn't fit the Mac fails here, before any multi-GB download.
+prompt_bonsai_macos() {
+    local choice="${OPENMONO_MODEL:-auto}" _bonsai_want=""
+    case "$choice" in
+        bonsai-pq2|bonsai|pq2) _bonsai_want=pq2 ;;
+        bonsai-ptq1|ptq1)      _bonsai_want=ptq1 ;;
+        qwen) return 0 ;;
+        auto) ;;
+        *) warn "Unknown --model=$choice — using Qwen"; return 0 ;;
+    esac
+    if [ -z "$_bonsai_want" ]; then
+        # No explicit flag: offer on TTY only, Qwen default. 16GB Macs are
+        # offered PTQ1_0 only; PQ2_0 appears from 24GB up.
+        if [ ! -t 0 ] || [ "${TOTAL_MEM:-0}" -lt 16 ]; then return 0; fi
+        flush_stdin
+        echo ""
+        echo "  Which model for this Mac? (${TOTAL_MEM}GB unified memory)"
+        echo ""
+        echo "  1) Qwen (default, tested on Metal)"
+        if [ "$TOTAL_MEM" -ge 24 ]; then
+        echo "  2) Ternary-Bonsai-2-27B PQ2_0 (~7.2GB) [EXPERIMENTAL on Metal]"
+        echo "  3) Ternary-Bonsai-2-27B PTQ1_0 (~5.9GB) [EXPERIMENTAL on Metal]"
+        else
+        echo "  2) Ternary-Bonsai-2-27B PTQ1_0 (~5.9GB) [EXPERIMENTAL on Metal]"
+        fi
+        echo ""
+        printf "  Enter 1, 2 or 3 [default: 1]: "
+        read -r -n 1 _bmc_choice; echo ""
+        case "${_bmc_choice:-1}" in
+            2) _bonsai_want=$([ "$TOTAL_MEM" -ge 24 ] && echo pq2 || echo ptq1) ;;
+            3) _bonsai_want=$([ "$TOTAL_MEM" -ge 24 ] && echo ptq1 || echo "") ;;
+            *) return 0 ;;
+        esac
+        [ -z "$_bonsai_want" ] && return 0
+    fi
+    if [ "$_bonsai_want" = "pq2" ] && [ "${TOTAL_MEM:-0}" -lt 24 ]; then
+        die "Bonsai PQ2_0 on macOS needs ≥24GB unified memory (this Mac: ${TOTAL_MEM}GB). Use --model=bonsai-ptq1 or --model=qwen."
+    fi
+    if [ "${TOTAL_MEM:-0}" -lt 16 ]; then
+        die "Bonsai on macOS needs ≥16GB unified memory (this Mac: ${TOTAL_MEM}GB). Re-run with --model=qwen."
+    fi
+    select_bonsai_model "$_bonsai_want"
+    if [ "$TOTAL_MEM" -ge 48 ]; then
+        _CTX_SIZE=98304
+    elif [ "$TOTAL_MEM" -ge 24 ]; then
+        _CTX_SIZE=65536
+    else
+        _CTX_SIZE=32768
+        warn "16GB Mac + Bonsai: tight fit — expect swap under load; Qwen 9B is the safer pick here"
+    fi
+    ok "Bonsai selected (EXPERIMENTAL on Metal): $MODEL_NAME (ctx: $_CTX_SIZE)"
 }
 
 # Initialize Homebrew in PATH (installed by install_prereqs_macos.sh)
@@ -216,10 +280,17 @@ if [ "$OPENMONO_ROLE" != "agent" ]; then
         die "Only ${TOTAL_MEM}GB RAM detected. 16GB unified memory is the minimum for inference.
 Upgrade to a Mac with at least 16GB, or use the 'agent' role and connect to a separate inference server."
     fi
+    IS_BONSAI=0
     select_model "$TOTAL_MEM"
+    # Bonsai picker fires here — AFTER unified-memory detection — and is
+    # conservative by design (Metal ternary kernels still being validated):
+    # Qwen is the default everywhere; Bonsai is opt-in via prompt choice or
+    # an explicit --model=bonsai-* flag (PQ2_0 needs ≥24GB, PTQ1_0 ≥16GB).
+    prompt_bonsai_macos
 
-    # Reduce context when mmproj is active (encoder needs ~1-2 GB burst)
-    if [ -n "${MODEL_MMPROJ:-}" ]; then
+    # Reduce context when mmproj is active (encoder needs ~1-2 GB burst).
+    # Qwen presets only — Bonsai ctx is already sized conservatively above.
+    if [ "${IS_BONSAI:-0}" != "1" ] && [ -n "${MODEL_MMPROJ:-}" ]; then
         _CTX_ORIG=$_CTX_SIZE
         if   [ "$TOTAL_MEM" -ge 48 ]; then _CTX_SIZE=$CTX_VISION
         elif [ "$TOTAL_MEM" -ge 32 ]; then _CTX_SIZE=$CTX_VISION_32G
@@ -422,6 +493,17 @@ if [ "$OPENMONO_ROLE" != "agent" ]; then
         ok "llama-server already installed: $(command -v llama-server)"
     fi
 
+    # Prism fork for Bonsai (Metal ternary kernels) — built on-machine, kept
+    # outside the repo so `openmono upgrade` never touches it. The brew stock
+    # binary above stays untouched for the Qwen path.
+    PRISM_BINARY=""
+    if [ "${IS_BONSAI:-0}" = "1" ]; then
+        build_prism_macos || die "Prism fork build failed — cannot run Bonsai without it"
+        PRISM_BINARY="$(prism_macos_bin)"
+        warn "First llama-server start compiles Metal shaders — can take several minutes."
+        warn "Don't kill it; watch progress with: openmono logs"
+    fi
+
     # Write the full inference config to ~/.openmono/settings.json.
     # This is the single source of truth for all runtime commands (start/stop/status).
     SETTINGS_FILE="$HOME/.openmono/settings.json"
@@ -448,9 +530,10 @@ if [ "$OPENMONO_ROLE" != "agent" ]; then
         "$_CTX_SIZE" \
         "$INSTALL_DIR" \
         "$LLAMA_API_KEY" \
-        "${MMPROJ_FILE:-}" <<'PYEOF'
+        "${MMPROJ_FILE:-}" \
+        "${PRISM_BINARY:-}" <<'PYEOF'
 import json, sys
-path, port, model_name, model_alias, ctx_size, install_dir, api_key, mmproj_path = sys.argv[1:9]
+path, port, model_name, model_alias, ctx_size, install_dir, api_key, mmproj_path, binary = sys.argv[1:10]
 with open(path) as f:
     cfg = json.load(f)
 cfg.setdefault("llm", {})["endpoint"] = f"http://host.docker.internal:{port}"
@@ -462,13 +545,15 @@ cfg["inference"] = {
     "ctx_size": int(ctx_size),
     "port": int(port),
     "install_dir": install_dir,
-    "mmproj_path": mmproj_path if mmproj_path else ""
+    "mmproj_path": mmproj_path if mmproj_path else "",
+    "binary": binary if binary else ""
 }
 with open(path, "w") as f:
     json.dump(cfg, f, indent=2)
 PYEOF
     ok "Inference config written to: $SETTINGS_FILE"
     detail "  model     : $MODEL_NAME"
+    detail "  binary    : ${PRISM_BINARY:-$(command -v llama-server)}"
     detail "  ctx_size  : $_CTX_SIZE"
     detail "  endpoint  : http://host.docker.internal:${LLAMA_PORT:-7474}"
     detail "  api_key   : [generated, stored in docker/.env]"
