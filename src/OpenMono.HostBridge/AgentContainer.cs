@@ -249,21 +249,55 @@ public sealed class AgentContainer
         args.Append("-e GIT_SSH_COMMAND=\"ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes\" ");
     }
 
+    /// <summary>
+    /// Rewrites a host-side loopback LLM endpoint for the agent container.
+    /// Linux: the compose network serves the model as <c>llama-server</c>
+    /// (container port 7474, fixed). macOS: inference runs natively on the
+    /// Mac host (Metal), so the container reaches it through Docker Desktop's
+    /// <c>host.docker.internal</c> — <c>llama-server</c> does not resolve
+    /// there. The native port is preserved (configurable via inference.port).
+    /// Anything non-loopback passes through untouched.
+    /// </summary>
     internal static string MapEndpoint(string endpoint) =>
-        endpoint.StartsWith("http://localhost:", StringComparison.OrdinalIgnoreCase) ||
-        endpoint.StartsWith("http://127.0.0.1:", StringComparison.OrdinalIgnoreCase) ||
-        endpoint.StartsWith("http://host.docker.internal:", StringComparison.OrdinalIgnoreCase)
-            ? "http://llama-server:7474"
+        IsLoopbackHttp(endpoint)
+            ? OperatingSystem.IsMacOS()
+                ? $"http://host.docker.internal:{LoopbackPortOr(endpoint, "7474")}"
+                : "http://llama-server:7474"
             : endpoint;
 
+    /// <summary>
+    /// Same rewrite for the optional web gateway. Linux keeps the compose
+    /// <c>caddy:8080</c> mapping; macOS targets the host via
+    /// <c>host.docker.internal</c>, preserving the configured port.
+    /// </summary>
     internal static string MapGateway(string gateway) =>
         string.IsNullOrWhiteSpace(gateway)
             ? ""
-            : gateway.StartsWith("http://localhost:", StringComparison.OrdinalIgnoreCase) ||
-              gateway.StartsWith("http://127.0.0.1:", StringComparison.OrdinalIgnoreCase) ||
-              gateway.StartsWith("http://host.docker.internal:", StringComparison.OrdinalIgnoreCase)
-                ? "http://caddy:8080"
+            : IsLoopbackHttp(gateway)
+                ? OperatingSystem.IsMacOS()
+                    ? $"http://host.docker.internal:{LoopbackPortOr(gateway, "8080")}"
+                    : "http://caddy:8080"
                 : gateway;
+
+    private static bool IsLoopbackHttp(string value) =>
+        value.StartsWith("http://localhost:", StringComparison.OrdinalIgnoreCase) ||
+        value.StartsWith("http://127.0.0.1:", StringComparison.OrdinalIgnoreCase) ||
+        value.StartsWith("http://host.docker.internal:", StringComparison.OrdinalIgnoreCase);
+
+    private static string LoopbackPortOr(string endpoint, string fallback)
+    {
+        try
+        {
+            var port = new Uri(endpoint).Port;
+            return port > 0
+                ? port.ToString(System.Globalization.CultureInfo.InvariantCulture)
+                : fallback;
+        }
+        catch (Exception)
+        {
+            return fallback;
+        }
+    }
 
     private static string Str(JsonElement? parent, string name)
     {

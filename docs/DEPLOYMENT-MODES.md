@@ -58,7 +58,7 @@ Project layout (`src/OpenMono.HostBridge/`, .NET 10, references the CLI project 
 |---|---|
 | `Program.cs` / `BridgeOptions.cs` | CLI (`--task`, `--session`, `--acp`, `--port`, `--keep`, `--init`, `--run-as`, `--allow-sudo`, `--no-sudo`, `--non-interactive`, `--tui`, `--classic`, `--plan`, …), TUI/line loops, discovery wait, mode ensure |
 | `AcpClient.cs` | HTTP + SSE client for the stock ACP API (+ `{"mode":…}` ensure) |
-| `AgentContainer.cs` | Spawns the unmodified `agent` service detached (`--acp-only`, loopback port publish, git passthrough, endpoint mapping), stops what it started |
+| `AgentContainer.cs` | Spawns the unmodified `agent` service detached (`--acp-only`, loopback port publish, git passthrough, endpoint mapping: Linux `llama-server:7474` / `caddy:8080`, macOS `host.docker.internal` for native Metal inference), stops what it started |
 | `HostExecutor.cs` | `HOST_EXEC` envelope parse, allow → deny → default policy, foreground/background bare-metal execution, sudo via run-as identity, audit |
 | `HostIdentity.cs` | Run-as identity: username (config) + sudo policy (`ask`/`allow`/`deny`) + password (memory-only, zeroed on dispose; `--password-file` / `OPENMONO_HOST_PASSWORD_FILE`) |
 | `AuditLog.cs` / `LogRedactor` | Paper trail: every host command appended to the existing agent log |
@@ -105,7 +105,8 @@ Project layout (`src/OpenMono.HostBridge/`, .NET 10, references the CLI project 
 | Agent stays in Plan, proposes but never acts | New ACP sessions default to plan | Bridge sets `build` explicitly unless `--plan` |
 | Host commands fail as the wrong user | Bridge run as root (or another user) while `run_as` is the login user | Fail-fast startup check; run the bridge as the login user |
 | `as_root` refused | Sudo policy is `deny` | Expected: change with `openmono config host.sudo_policy ask` (or `allow`), or keep off and do root steps by hand |
-| Sudo password prompt mid-turn | Timestamp expired and no password in memory | Masked prompt (TUI stands down fullscreen so the secret never touches its input box), or pre-seed `--password-file` / `OPENMONO_HOST_PASSWORD_FILE` |
+| Sudo password prompt mid-turn | Timestamp expired and no password in memory, or wrong password typed | Masked in-TUI prompt (never echoed/logged), up to 3 tries with the bad secret wiped from memory each time; or pre-seed `--password-file` / `OPENMONO_HOST_PASSWORD_FILE` |
+| Turn error "Name or service not known (llama-server:7474)" on macOS | Container aimed at the Linux compose-network name, but macOS inference runs natively on the host | Fixed: loopback endpoints map to `host.docker.internal` (native port preserved) on macOS, `llama-server:7474` on Linux |
 | VS Code driving the host | Extension integration is sandbox-only by design | `openmono agent --host --acp-only …` is refused; run without `--host` for the extension |
 
 ### Run-as identity, sudo, and the paper trail

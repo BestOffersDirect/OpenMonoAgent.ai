@@ -324,6 +324,55 @@ public class OperatorPreambleTests
     }
 }
 
+public class AgentContainerMappingTests
+{
+    [Fact]
+    public void MapEndpoint_Loopback_TargetsReachableHost()
+    {
+        // Linux: compose-network llama-server. macOS: native Metal inference
+        // on the Mac host via Docker Desktop's host.docker.internal.
+        var mapped = AgentContainer.MapEndpoint("http://127.0.0.1:7474");
+        if (OperatingSystem.IsMacOS())
+            mapped.Should().Be("http://host.docker.internal:7474");
+        else
+            mapped.Should().Be("http://llama-server:7474");
+    }
+
+    [Fact]
+    public void MapEndpoint_Loopback_PreservesNativePort()
+    {
+        var mapped = AgentContainer.MapEndpoint("http://localhost:8081");
+        if (OperatingSystem.IsMacOS())
+            mapped.Should().Be("http://host.docker.internal:8081");
+        else
+            mapped.Should().Be("http://llama-server:7474");
+    }
+
+    [Fact]
+    public void MapEndpoint_Remote_PassesThrough()
+    {
+        AgentContainer.MapEndpoint("http://192.168.1.10:7474")
+            .Should().Be("http://192.168.1.10:7474");
+    }
+
+    [Fact]
+    public void MapGateway_Empty_StaysEmpty()
+    {
+        AgentContainer.MapGateway("").Should().Be("");
+        AgentContainer.MapGateway("   ").Should().Be("");
+    }
+
+    [Fact]
+    public void MapGateway_Loopback_TargetsReachableHost()
+    {
+        var mapped = AgentContainer.MapGateway("http://127.0.0.1:8080");
+        if (OperatingSystem.IsMacOS())
+            mapped.Should().Be("http://host.docker.internal:8080");
+        else
+            mapped.Should().Be("http://caddy:8080");
+    }
+}
+
 public class TuiInputFilterTests
 {
     [Theory]
