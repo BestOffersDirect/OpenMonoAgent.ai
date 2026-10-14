@@ -350,8 +350,8 @@ cmd_help() {
     echo "             llm.endpoint (local or relay)."
     echo ""
     echo "Inference box (llama-server lifecycle):"
-    printf "  %-14s %s\n" "start"   "Start llama-server in the background"
-    printf "  %-14s %s\n" "stop"    "Stop llama-server"
+    printf "  %-14s %s\n" "start"   "Start llama-server + gateway services in the background"
+    printf "  %-14s %s\n" "stop"    "Stop the stack (flags: --llama --gateway --search --scraper --agent-host --agent --all)"
     printf "  %-14s %s\n" "restart" "Restart llama-server"
     printf "  %-14s %s\n" "logs"    "Tail llama-server logs"
     printf "  %-14s %s\n" "status"  "Show container + GPU + model status"
@@ -703,35 +703,192 @@ cmd_start() {
     _start_web_services || true
 }
 
-cmd_stop() {
+# Inventory for bare `openmono stop`: everything actually running relative
+# to OMA, so the operator confirms against reality instead of assumptions.
+_stop_inventory() {
+    echo ""
+    echo "Running OpenMono pieces:"
     if [[ "$NATIVE_INFERENCE" == "true" ]]; then
-        native_cmd_stop || return $?
-        if docker info &>/dev/null 2>&1; then
-            (cd "$DOCKER_DIR" && docker compose down 2>/dev/null || true)
+        # Native port lives in settings (inference.port), not LLAMA_PORT.
+        local nport="$LLAMA_PORT"
+        if command -v jq &>/dev/null && [[ -f "$HOME/.openmono/settings.json" ]]; then
+            local cfg_port
+            cfg_port="$(jq -r '.inference.port // empty' "$HOME/.openmono/settings.json" 2>/dev/null || true)"
+            [[ "$cfg_port" =~ ^[0-9]+$ ]] && nport="$cfg_port"
         fi
-        return 0
-    fi
-
-    _ensure_docker
-    cd "$DOCKER_DIR"
-    export LLAMA_PORT
-    if ! curl -sf "http://localhost:${LLAMA_PORT}/health" &>/dev/null; then
-        warn "llama-server is not responding on port ${LLAMA_PORT}"
-    fi
-
-    info "Stopping llama-server..."
-    if docker compose stop llama-server 2>/dev/null; then
-        ok "Stopped"
-    else
-        if docker compose kill llama-server 2>/dev/null; then
-            ok "Force-stopped"
+        if curl -sf "http://localhost:${nport}/health" &>/dev/null; then
+            echo "  - llama-server (native, Metal) on port ${nport}"
         else
-            err "Failed to stop llama-server. Try: cd docker && docker compose kill llama-server"
-            return 1
+            echo "  - llama-server (native): not responding on port ${nport}"
+        fi
+    else
+        if curl -sf "http://localhost:${LLAMA_PORT}/health" &>/dev/null; then
+            echo "  - llama-server (docker) healthy on port ${LLAMA_PORT}"
+        else
+            echo "  - llama-server (docker): not responding"
+        fi
+    fi
+    if docker info &>/dev/null 2>&1; then
+        local running
+        running="$(cd "$DOCKER_DIR" && docker compose ps --format '{{.Service}} ({{.State}})' 2>/dev/null | grep -v '^$' || true)"
+        if [[ -n "$running" ]]; then
+            echo "$running" | while IFS= read -r line; do echo "  - $line"; done
+        else
+            echo "  - no compose services running"
+        fi
+        local extra
+        extra="$(docker ps -a --filter 'name=openmono-host-bridge' --filter 'name=openmono-agent' \
+            --format '{{.Names}} ({{.State}})' 2>/dev/null || true)"
+        if [[ -n "$extra" ]]; then
+            echo "$extra" | while IFS= read -r line; do echo "  - $line [agent container — kept unless --agent-host/--agent]"; done
+        fi
+        if pgrep -f 'host-bridge' &>/dev/null; then
+            echo "  - host-bridge process is LIVE (stop it with Ctrl-C / /quit first — stop never kills it)"
+        fi
+    else
+        echo "  - Docker daemon not accessible — container state unknown"
+    fi
+    echo ""
+}
+
+cmd_stop() {
+    # Selectors: default = full compose stack (llama + gateway + search +
+    # scraper). Run-created agent containers are NEVER touched by default —
+    # stopping those would kill someone's live `openmono agent` session in
+    # another terminal. Ask for them explicitly (--agent-host, --agent) or
+    # take everything with --all.
+    local sel_llama=false sel_gateway=false sel_search=false sel_scraper=false
+    local sel_bridge=false sel_agent=false sel_all=false rm_orphans=false
+    local a
+    for a in ${1+"$@"}; do
+        case "$a" in
+            --llama) sel_llama=true ;;
+            --gateway) sel_gateway=true ;;
+            --search) sel_search=true ;;
+            --scraper) sel_scraper=true ;;
+            --agent-host) sel_bridge=true ;;
+            --agent) sel_agent=true ;;
+            --all) sel_all=true ;;
+            --remove-orphans) rm_orphans=true ;;
+            -h|--help)
+                echo "Usage: openmono stop [--llama] [--gateway] [--search] [--scraper] [--agent-host] [--agent] [--all] [--remove-orphans]"
+                echo ""
+                echo "  (no flags)   Stop the full compose stack: llama-server + gateway/search/scraper."
+                echo "  --agent-host  Also remove the openmono-host-bridge container (agent --host)."
+                echo "                Stop the host-bridge process itself with Ctrl-C / /quit first."
+                echo "  --agent       Also remove live openmono-agent run containers (sandbox sessions)."
+                echo "  --all         Everything above + 'compose down --remove-orphans'."
+                return 0 ;;
+            *)
+                err "Unknown flag for stop: $a (see: openmono stop --help)"
+                return 1 ;;
+        esac
+    done
+    if [[ "$sel_all" == "true" ]]; then
+        sel_llama=true; sel_gateway=true; sel_search=true; sel_scraper=true
+        sel_bridge=true; sel_agent=true
+    elif [[ "$sel_llama" == "false" && "$sel_gateway" == "false" && \
+            "$sel_search" == "false" && "$sel_scraper" == "false" && \
+            "$sel_bridge" == "false" && "$sel_agent" == "false" ]]; then
+        sel_llama=true; sel_gateway=true; sel_search=true; sel_scraper=true
+    fi
+    local no_flags=true
+    [[ "$sel_bridge" == "true" || "$sel_agent" == "true" || "$sel_all" == "true" || \
+       "$sel_llama" == "false" || "$sel_gateway" == "false" || \
+       "$sel_search" == "false" || "$sel_scraper" == "false" ]] && no_flags=false
+    # Bare `openmono stop`: show everything actually running relative to OMA
+    # and require confirmation. Explicit flags proceed without asking.
+    if [[ "$no_flags" == "true" ]]; then
+        if [[ -t 0 ]]; then
+            _stop_inventory
+            local confirm=""
+            read -r -p "Stop all of the above? [y/N] " confirm || confirm=""
+            case "$confirm" in
+                [yY]|[yY]es) ;;
+                *)
+                    info "Aborted — nothing stopped. Target pieces explicitly, e.g.: openmono stop --llama"
+                    return 0 ;;
+            esac
+        else
+            info "Non-interactive — proceeding with the full compose stack (no agent containers)."
         fi
     fi
 
-    docker compose down 2>/dev/null || true
+    local rc=0
+
+    # Native inference (macOS): never early-return. A dead llama-server must
+    # not skip the compose cleanup below — that ordering bug used to leave
+    # gateway/search/scraper running forever after `openmono stop`.
+    if [[ "$NATIVE_INFERENCE" == "true" ]]; then
+        if [[ "$sel_llama" == "true" ]]; then
+            native_cmd_stop || { warn "native llama-server stop failed — continuing with containers."; rc=1; }
+        fi
+    else
+        _ensure_docker
+        if [[ "$sel_llama" == "true" ]]; then
+            if ! curl -sf "http://localhost:${LLAMA_PORT}/health" &>/dev/null; then
+                warn "llama-server is not responding on port ${LLAMA_PORT}"
+            fi
+        fi
+    fi
+
+    if docker info &>/dev/null 2>&1; then
+        cd "$DOCKER_DIR"
+        export LLAMA_PORT
+        # Explicit service names bypass compose profile filtering, so every
+        # selected service is stopped regardless of which profiles started it.
+        local svcs=()
+        [[ "$sel_llama" == "true" ]] && svcs+=(llama-server)
+        [[ "$sel_gateway" == "true" ]] && svcs+=(caddy)
+        [[ "$sel_search" == "true" ]] && svcs+=(searxng)
+        [[ "$sel_scraper" == "true" ]] && svcs+=(scrapling)
+        if [[ ${#svcs[@]} -gt 0 ]]; then
+            info "Stopping ${svcs[*]}..."
+            if docker compose stop "${svcs[@]}" 2>/dev/null; then
+                ok "Stopped: ${svcs[*]}"
+            else
+                warn "Some services did not stop cleanly — check: docker compose ps"
+                rc=1
+            fi
+        fi
+        # Run-created containers are invisible to `compose down` (they come
+        # from `compose run -d --name`, not `up`), so remove them by name.
+        # `rm -f` on a non-existent name is a silent no-op success.
+        if [[ "$sel_bridge" == "true" ]]; then
+            if docker rm -f openmono-host-bridge 2>/dev/null; then
+                ok "Removed openmono-host-bridge container"
+            else
+                info "No openmono-host-bridge container to remove"
+            fi
+        fi
+        if [[ "$sel_agent" == "true" ]]; then
+            if docker rm -f openmono-agent 2>/dev/null; then
+                ok "Removed openmono-agent container"
+            else
+                info "No openmono-agent container to remove"
+            fi
+        fi
+        # Full-stack selections finish with `down` (previous behaviour): this
+        # removes stopped containers + the project network. Subset selections
+        # only stop, so unrelated services keep running.
+        if [[ "$sel_llama" == "true" && "$sel_gateway" == "true" && \
+              "$sel_search" == "true" && "$sel_scraper" == "true" ]]; then
+            if [[ "$rm_orphans" == "true" || "$sel_all" == "true" ]]; then
+                docker compose down --remove-orphans 2>/dev/null || rc=1
+            else
+                docker compose down 2>/dev/null || rc=1
+            fi
+        fi
+        if [[ "$rc" == "0" ]]; then
+            ok "Stop complete — verify: docker compose ps"
+        else
+            warn "Stop finished with warnings — verify: docker compose ps"
+        fi
+    else
+        warn "Docker daemon is not accessible — native processes (if any) handled above; containers untouched."
+        rc=1
+    fi
+    return $rc
 }
 
 cmd_restart() {
@@ -1715,9 +1872,9 @@ fi
 
 case "$COMMAND" in
     setup)          cmd_setup "$@";;
-    start)          cmd_start ;;
-    stop)           cmd_stop ;;
-    restart)        cmd_restart ;;
+    start)          cmd_start "$@" ;;
+    stop)           cmd_stop "$@" ;;
+    restart)        cmd_restart "$@" ;;
     agent)          cmd_agent "${AGENT_FORWARD[@]+"${AGENT_FORWARD[@]}"}" "$@" ;;
     logs)           cmd_logs ;;
     status)         cmd_status ;;

@@ -35,7 +35,8 @@ public static class OperatorPreamble
         return $$"""
             [HOST OPERATOR CONTEXT — standing orders for this whole session, higher priority than any playbook's tool defaults. You are managing a {{hostKind}} through a host sub-agent. Your own Bash/Grep/FileRead/Glob tools run INSIDE a container and see only the bind-mounted workspace below — they CANNOT see host files, host logs, the host docker daemon state beyond the mount, or service state.]
 
-            - Workspace (the only place your container tools work): {{workDir}}
+            - Your own tools see ONLY /workspace — that IS the host directory {{workDir}}, bind-mounted (same files). In your own tools always use /workspace/... or relative paths. Host-absolute paths ({{workDir}}/...) do not exist inside your container and will fail — that failure is expected, never a cue to retry.
+            - PATH ROUTING — decide before every call, never by trial. Under /workspace: your own tools. Anywhere else on the host (/etc, /var/log, /home, /root, /opt, ...): ONLY HOST_EXEC, using the HOST path (its working directory is {{workDir}}, so relative paths work there too). One failed container-tool attempt on a host path is already one too many — switch, don't reframe.
             - For ANY host action — shell commands, reading/writing ANY file outside the workspace, logs, git, docker/docker compose, {{svcExamples}}, installs, curl health checks — call AskUser with a question of exactly this form and NOTHING else on the question line:
               HOST_EXEC: {"command": "<shell command>", "timeout_ms": 300000, "background": false}
               The host sub-agent runs it on bare metal as user '{{runAsUser}}' and answers with its output. Set "background": true for servers/watchers that never exit (answer carries PID + log path to tail with a later HOST_EXEC call). {{sudoLine}}
