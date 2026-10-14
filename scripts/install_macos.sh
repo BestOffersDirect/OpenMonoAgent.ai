@@ -413,8 +413,12 @@ if [ "$OPENMONO_ROLE" != "agent" ]; then
     next_step "Installing llama.cpp (Metal)"
 
     # llama.cpp from Homebrew runs natively on the host, enabling Metal GPU
-    # acceleration on Apple Silicon. The agent Docker container reaches it via
-    # host.docker.internal, which Docker Desktop resolves automatically on macOS.
+    # acceleration on Apple Silicon. The endpoint is stored as 127.0.0.1
+    # (resolves everywhere on the host); every container consumer maps it
+    # for its own network — the bridge and the openmono CLI rewrite loopback
+    # to host.docker.internal on macOS (Docker Desktop) and to the compose
+    # service names on Linux. Never store host.docker.internal here: macOS
+    # itself does not resolve it, so host-side readers would break.
     if ! command -v llama-server &>/dev/null; then
         info "Installing llama.cpp via Homebrew..."
         run brew install llama.cpp || die "brew install llama.cpp failed"
@@ -453,7 +457,7 @@ import json, sys
 path, port, model_name, model_alias, ctx_size, install_dir, api_key, mmproj_path = sys.argv[1:9]
 with open(path) as f:
     cfg = json.load(f)
-cfg.setdefault("llm", {})["endpoint"] = f"http://host.docker.internal:{port}"
+cfg.setdefault("llm", {})["endpoint"] = f"http://127.0.0.1:{port}"
 cfg.setdefault("llm", {})["api_key"] = api_key
 cfg["inference"] = {
     "mode": "native-metal",
@@ -470,7 +474,7 @@ PYEOF
     ok "Inference config written to: $SETTINGS_FILE"
     detail "  model     : $MODEL_NAME"
     detail "  ctx_size  : $_CTX_SIZE"
-    detail "  endpoint  : http://host.docker.internal:${LLAMA_PORT:-7474}"
+    detail "  endpoint  : http://127.0.0.1:${LLAMA_PORT:-7474}"
     detail "  api_key   : [generated, stored in docker/.env]"
 
     # Update docker/.env with model and vision state
