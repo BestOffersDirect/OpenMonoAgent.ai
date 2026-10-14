@@ -438,6 +438,9 @@ if [ -n "$INSTALL_DIR" ] && [ -d "$INSTALL_DIR/docker" ] && command -v docker &>
         # Remove the llama.cpp images that install.sh references. Don't touch
         # any other image. Use docker image inspect to check existence first.
         for img in \
+            startuphakk/prism-llama.cpp_cuda:latest \
+            startuphakk/prism-llama.cpp_vulkan:latest \
+            llama-cpp-prism:cuda \
             ghcr.io/ggml-org/llama.cpp:server \
             ghcr.io/ggml-org/llama.cpp:server-cuda \
             ghcr.io/ggml-org/llama.cpp:server-vulkan \

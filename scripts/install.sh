@@ -19,9 +19,10 @@ set -euo pipefail
 #   LLAMA_PORT=7474       llama-server host port (default 7474)
 #   OPENMONO_MODEL        Model family: auto (default), bonsai-pq2, bonsai-ptq1, qwen
 #                         auto = prompt on TTY (GPU→Bonsai PQ2_0, CPU→Qwen), else auto-detect
-#   OPENMONO_PRISM_CDN_URL  Override the CDN tarball URL for the Prism llama.cpp image
-#   OPENMONO_PRISM_IMAGE    Expected image ref once loaded (default llama-cpp-prism:latest)
-#   OPENMONO_PRISM_FORCE_PULL=1  Re-pull the Prism image even if already present
+#   OPENMONO_PRISM_IMAGE_CUDA   Prism CUDA image ref (default startuphakk/prism-llama.cpp_cuda:latest)
+#   OPENMONO_PRISM_IMAGE_VULKAN Prism Vulkan image ref (default startuphakk/prism-llama.cpp_vulkan:latest)
+#   OPENMONO_PRISM_IMAGE        Legacy single-ref override (wins over both when set)
+#   OPENMONO_PRISM_FORCE_PULL=1 Re-pull the Prism image even if already present
 #
 # Dev/testing only (not user-facing):
 #   OPENMONO_MODEL_MIRROR=http://192.168.x.x:8080
@@ -82,8 +83,9 @@ select_model() {
 # Interactive model-family picker. Respects OPENMONO_MODEL when set
 # (auto/bonsai-pq2/bonsai-ptq1/qwen/bonsai). On a TTY with AUTO, asks the user;
 # otherwise defaults: GPU→Bonsai PQ2_0, CPU→Qwen (stock kernels).
-# Requires GPU_MODE and _GPU_TIER to be set by the caller. Sets IS_BONSAI=1
-# when a Bonsai quant is chosen (caller must then use the Prism image).
+# Requires GPU_MODE or AMD_IGPU_MODE to be set by the caller. Sets IS_BONSAI=1
+# when a Bonsai quant is chosen (caller must then use the Prism image for
+# the matching backend: CUDA on NVIDIA, Vulkan on the 7940HS iGPU).
 prompt_model_family() {
     IS_BONSAI=0
     local choice="${OPENMONO_MODEL:-auto}"
@@ -93,17 +95,15 @@ prompt_model_family() {
         qwen) return 0 ;;  # keep select_model() result
     esac
     # choice == auto from here
-    if [ "${GPU_MODE:-0}" != "1" ]; then
-        # Non-NVIDIA box (CPU, AMD iGPU/Vulkan, agent role): stock Qwen MoE
-        # only. The Prism image is CUDA-only (:cuda) — no CPU/Vulkan tarball
-        # exists yet, so the picker never fires here and nobody is offered
+    if [ "${GPU_MODE:-0}" != "1" ] && [ "${AMD_IGPU_MODE:-0}" != "1" ]; then
+        # CPU-only box: stock Qwen MoE only. There is no Prism CPU image,
+        # so the picker never fires here and nobody is offered
         # a model they can't run. An explicit --model=bonsai-* selection is
         # left in place so Step 2 can fail with a clear message instead of
         # silently installing the wrong model.
         return 0
     fi
-    # NVIDIA GPU box from here on — the only place the picker fires.
-    # GPU box
+    # GPU/iGPU box from here on — the only place the picker fires.
     if [ -t 0 ] && [[ -z "${OPENMONO_MODEL:-}" ]]; then
         flush_stdin
         echo ""
@@ -357,22 +357,26 @@ if [ "$OPENMONO_ROLE" != "agent" ]; then
     # box can't run. An explicit --model=bonsai-* flag is honored anywhere
     # and validated by the gate below.
     prompt_model_family
-    # Bonsai gate: the CDN image is CUDA-only (:cuda). Fail BEFORE the
-    # multi-GB model download, not after it.
-    if [ "${IS_BONSAI:-0}" = "1" ] && [ "${GPU_MODE:-0}" != "1" ]; then
-        die "Bonsai requires an NVIDIA GPU — the Prism image is CUDA-only ($(prism_image_ref)). No Vulkan/CPU tarball is published yet. Re-run with --model=qwen for this box."
+    # Bonsai gate: needs an accelerated backend (NVIDIA/CUDA or 7940HS/Vulkan).
+    # Fail BEFORE the multi-GB model download, not after it.
+    if [ "${IS_BONSAI:-0}" = "1" ] && [ "${GPU_MODE:-0}" != "1" ] && [ "${AMD_IGPU_MODE:-0}" != "1" ]; then
+        die "Bonsai requires a GPU — CUDA: $(prism_image_cuda) / Vulkan: $(prism_image_vulkan). No CPU image exists. Re-run with --model=qwen for this box."
     fi
-    # Early CDN pull: verify the Prism image BEFORE the model download.
-    # Explicit --model=bonsai-* + unreachable CDN = hard fail (user asked
-    # for it). Auto/prompt-selected Bonsai + unreachable CDN = fall back
+    # Early Docker Hub pull: verify the Prism image BEFORE the model download.
+    # Explicit --model=bonsai-* + unreachable registry = hard fail (user asked
+    # for it). Auto/prompt-selected Bonsai + unreachable registry = fall back
     # to stock Qwen so setup still yields a working box.
+    # On the AMD iGPU path without an explicit bonsai flag, stay on stock
+    # Qwen (Vulkan Bonsai support is new) — only use the Vulkan Prism image
+    # when Bonsai was explicitly requested or already selected on NVIDIA.
     if [ "${IS_BONSAI:-0}" = "1" ]; then
-        if ! pull_img_from_cdn; then
+        _PRISM_BACKEND="$(prism_backend)"
+        if ! pull_prism_image "$_PRISM_BACKEND"; then
             case "${OPENMONO_MODEL:-auto}" in
                 bonsai-pq2|bonsai|pq2|bonsai-ptq1|ptq1)
-                    die "Prism image pull failed and --model=${OPENMONO_MODEL} was explicitly requested. Check network/CDN, or re-run with --model=qwen." ;;
+                    die "Prism image pull failed and --model=${OPENMONO_MODEL} was explicitly requested. Check network/Docker Hub, or re-run with --model=qwen." ;;
                 *)
-                    warn "Prism CDN unreachable — falling back to stock Qwen (no Prism image needed)"
+                    warn "Prism image unreachable — falling back to stock Qwen (no Prism image needed)"
                     IS_BONSAI=0
                     _FALLBACK_TIER="$_GPU_TIER"
                     [ "${_FALLBACK_TIER:-0}" -lt 12 ] && _FALLBACK_TIER=12
@@ -584,11 +588,11 @@ if [ "$OPENMONO_ROLE" != "agent" ]; then
     OVERRIDE_FILE="$INSTALL_DIR/docker/docker-compose.override.yml"
     
     if [ "${GPU_MODE:-0}" = "1" ]; then
-        # Bonsai path: prebuilt Prism image from CDN (stock llama.cpp rejects PQ2_0/PTQ1_0).
+        # Bonsai path: prebuilt Prism CUDA image from Docker Hub (stock llama.cpp rejects PQ2_0/PTQ1_0).
         _LLAMA_IMAGE="ghcr.io/ggml-org/llama.cpp:server-cuda"
         if [ "${IS_BONSAI:-0}" = "1" ]; then
-            pull_img_from_cdn || die "Prism image pull failed — cannot run Bonsai without it"
-            _LLAMA_IMAGE="$(prism_image_ref)"
+            pull_prism_image cuda || die "Prism image pull failed — cannot run Bonsai without it"
+            _LLAMA_IMAGE="$(prism_image_ref cuda)"
             # Bonsai VRAM budget: weights (7.2/5.9GB) + KV. Keep ctx conservative;
             # hybrid-attention backbone keeps long ctx practical, but KV is what OOMs.
             if [ "${_GPU_TIER:-0}" -ge 24 ]; then
@@ -711,6 +715,14 @@ EOF
 elif [ "${AMD_IGPU_MODE:-0}" = "1" ]; then
     info "Writing AMD iGPU (Vulkan) override: $OVERRIDE_FILE"
 
+    # Bonsai on the 7940HS path uses the Prism Vulkan image from Docker Hub;
+    # stock Qwen keeps the upstream Vulkan image.
+    _VULKAN_IMAGE="ghcr.io/ggml-org/llama.cpp:server-vulkan-b9070"
+    if [ "${IS_BONSAI:-0}" = "1" ]; then
+        pull_prism_image vulkan || die "Prism Vulkan image pull failed — cannot run Bonsai without it"
+        _VULKAN_IMAGE="$(prism_image_ref vulkan)"
+    fi
+
     # Context size reduction for mmproj (same as CPU branch)
     _CTX_ORIG=196608
     _CTX=196608
@@ -728,7 +740,7 @@ elif [ "${AMD_IGPU_MODE:-0}" = "1" ]; then
 # NOTE: models volume + host port mapping come from the base compose file.
 services:
   llama-server:
-    image: \${LLAMA_IMAGE:-ghcr.io/ggml-org/llama.cpp:server-vulkan-b9070}
+    image: \${LLAMA_IMAGE:-$_VULKAN_IMAGE}
     devices:
       - /dev/dri:/dev/dri
     group_add:
@@ -793,10 +805,10 @@ else
         detail "Vision enabled: context reduced from $(( _CTX_ORIG / 1024 ))k → $(( CTX_VISION / 1024 ))k to fit mmproj in RAM"
     fi
     MMPROJ_OPT="${MODEL_MMPROJ:+--mmproj /models/${MODEL_MMPROJ} --image-min-tokens 1024 --image-max-tokens 1280}"
-    # Bonsai is gated to NVIDIA/CUDA in Step 2 — reaching here means a manual
+    # Bonsai is gated to CUDA/Vulkan in Step 2 — reaching here means a manual
     # override slipped through. Fail loudly: the stock image can't run it.
     if [ "${IS_BONSAI:-0}" = "1" ]; then
-        die "Bonsai on CPU/Vulkan is unsupported — no Prism tarball exists for it yet (CUDA-only: $(prism_image_ref)). Re-run with --model=qwen."
+        die "Bonsai on CPU is unsupported — no Prism CPU image exists (CUDA: $(prism_image_cuda), Vulkan: $(prism_image_vulkan)). Re-run with --model=qwen."
     fi
     _CPU_IMAGE="ghcr.io/ggml-org/llama.cpp:server"
     _CPU_COMMENT="# CPU-only configuration (auto-generated by install.sh)"
@@ -917,9 +929,10 @@ run docker compose down || true
 # Only build the images this role actually needs.
 if [ "$OPENMONO_ROLE" != "agent" ]; then
     if [ "${IS_BONSAI:-0}" = "1" ]; then
-        info "Bonsai selected — using prebuilt Prism image from CDN (no llama-server build)"
-        detail "Image: $(prism_image_ref)"
-        prism_image_available || die "Prism image '$(prism_image_ref)' missing — pull failed earlier"
+        _PRISM_BACKEND="$(prism_backend)"
+        info "Bonsai selected — using prebuilt Prism image from Docker Hub (no llama-server build)"
+        detail "Image: $(prism_image_ref "$_PRISM_BACKEND")"
+        prism_image_available "$_PRISM_BACKEND" || die "Prism image '$(prism_image_ref "$_PRISM_BACKEND")' missing — pull failed earlier"
     else
     info "Building llama-server image..."
     if [ "${GPU_MODE:-0}" = "1" ]; then

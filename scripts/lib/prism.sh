@@ -10,17 +10,22 @@
 # requires the PrismML-Eng/llama.cpp fork:
 #   https://github.com/PrismML-Eng/llama.cpp
 #
-# On Linux we ship that fork as a prebuilt Docker image hosted on a CDN.
-# NOTE: the CDN image is NVIDIA/CUDA-only (tag :cuda). There is no Vulkan
-# (AMD iGPU) or CPU tarball yet, and no macOS story — Bonsai install is
-# gated to GPU_MODE=1 until those exist.
+# On Linux we ship that fork as prebuilt Docker images on Docker Hub
+# (one per backend — Bonsai runs on both paths now):
+#   startuphakk/prism-llama.cpp_cuda    NVIDIA/CUDA   (GPU_MODE=1)
+#   startuphakk/prism-llama.cpp_vulkan  AMD iGPU      (AMD_IGPU_MODE=1, 7940HS)
+# Fetched with a plain `docker pull` — no CDN tarball, no `docker load`.
+# NOTE: there is no CPU tarball/image and no macOS story — Bonsai install is
+# gated to GPU_MODE=1 or AMD_IGPU_MODE=1.
 # ──────────────────────────────────────────────────────────────────────────────
 
 # Canonical defaults. Override via env:
-#   OPENMONO_PRISM_CDN_URL  full URL of the gzipped docker image tarball
-#   OPENMONO_PRISM_IMAGE    expected image ref once loaded (tag inside tarball)
-PRISM_CDN_URL_DEFAULT="http://cdn.cleanrouter.com/docker/llama-cpp-prism.tar.gz"
-PRISM_IMAGE_DEFAULT="llama-cpp-prism:cuda"
+#   OPENMONO_PRISM_IMAGE_CUDA    CUDA image ref (NVIDIA path)
+#   OPENMONO_PRISM_IMAGE_VULKAN  Vulkan image ref (7940HS iGPU path)
+#   OPENMONO_PRISM_IMAGE         legacy single-ref override (wins over both when set)
+#   OPENMONO_PRISM_CDN_URL       DEPRECATED (CDN tarball path removed) — ignored
+PRISM_IMAGE_CUDA_DEFAULT="startuphakk/prism-llama.cpp_cuda:latest"
+PRISM_IMAGE_VULKAN_DEFAULT="startuphakk/prism-llama.cpp_vulkan:latest"
 
 # Bonsai model files (verified against the HF repo file list).
 PRISM_HF_BASE="https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf/resolve/main"
@@ -63,64 +68,81 @@ CTX_BONSAI_16G=131072
 CTX_BONSAI_12G=98304
 CTX_BONSAI_8G=32768
 
-prism_cdn_url()   { echo "${OPENMONO_PRISM_CDN_URL:-$PRISM_CDN_URL_DEFAULT}"; }
-prism_image_ref() { echo "${OPENMONO_PRISM_IMAGE:-$PRISM_IMAGE_DEFAULT}"; }
+prism_image_cuda()   { echo "${OPENMONO_PRISM_IMAGE_CUDA:-$PRISM_IMAGE_CUDA_DEFAULT}"; }
+prism_image_vulkan() { echo "${OPENMONO_PRISM_IMAGE_VULKAN:-$PRISM_IMAGE_VULKAN_DEFAULT}"; }
 
-# prism_image_available — true if the image ref is already in the local daemon.
-prism_image_available() {
-    docker image inspect "$(prism_image_ref)" &>/dev/null 2>&1
+# prism_image_ref [backend] — image ref for the requested backend
+# (cuda|vulkan, default cuda). OPENMONO_PRISM_IMAGE wins when set (legacy
+# single-ref override); otherwise the per-backend ref is returned.
+prism_image_ref() {
+    if [[ -n "${OPENMONO_PRISM_IMAGE:-}" ]]; then
+        echo "$OPENMONO_PRISM_IMAGE"
+        return 0
+    fi
+    case "${1:-cuda}" in
+        vulkan) prism_image_vulkan ;;
+        *)      prism_image_cuda ;;
+    esac
 }
 
-# pull_img_from_cdn — stream the gzipped image tarball from the CDN straight
-# into `docker load` (no intermediate file on disk).
-#
-#   curl -fsSL <cdn-url> | gunzip -c | docker load
-#
-# Idempotent: skips when the image ref already exists locally, unless
-# OPENMONO_PRISM_FORCE_PULL=1. Returns non-zero on failure.
-pull_img_from_cdn() {
+# prism_backend — cuda when GPU_MODE=1, vulkan when AMD_IGPU_MODE=1, else cuda.
+prism_backend() {
+    if [[ "${AMD_IGPU_MODE:-0}" = "1" && "${GPU_MODE:-0}" != "1" ]]; then
+        echo "vulkan"
+    else
+        echo "cuda"
+    fi
+}
+
+# prism_image_available [backend] — true if the backend's image ref is
+# already in the local daemon.
+prism_image_available() {
+    docker image inspect "$(prism_image_ref "${1:-}")" &>/dev/null 2>&1
+}
+
+# pull_prism_image [backend] — `docker pull` the backend's Prism image from
+# Docker Hub. Idempotent: skips when the image ref already exists locally,
+# unless OPENMONO_PRISM_FORCE_PULL=1. Returns non-zero on failure.
+pull_prism_image() {
+    local backend; backend="${1:-$(prism_backend)}"
     if [[ "$(uname -s)" != "Linux" ]]; then
-        err "pull_img_from_cdn: Linux-only for now (native Metal build needed on macOS — see prism.sh notes)"
+        err "pull_prism_image: Linux-only for now (native Metal build needed on macOS — see prism.sh notes)"
         return 1
     fi
-    command -v docker &>/dev/null || { err "pull_img_from_cdn: docker not found"; return 1; }
-    command -v curl &>/dev/null   || { err "pull_img_from_cdn: curl not found"; return 1; }
-    command -v gunzip &>/dev/null || { err "pull_img_from_cdn: gunzip not found"; return 1; }
+    command -v docker &>/dev/null || { err "pull_prism_image: docker not found"; return 1; }
 
-    if prism_image_available && [[ "${OPENMONO_PRISM_FORCE_PULL:-0}" != "1" ]]; then
-        ok "Prism image already present ($(prism_image_ref)) — skipping CDN pull"
+    local ref; ref="$(prism_image_ref "$backend")"
+    if prism_image_available "$backend" && [[ "${OPENMONO_PRISM_FORCE_PULL:-0}" != "1" ]]; then
+        ok "Prism image already present ($ref) — skipping pull"
         return 0
     fi
 
-    local url; url="$(prism_cdn_url)"
-    info "Pulling Prism llama.cpp image from CDN..."
-    detail "URL: $url"
-    detail "Target ref: $(prism_image_ref)"
+    info "Pulling Prism llama.cpp image ($backend) from Docker Hub..."
+    detail "Image: $ref"
 
-    # Probe first so DNS/firewall failures surface fast with a clear message.
-    if ! curl -sIL --fail --max-time 15 "$url" >/dev/null 2>&1; then
-        err "CDN URL is not reachable: $url"
-        err "Check network/firewall, or set a mirror via OPENMONO_PRISM_CDN_URL=<url>"
+    if ! run_live docker pull "$ref"; then
+        err "docker pull failed for $ref"
+        err "Check network/Docker Hub access, or pin another ref:"
+        err "  OPENMONO_PRISM_IMAGE_CUDA=<ref>  (NVIDIA path)"
+        err "  OPENMONO_PRISM_IMAGE_VULKAN=<ref>  (7940HS iGPU path)"
         return 1
     fi
 
-    # Stream: CDN tarball (gzip) -> gunzip -> docker load. run_live streams to
-    # the user AND the setup log (this can be a multi-GB transfer).
-    if ! run_live bash -c "curl -fsSL '$url' | gunzip -c | docker load"; then
-        err "docker load from CDN failed"
-        err "Retry with OPENMONO_VERBOSE=1, or manually: curl -fsSL '$url' | gunzip -c | docker load"
+    if ! prism_image_available "$backend"; then
+        warn "docker pull succeeded but '$ref' not found in local images."
+        err "Set the ref explicitly: OPENMONO_PRISM_IMAGE_<CUDA|VULKAN>=<repo:tag> openmono setup"
         return 1
     fi
 
-    if ! prism_image_available; then
-        warn "docker load succeeded but '$(prism_image_ref)' not found in local images."
-        warn "The tarball may tag the image differently. Available prism images:"
-        docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep -i -E 'prism|llama|bonsai' | sed 's/^/    /' || true
-        err "Set the loaded tag explicitly: OPENMONO_PRISM_IMAGE=<repo:tag> openmono setup"
-        return 1
-    fi
+    ok "Prism image ready ($ref)"
+}
 
-    ok "Prism image ready ($(prism_image_ref))"
+# pull_img_from_cdn — DEPRECATED alias (CDN tarball path removed). Maps to
+# pull_prism_image so old callers/envs keep working: an explicit
+# OPENMONO_PRISM_IMAGE still wins inside prism_image_ref().
+pull_img_from_cdn() {
+    warn "pull_img_from_cdn is deprecated — the CDN tarball is gone, pulling from Docker Hub instead"
+    pull_prism_image "${1:-$(prism_backend)}"
 }
 
 # ── macOS native (Metal) build ────────────────────────────────────────────────
