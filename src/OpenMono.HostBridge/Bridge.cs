@@ -10,10 +10,8 @@ namespace OpenMono.HostBridge;
 /// stay in the container — the only thing that ever runs on bare metal is an
 /// approved HOST_EXEC command.
 /// </summary>
-public sealed class Bridge
+public sealed class Bridge : IHostExecPrompter
 {
-    private const int MaxPauseDepth = 25;
-
     private readonly AcpClient _acp;
     private readonly BridgeConfig _config;
     private readonly HostExecutor _executor;
@@ -22,14 +20,16 @@ public sealed class Bridge
     private readonly string _workDir;
     private readonly bool _nonInteractive;
     private bool _buildMode;
-    // Session-scoped answers from the permission menu ("allow all" / "deny
-    // all"): in-memory only, mirroring the regular agent's PermissionEngine.
-    // Keyed by tool name ("sudo", "host-exec", or the ACP tool name).
-    private readonly HashSet<string> _sessionAllow = new(StringComparer.OrdinalIgnoreCase);
-    private readonly HashSet<string> _sessionDeny = new(StringComparer.OrdinalIgnoreCase);
-    // In-container AskUser call ids whose tool cards are swallowed because
-    // they carry a HOST_EXEC envelope (the bridge renders that action itself).
-    private readonly HashSet<string> _suppressedToolCalls = new(StringComparer.Ordinal);
+    // Single session-scoped permission memory: tool grants (base) + host-exec
+    // and sudo grants (extension). Replaces _sessionAllow/_sessionDeny.
+    private readonly HostExecPermissionStore _store = new();
+    // In-container AskUser tool calls carrying a HOST_EXEC envelope have their
+    // cards swallowed (the bridge renders that action itself). Pairing is by
+    // event order — see HostExecSuppressionTracker. Genuine questions render.
+    private readonly HostExecSuppressionTracker _suppression = new();
+    // Diagnostic-only pause count (no gate, no cap). Reset per turn.
+    private int _pauseCount;
+    private string _lastPauseKind = "";
 
     public Bridge(
         AcpClient acp,
@@ -53,10 +53,13 @@ public sealed class Bridge
 
     public async Task<int> RunTurnAsync(string baseUrl, string sessionId, object payload, CancellationToken ct)
     {
+        _pauseCount = 0;
+        _lastPauseKind = "";
+        _suppression.Clear();
         _ui.ResponseBegin();
         try
         {
-            return await PumpAsync(baseUrl, sessionId, _acp.PostTurnStreamAsync(baseUrl, sessionId, payload, ct), 0, ct);
+            return await PumpAsync(baseUrl, sessionId, _acp.PostTurnStreamAsync(baseUrl, sessionId, payload, ct), ct);
         }
         finally
         {
@@ -68,26 +71,29 @@ public sealed class Bridge
         string baseUrl,
         string sessionId,
         IAsyncEnumerable<AcpEvent> stream,
-        int depth,
         CancellationToken ct)
     {
-        if (depth > MaxPauseDepth)
-        {
-            _ui.Error("[bridge] ERROR: pause nesting too deep — aborting turn.");
-            return 1;
-        }
-
         await foreach (var evt in stream.WithCancellation(ct))
         {
-            var code = await HandleEventAsync(baseUrl, sessionId, evt, depth, ct);
+            var code = await HandleEventAsync(baseUrl, sessionId, evt, ct);
             if (code.HasValue)
                 return code.Value;
         }
         return 0;
     }
 
+    private void NotePause(string kind)
+    {
+        // Observability only: never a gate. Long legitimate tasks keep going;
+        // a climbing count tells the operator a pause ping-pong may be stuck.
+        _pauseCount++;
+        _lastPauseKind = kind;
+        if (_pauseCount % 25 == 0)
+            _ui.Info($"[bridge] {_pauseCount} pauses this turn (no cap — Ctrl-C to abort). Last: {kind}.");
+    }
+
     private async Task<int?> HandleEventAsync(
-        string baseUrl, string sessionId, AcpEvent evt, int depth, CancellationToken ct)
+        string baseUrl, string sessionId, AcpEvent evt, CancellationToken ct)
     {
         switch (evt.Type)
         {
@@ -100,17 +106,12 @@ public sealed class Bridge
             case "tool_start":
             {
                 var name = Str(evt.Data, "name");
-                var suppressId = HostExecSuppressionId(name, evt.Data);
-                if (suppressId is not null)
+                var id = Str(evt.Data, "id");
+                if (name.Equals("AskUser", StringComparison.OrdinalIgnoreCase) && id.Length > 0)
                 {
-                    // The in-container AskUser call carrying a HOST_EXEC
-                    // envelope: the bridge renders its own host-exec card +
-                    // prompt for the same action, so the raw-JSON card would be
-                    // a duplicate. Swallow it (and its tool_end, correlated
-                    // below by call id).
-                    if (_suppressedToolCalls.Count > 64)
-                        _suppressedToolCalls.Clear();
-                    _suppressedToolCalls.Add(suppressId);
+                    // Candidate HOST_EXEC carrier: hold the card until its
+                    // user_input_request classifies it (exact, no text parsing).
+                    _suppression.TrackAskUserStart(id);
                     return null;
                 }
                 _ui.ToolStart(name, Str(evt.Data, "summary"));
@@ -119,7 +120,7 @@ public sealed class Bridge
             case "tool_end":
             {
                 var id = Str(evt.Data, "id");
-                if (id.Length > 0 && _suppressedToolCalls.Remove(id))
+                if (_suppression.ConsumeIfSuppressed(id))
                     return null;
                 var ok = evt.Data.TryGetProperty("ok", out var okEl) && okEl.ValueKind == JsonValueKind.True;
                 var reason = Str(evt.Data, "reason");
@@ -142,17 +143,20 @@ public sealed class Bridge
             }
             case "permission_request":
             {
+                NotePause("permission_request");
                 var allow = await ResolveToolPermissionAsync(
                     Str(evt.Data, "tool"), Str(evt.Data, "summary"), IsDangerous(evt.Data), ct);
                 return await PumpAsync(baseUrl, sessionId,
                     _acp.PostTurnStreamAsync(baseUrl, sessionId,
                         AcpClient.PermissionPayload(Str(evt.Data, "id"), allow, _config.PermissionScope), ct),
-                    depth + 1, ct);
+                    ct);
             }
             case "user_input_request":
-                return await ResolveUserInputAsync(baseUrl, sessionId, evt, depth, ct);
+                NotePause("user_input_request");
+                return await ResolveUserInputAsync(baseUrl, sessionId, evt, ct);
             case "playbook_permission_request":
             {
+                NotePause("playbook_permission_request");
                 var id = Str(evt.Data, "id");
                 var name = Str(evt.Data, "playbookName");
                 var allow = await _ui.PlaybookAsync(
@@ -163,10 +167,11 @@ public sealed class Bridge
                 return await PumpAsync(baseUrl, sessionId,
                     _acp.PostTurnStreamAsync(baseUrl, sessionId,
                         AcpClient.PlaybookPayload(id, allow), ct),
-                    depth + 1, ct);
+                    ct);
             }
             case "toggle_mode_request":
             {
+                NotePause("toggle_mode_request");
                 var id = Str(evt.Data, "id");
                 // The agent only ever asks to go build. If we already put the
                 // session there, approve without bothering the operator.
@@ -177,7 +182,7 @@ public sealed class Bridge
                 return await PumpAsync(baseUrl, sessionId,
                     _acp.PostTurnStreamAsync(baseUrl, sessionId,
                         AcpClient.ToggleModePayload(id, approve), ct),
-                    depth + 1, ct);
+                    ct);
             }
             case "mode_changed":
             {
@@ -208,12 +213,20 @@ public sealed class Bridge
     }
 
     private async Task<int> ResolveUserInputAsync(
-        string baseUrl, string sessionId, AcpEvent evt, int depth, CancellationToken ct)
+        string baseUrl, string sessionId, AcpEvent evt, CancellationToken ct)
     {
         var id = Str(evt.Data, "id");
         var question = Str(evt.Data, "question");
 
-        if (HostExecRequest.LooksLikeHostExec(question))
+        // Pair with the AskUser tool call that produced this prompt (FIFO —
+        // prompts arrive in start order). The tracker marks the linked call
+        // suppressed when this is a HOST_EXEC carrier. HOST_EXEC executes
+        // regardless of linkage (playbook param prompts have no AskUser
+        // origin); genuine questions render their deferred card with full text.
+        var isHostExec = HostExecRequest.LooksLikeHostExec(question);
+        var linkedToolId = _suppression.LinkPrompt(isHostExec);
+
+        if (isHostExec)
         {
             string answer;
             if (HostExecRequest.TryParse(question, out var request) && request is not null)
@@ -234,8 +247,13 @@ public sealed class Bridge
             return await PumpAsync(baseUrl, sessionId,
                 _acp.PostTurnStreamAsync(baseUrl, sessionId,
                     AcpClient.UserInputPayload(id, answer), ct),
-                depth + 1, ct);
+                ct);
         }
+
+        // Genuine question: render the deferred AskUser card (if it had an
+        // AskUser origin), then prompt with the full text.
+        if (!isHostExec && linkedToolId is not null)
+            _ui.ToolStart("AskUser", question);
 
         if (_nonInteractive)
         {
@@ -246,7 +264,7 @@ public sealed class Bridge
         return await PumpAsync(baseUrl, sessionId,
             _acp.PostTurnStreamAsync(baseUrl, sessionId,
                 AcpClient.UserInputPayload(id, answerText), ct),
-            depth + 1, ct);
+            ct);
     }
 
     /// <summary>
@@ -278,14 +296,14 @@ public sealed class Bridge
         // operator explicitly changes it (openmono config host.sudo_policy).
         if (_executor.RequiresElevation(request) && _identity.Sudo == SudoPolicy.Ask)
         {
-            if (_sessionDeny.Contains("sudo"))
+            if (_store.TryResolveSudo() is { Allow: false })
             {
                 AuditLog.WriteCommand(targetUser, request.AsRoot, request.Command,
                     -1, stopwatch.ElapsedMilliseconds, false,
                     "sudo ask policy denied for session (deny all)");
                 return $"Host execution denied by operator (sudo denied for session): {request.Command}";
             }
-            if (!_sessionAllow.Contains("sudo"))
+            if (_store.TryResolveSudo() is not { Allow: true })
             {
                 var interactive = !_nonInteractive && !Console.IsInputRedirected;
                 if (!interactive)
@@ -298,12 +316,9 @@ public sealed class Bridge
                     return "Host execution denied by bridge policy (sudo ask policy, non-interactive): " + request.Command;
                 }
                 var (allow, scope) = await _ui.PermissionAsync(
-                    "sudo", $"Run '{Truncate(request.Command, 200)}' as {targetUser} with sudo?", ct);
+                    "sudo", $"Run '{request.Command}' as {targetUser} with sudo?", ct);
                 if (scope == "session")
-                {
-                    if (allow) _sessionAllow.Add("sudo");
-                    else _sessionDeny.Add("sudo");
-                }
+                    _store.RememberSudo(allow, OpenMono.Permissions.GrantScope.Session);
                 if (!allow)
                 {
                     AuditLog.WriteCommand(targetUser, request.AsRoot, request.Command,
@@ -315,11 +330,11 @@ public sealed class Bridge
 
         if (decision == HostPolicyDecision.Ask && !_nonInteractive)
         {
-            if (_sessionDeny.Contains("host-exec"))
+            if (_store.TryResolveHostExec() is { Allow: false })
             {
                 decision = HostPolicyDecision.Deny;
             }
-            else if (_sessionAllow.Contains("host-exec"))
+            else if (_store.TryResolveHostExec() is { Allow: true })
             {
                 decision = HostPolicyDecision.Allow;
             }
@@ -327,10 +342,7 @@ public sealed class Bridge
             {
                 var (allow, scope) = await _ui.PermissionAsync("host-exec", request.Command, ct);
                 if (scope == "session")
-                {
-                    if (allow) _sessionAllow.Add("host-exec");
-                    else _sessionDeny.Add("host-exec");
-                }
+                    _store.RememberHostExec(allow, OpenMono.Permissions.GrantScope.Session);
                 decision = allow ? HostPolicyDecision.Allow : HostPolicyDecision.Deny;
             }
         }
@@ -356,54 +368,113 @@ public sealed class Bridge
             _identity.SetPassword(await _ui.PasswordAsync($"Sudo password for '{targetUser}' (type it — nothing is logged): ", ct));
         }
 
+        // Pre-exec hint only (never blocking): warn about TTY-direct secrets
+        // up front so the operator is not surprised by the guidance error.
+        switch (HostExecInteraction.Classify(request.Command))
+        {
+            case InteractiveHint.StdinSecret:
+            case InteractiveHint.StdinConfirm:
+                _ui.Info("[host] this command may ask for input — you'll be prompted if it does.");
+                break;
+            case InteractiveHint.TtySecret:
+                _ui.Info("[host] note: ssh-style password prompts need a TTY — prefer key auth.");
+                break;
+            default:
+                break;
+        }
+
         _ui.HostStart(request.Command);
-        var output = await _executor.ExecuteAsync(request, _config.TimeoutMs, ct);
+        var output = await _executor.ExecuteAsync(request, _config.TimeoutMs, ct, this);
         _ui.HostDone(request.Command, output);
         return $"[host-exec on {_workDir}]\n$ {request.Command}\n{output}";
     }
+
+    // IHostExecPrompter: commands that block on stdin ask the operator through
+    // the existing UI. Answers are per-command, never session grants, and
+    // secrets are never logged (only the prompt excerpt + channel are audited).
+    bool IHostExecPrompter.CanPrompt => !_nonInteractive && !Console.IsInputRedirected;
+
+    async Task<char[]?> IHostExecPrompter.AskSecretAsync(string promptExcerpt, CancellationToken ct)
+    {
+        AuditPrompt(promptExcerpt, "masked");
+        try
+        {
+            return await _ui.PasswordAsync($"[host] input needed ({promptExcerpt}): ", ct);
+        }
+        catch (OperationCanceledException)
+        {
+            return null;
+        }
+    }
+
+    async Task<string?> IHostExecPrompter.AskTextAsync(string promptExcerpt, CancellationToken ct)
+    {
+        AuditPrompt(promptExcerpt, "echoed");
+        try
+        {
+            return await _ui.InputAsync($"[host] input needed ({promptExcerpt}) ", ct);
+        }
+        catch (OperationCanceledException)
+        {
+            return null;
+        }
+    }
+
+    async Task<bool?> IHostExecPrompter.AskConfirmAsync(string promptExcerpt, CancellationToken ct)
+    {
+        AuditPrompt(promptExcerpt, "confirm");
+        try
+        {
+            return await _ui.ConfirmAsync($"[host] {promptExcerpt} ", ct);
+        }
+        catch (OperationCanceledException)
+        {
+            return null;
+        }
+    }
+
+    private void AuditPrompt(string excerpt, string channel) =>
+        AuditLog.WriteCommand(_identity.RunAsUser, false,
+            excerpt.Length > 200 ? excerpt[..200] + "..." : excerpt,
+            -1, 0, false, $"host stdin prompt shown ({channel}); value never logged");
 
     private async Task<bool> ResolveToolPermissionAsync(string tool, string summary, bool dangerous, CancellationToken ct)
     {
         _config.Tools.TryGetValue(tool, out var rule);
         rule = (rule ?? _config.ToolDefault).Trim().ToLowerInvariant();
         var explicitAllow = _config.Tools.ContainsKey(tool) && rule == "allow";
-        if (_sessionDeny.Contains(tool))
+        // Session memory first (full text to the UI — wrap, never truncate).
+        if (_store.TryResolve(tool) is { Allow: false })
         {
-            _ui.Info($"[bridge] session-deny {tool} ({Truncate(summary, 120)})");
+            _ui.Info($"[bridge] session-deny {tool} ({summary})");
             return false;
         }
-        if (_sessionAllow.Contains(tool))
+        if (_store.TryResolve(tool) is { Allow: true })
         {
-            _ui.Info($"[bridge] session-allow {tool} ({Truncate(summary, 120)}) [{_config.PermissionScope}]");
+            _ui.Info($"[bridge] session-allow {tool} ({summary}) [{_config.PermissionScope}]");
             return true;
         }
         if (dangerous && !explicitAllow)
         {
-            _ui.Info($"[bridge] dangerous {tool} ({Truncate(summary, 120)}) — asking operator.");
-            var (allow, scope) = await _ui.PermissionAsync(tool, $"Allow dangerous {tool}? {Truncate(summary, 200)}", ct);
+            _ui.Info($"[bridge] dangerous {tool} ({summary}) — asking operator.");
+            var (allow, scope) = await _ui.PermissionAsync(tool, $"Allow dangerous {tool}? {summary}", ct);
             if (scope == "session")
-            {
-                if (allow) _sessionAllow.Add(tool);
-                else _sessionDeny.Add(tool);
-            }
+                _store.Remember(tool, allow, OpenMono.Permissions.GrantScope.Session);
             return allow;
         }
         if (rule == "allow")
         {
-            _ui.Info($"[bridge] auto-allow {tool} ({Truncate(summary, 120)}) [{_config.PermissionScope}]");
+            _ui.Info($"[bridge] auto-allow {tool} ({summary}) [{_config.PermissionScope}]");
             return true;
         }
         if (rule == "deny")
         {
-            _ui.Info($"[bridge] auto-deny {tool} ({Truncate(summary, 120)})");
+            _ui.Info($"[bridge] auto-deny {tool} ({summary})");
             return false;
         }
-        var (ok, okScope) = await _ui.PermissionAsync(tool, $"Allow {tool}? {Truncate(summary, 200)}", ct);
+        var (ok, okScope) = await _ui.PermissionAsync(tool, $"Allow {tool}? {summary}", ct);
         if (okScope == "session")
-        {
-            if (ok) _sessionAllow.Add(tool);
-            else _sessionDeny.Add(tool);
-        }
+            _store.Remember(tool, ok, OpenMono.Permissions.GrantScope.Session);
         return ok;
     }
 
@@ -444,46 +515,6 @@ public sealed class Bridge
 
     private static bool IsDangerous(JsonElement data) =>
         data.TryGetProperty("dangerous", out var el) && el.ValueKind == JsonValueKind.True;
-
-    /// <summary>
-    /// The call id to suppress when this tool_start is the in-container
-    /// AskUser call carrying a HOST_EXEC envelope (its summary is the raw
-    /// AskUser args JSON, e.g. <c>{"question":"HOST_EXEC: ..."}</c>), else
-    /// null. Genuine AskUser questions are never suppressed.
-    /// </summary>
-    private static string? HostExecSuppressionId(string name, JsonElement data)
-    {
-        if (!name.Equals("AskUser", StringComparison.OrdinalIgnoreCase))
-            return null;
-        var id = Str(data, "id");
-        if (id.Length == 0)
-            return null;
-        if (HostExecRequest.LooksLikeHostExec(Str(data, "summary")))
-            return id;
-        if (data.TryGetProperty("arguments", out var argsEl) &&
-            argsEl.ValueKind == JsonValueKind.String &&
-            LooksLikeHostExecArgs(argsEl.GetString()))
-            return id;
-        return null;
-    }
-
-    private static bool LooksLikeHostExecArgs(string? args)
-    {
-        if (string.IsNullOrWhiteSpace(args))
-            return false;
-        try
-        {
-            using var doc = JsonDocument.Parse(args);
-            if (doc.RootElement.TryGetProperty("question", out var q) &&
-                q.ValueKind == JsonValueKind.String &&
-                HostExecRequest.LooksLikeHostExec(q.GetString() ?? ""))
-                return true;
-        }
-        catch (JsonException)
-        {
-        }
-        return args.Contains(HostExecRequest.Prefix, StringComparison.Ordinal);
-    }
 
     private static string Str(JsonElement data, string name) =>
         data.ValueKind == JsonValueKind.Object &&

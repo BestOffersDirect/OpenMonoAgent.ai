@@ -385,11 +385,10 @@ internal sealed class AnsiInputReader(
         var saved = _bgInputBuf.ToString();
         painter.AddMessage(new AnsiPainter.Msg("sys", $"? {question}"));
         StopBackgroundInput();
-        painter.PaintActionLane(
-            $"{AnsiPainter.Fc}{AnsiPainter.B}? {question}{AnsiPainter.R}",
-            "",
-            $"  {AnsiPainter.Fk}Type your answer and press Enter{AnsiPainter.R}"
-        );
+        painter.Sz();
+        var wrapped = AnsiPainter.Wrap($"? {question}", Math.Max(1, painter.ComputeLayout("").MainW - 2));
+        painter.PaintActionLaneLines(wrapped,
+            $"  {AnsiPainter.Fk}Type your answer and press Enter{AnsiPainter.R}");
         painter.PaintConvThrottled(force: true);
 
         var ans = ReadInputCore(interactive: true);
@@ -530,24 +529,22 @@ internal sealed class AnsiInputReader(
     {
         var saved = _bgInputBuf.ToString();
         StopBackgroundInput();
-        painter.AddMessage(new AnsiPainter.Msg("sys",
-            $"{AnsiPainter.Fy}▶ Playbook approval: {plan.PlaybookName}{AnsiPainter.R}"));
 
         var stepsStr = string.Join(", ", plan.Steps.Select(s => s.Id));
         var toolsStr = string.Join(", ", plan.Tools.Select(t => t.Name));
 
+        // Full plan in the transcript (it wraps); the lane below shows the
+        // same text wrapped to fit, never cut with "...".
+        painter.AddMessage(new AnsiPainter.Msg("sys",
+            $"{AnsiPainter.Fy}▶ Playbook approval: {plan.PlaybookName}{AnsiPainter.R}\nSteps: {stepsStr}\nTools: {toolsStr}"));
+
         painter.Sz();
-        var maxLineLen = painter.ComputeLayout("").MainW - 4;
-        var truncatedSteps = stepsStr.Length > maxLineLen
-            ? stepsStr[..(maxLineLen - 3)] + "..."
-            : stepsStr;
-        var truncatedTools = toolsStr.Length > maxLineLen
-            ? toolsStr[..(maxLineLen - 3)] + "..."
-            : toolsStr;
+        var wrapW = Math.Max(1, painter.ComputeLayout("").MainW - 2);
+        var summaryLines = AnsiPainter.Wrap($"Steps: {stepsStr}\nTools: {toolsStr}", wrapW);
 
         painter.PaintPermissionLane(
             $"{AnsiPainter.Fy}{AnsiPainter.B}▸ Approve playbook: {plan.PlaybookName}{AnsiPainter.R}",
-            $"{AnsiPainter.Fw}Steps: {truncatedSteps}\nTools: {truncatedTools}{AnsiPainter.R}",
+            summaryLines,
             $"  {AnsiPainter.B}{AnsiPainter.Fg}[y]{AnsiPainter.R}{AnsiPainter.BgInput}  Allow",
             $"  {AnsiPainter.B}{AnsiPainter.Fy}[n]{AnsiPainter.R}{AnsiPainter.BgInput}  Deny",
             "",

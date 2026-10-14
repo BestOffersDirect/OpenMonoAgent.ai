@@ -245,7 +245,7 @@ public sealed class HostExecutor
         };
     }
 
-    public async Task<string> ExecuteAsync(HostExecRequest request, int defaultTimeoutMs, CancellationToken ct)
+    public async Task<string> ExecuteAsync(HostExecRequest request, int defaultTimeoutMs, CancellationToken ct, IHostExecPrompter? prompter = null)
     {
         var stopwatch = Stopwatch.StartNew();
         var command = request.Command;
@@ -286,20 +286,21 @@ public sealed class HostExecutor
         {
             result = request.Background
                 ? RunBackgroundDirect(command)
-                : await RunForegroundDirectAsync(command, defaultTimeoutMs, request.TimeoutMs, ct);
+                : await RunForegroundDirectAsync(command, defaultTimeoutMs, request.TimeoutMs, prompter, ct);
         }
         else if (explicitEscalation && !request.AsRoot && targetUser.Equals(HostIdentity.CurrentUser, StringComparison.Ordinal))
         {
-            // Operator's own sudo, passed through unwrapped (stdin closed: fails closed, never prompts).
+            // Operator's own sudo, passed through unwrapped. The prompt loop
+            // still applies (fails fast with guidance when no prompter).
             result = request.Background
                 ? RunBackgroundDirect(command)
-                : await RunForegroundDirectAsync(command, defaultTimeoutMs, request.TimeoutMs, ct);
+                : await RunForegroundDirectAsync(command, defaultTimeoutMs, request.TimeoutMs, prompter, ct);
         }
         else
         {
             result = request.Background
                 ? RunBackgroundSudo(command, targetUser, ct)
-                : await RunForegroundSudoAsync(command, targetUser, defaultTimeoutMs, request.TimeoutMs, ct);
+                : await RunForegroundSudoAsync(command, targetUser, defaultTimeoutMs, request.TimeoutMs, prompter, ct);
         }
 
         var exit = result.StartsWith("ERROR:", StringComparison.Ordinal) ? -1 : ParseExit(result);
@@ -336,13 +337,13 @@ public sealed class HostExecutor
     }
 
     private async Task<string> RunForegroundDirectAsync(
-        string command, int defaultTimeoutMs, int? requestTimeoutMs, CancellationToken ct)
+        string command, int defaultTimeoutMs, int? requestTimeoutMs, IHostExecPrompter? prompter, CancellationToken ct)
     {
         var timeoutMs = requestTimeoutMs is > 0 ? Math.Min(requestTimeoutMs.Value, 600_000) : defaultTimeoutMs;
-        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        timeoutCts.CancelAfter(timeoutMs);
 
-        var psi = BashPsi(command, stdin: false);
+        // stdin stays open: when the command blocks on input, the prompt loop
+        // asks the operator (or fails fast with guidance when no prompter).
+        var psi = BashPsi(command, stdin: true);
         using var process = new Process { StartInfo = psi };
         try
         {
@@ -354,28 +355,19 @@ public sealed class HostExecutor
             return $"ERROR: failed to start process: {ex.Message}";
         }
 
-        string stdout, stderr;
-        try
-        {
-            var stdoutTask = process.StandardOutput.ReadToEndAsync(timeoutCts.Token);
-            var stderrTask = process.StandardError.ReadToEndAsync(timeoutCts.Token);
-            await process.WaitForExitAsync(timeoutCts.Token);
-            stdout = await stdoutTask;
-            stderr = await stderrTask;
-        }
-        catch (OperationCanceledException)
-        {
-            var pid = SafePid(process);
-            var confirmed = TryKillTree(process, useSudo: false);
-            return ct.IsCancellationRequested
-                ? $"ERROR: command cancelled: {command}"
-                : TimeoutMessage(timeoutMs, command, pid, confirmed);
-        }
-        return FormatResult(process.ExitCode, stdout, stderr);
+        var read = await InteractiveProcessRunner.ReadAsync(
+            process, prompter, timeoutMs, ct, p => TryKillTree(p, useSudo: false));
+        if (read.Cancelled)
+            return $"ERROR: command cancelled: {command}";
+        if (read.AbortError is not null)
+            return read.AbortError;
+        if (read.TimedOut)
+            return TimeoutMessage(timeoutMs, command, SafePid(process), confirmedTerminated: true);
+        return FormatResult(process.ExitCode, read.Stdout, read.Stderr);
     }
 
     private async Task<string> RunForegroundSudoAsync(
-        string command, string targetUser, int defaultTimeoutMs, int? requestTimeoutMs, CancellationToken ct)
+        string command, string targetUser, int defaultTimeoutMs, int? requestTimeoutMs, IHostExecPrompter? prompter, CancellationToken ct)
     {
         if (!SudoPresent())
             return "ERROR: sudo is not installed on this host.";
@@ -385,30 +377,27 @@ public sealed class HostExecutor
 
         // Fast path: cached timestamp / NOPASSWD — no password touches stdin.
         if (SudoProbe(targetUser))
-            return await RunSudoAttemptAsync(command, targetUser, usePassword: false, timeoutMs, ct);
+            return await RunSudoAttemptAsync(command, targetUser, usePassword: false, timeoutMs, prompter, ct);
 
         if (!_identity.HasPassword)
             return $"ERROR: elevation to '{targetUser}' needs a sudo password and none is in memory. " +
                 "Restart the bridge interactively to provide it, or set OPENMONO_HOST_PASSWORD_FILE.";
 
-        var result = await RunSudoAttemptAsync(command, targetUser, usePassword: true, timeoutMs, ct);
+        var result = await RunSudoAttemptAsync(command, targetUser, usePassword: true, timeoutMs, prompter, ct);
         if (IsPasswordFailure(result))
         {
             // Timestamp may have expired between probe and run — one retry.
             ForgetSudoProbe(targetUser);
-            result = await RunSudoAttemptAsync(command, targetUser, usePassword: true, timeoutMs, ct);
+            result = await RunSudoAttemptAsync(command, targetUser, usePassword: true, timeoutMs, prompter, ct);
         }
         return result;
     }
 
     private async Task<string> RunSudoAttemptAsync(
-        string command, string targetUser, bool usePassword, int timeoutMs, CancellationToken ct)
+        string command, string targetUser, bool usePassword, int timeoutMs, IHostExecPrompter? prompter, CancellationToken ct)
     {
         if (!HostIdentity.IsValidUsername(targetUser))
             return $"ERROR: refusing to run as invalid username '{targetUser}'.";
-        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        timeoutCts.CancelAfter(timeoutMs);
-
         var inner = $"sudo {(usePassword ? "-S " : "")}-u {targetUser} -- /bin/bash -c {Escape(command)}";
         var psi = new ProcessStartInfo
         {
@@ -432,9 +421,11 @@ public sealed class HostExecutor
             return $"ERROR: failed to start sudo: {ex.Message}";
         }
 
-        try
+        // Sudo password first (when needed), then the prompt loop for any
+        // further input the command itself requests. Stdin stays open.
+        if (usePassword)
         {
-            if (usePassword)
+            try
             {
                 _identity.UsePasswordBytes(bytes =>
                 {
@@ -444,19 +435,21 @@ public sealed class HostExecutor
                     return 0;
                 });
             }
-            process.StandardInput.Close();
+            catch (IOException)
+            {
+                return "ERROR: failed to provide sudo password (process exited early).";
+            }
+        }
 
-            var stdoutTask = process.StandardOutput.ReadToEndAsync(timeoutCts.Token);
-            var stderrTask = process.StandardError.ReadToEndAsync(timeoutCts.Token);
-            await process.WaitForExitAsync(timeoutCts.Token);
-            return FormatResult(process.ExitCode, await stdoutTask, await stderrTask);
-        }
-        catch (OperationCanceledException)
-        {
-            var pid = SafePid(process);
-            var confirmed = TryKillTree(process, useSudo: true);
-            return TimeoutMessage(timeoutMs, command, pid, confirmed);
-        }
+        var read = await InteractiveProcessRunner.ReadAsync(
+            process, prompter, timeoutMs, ct, p => TryKillTree(p, useSudo: true));
+        if (read.Cancelled)
+            return $"ERROR: command cancelled: {command}";
+        if (read.AbortError is not null)
+            return read.AbortError;
+        if (read.TimedOut)
+            return TimeoutMessage(timeoutMs, command, SafePid(process), confirmedTerminated: true);
+        return FormatResult(process.ExitCode, read.Stdout, read.Stderr);
     }
 
     private string RunBackgroundDirect(string command)

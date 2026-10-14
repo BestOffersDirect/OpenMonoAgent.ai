@@ -474,22 +474,34 @@ internal sealed partial class AnsiPainter(AppConfig config, SessionState session
 
     internal void PaintActionLane(string line1, string line2, string line3)
     {
+        PaintActionLaneLines([line1, line2, line3], "");
+    }
+
+    /// <summary>
+    /// Action lane with a wrapped body: rows grow upward from the bottom like
+    /// <see cref="PaintPermissionMenu"/>, so long AskUser questions are fully
+    /// visible instead of overflowing the frame. The transcript always holds
+    /// the complete text as well.
+    /// </summary>
+    internal void PaintActionLaneLines(IReadOnlyList<string> bodyLines, string hint)
+    {
         Sz();
         var w = _tw - _sideW;
         var sb = new StringBuilder(512);
 
-        var row1 = Math.Max(1, _th - 3);
-        var row2 = Math.Max(1, _th - 2);
+        void Row(int offset, string text)
+        {
+            sb.Append($"{E}[{Math.Max(1, _th - offset)};1H");
+            sb.Append($"{BgInput} {PadR(text, Math.Max(0, w - 2))}{R}");
+        }
 
-        sb.Append($"{E}[{row1};1H");
-        sb.Append($"{BgInput} {PadR(line1, Math.Max(0, w - 2))}{R}");
-
-        sb.Append($"{E}[{row2};1H");
-        sb.Append($"{BgInput} {PadR(line2, Math.Max(0, w - 2))}{R}");
-
-        var tabRow = Math.Max(1, _th - 1);
-        sb.Append($"{E}[{tabRow};1H");
-        sb.Append($"{BgInput} {PadR(line3, Math.Max(0, w - 2))}{R}");
+        var n = Math.Min(Math.Max(bodyLines.Count, 1), 12);
+        for (var i = 0; i < n && i < bodyLines.Count; i++)
+            Row(n - i + 1, bodyLines[i]);
+        if (bodyLines.Count > n)
+            Row(1, $"  {Fk}… ({bodyLines.Count - n} more — full text in transcript above){R}");
+        else
+            Row(1, hint);
 
         lock (_writeLock)
         {
@@ -498,7 +510,7 @@ internal sealed partial class AnsiPainter(AppConfig config, SessionState session
         }
     }
 
-    internal void PaintPermissionLane(string title, string summary, string opt1, string opt2, string opt3, string opt4)
+    internal void PaintPermissionLane(string title, IReadOnlyList<string> summaryLines, string opt1, string opt2, string opt3, string opt4)
     {
         Sz();
         var w  = _tw - _sideW;
@@ -510,8 +522,16 @@ internal sealed partial class AnsiPainter(AppConfig config, SessionState session
             sb.Append($"{BgInput} {PadR(text, Math.Max(0, w - 2))}{R}");
         }
 
-        Row(6, title);
-        Row(5, summary);
+        var shown = Math.Min(Math.Max(summaryLines.Count, 1), 12);
+        var overflow = summaryLines.Count > shown;
+        // Reserve offset 5 for the overflow note when capped.
+        var bodyCount = overflow ? shown - 1 : Math.Min(shown, summaryLines.Count);
+        var titleOffset = 5 + shown;
+        Row(titleOffset, title);
+        for (var i = 0; i < bodyCount; i++)
+            Row(titleOffset - 1 - i, summaryLines[i]);
+        if (overflow)
+            Row(5, $"  {Fk}… ({summaryLines.Count - bodyCount} more — full plan in transcript above){R}");
         Row(4, opt1);
         Row(3, opt2);
         Row(2, opt3);
@@ -565,7 +585,14 @@ internal sealed partial class AnsiPainter(AppConfig config, SessionState session
             sb.Append($"{BgInput} {PadR(text, Math.Max(0, w - 2))}{R}");
         }
 
-        Row(n + 3, $"{B}{Fbb}? {R}{BgInput}{title}");
+        var titleLines = Wrap($"{B}{Fbb}? {R}{BgInput}{title}", Math.Max(1, w - 2));
+        var overflowTitle = titleLines.Count > 3;
+        var shownTitle = overflowTitle ? 2 : Math.Min(titleLines.Count, 3);
+        var topOffset = n + 2 + shownTitle + (overflowTitle ? 1 : 0);
+        for (var i = 0; i < shownTitle && i < titleLines.Count; i++)
+            Row(topOffset - i, titleLines[i]);
+        if (overflowTitle)
+            Row(topOffset - shownTitle, $"  {Fk}… ({titleLines.Count - shownTitle} more — full question in transcript){R}");
         for (var i = 0; i < n; i++)
         {
             var marker = (!onCustom && i == selected) ? $"{B}{Fbb}❯ {R}{BgInput}" : "  ";
@@ -2038,10 +2065,23 @@ internal sealed partial class AnsiPainter(AppConfig config, SessionState session
             {
                 var contentLines = m.Text.Split('\n');
                 const int maxContentLines = 33;
-                for (var i = 0; i < Math.Min(contentLines.Length, maxContentLines); i++)
-                    lines.Add($"  {Fk}{contentLines[i]}{R}");
-                if (contentLines.Length > maxContentLines)
-                    lines.Add($"  {DM}{Fk}… ({contentLines.Length - maxContentLines} more lines){R}");
+                var shown = 0;
+                var rawShown = 0;
+                foreach (var raw in contentLines)
+                {
+                    if (shown >= maxContentLines)
+                        break;
+                    foreach (var wl in Wrap(raw, Math.Max(1, w - 4)))
+                    {
+                        if (shown >= maxContentLines)
+                            break;
+                        lines.Add($"  {Fk}{wl}{R}");
+                        shown++;
+                    }
+                    rawShown++;
+                }
+                if (rawShown < contentLines.Length)
+                    lines.Add($"  {DM}{Fk}… ({contentLines.Length - rawShown} more lines){R}");
                 break;
             }
             case "diff":

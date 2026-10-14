@@ -72,7 +72,8 @@ public sealed class ConversationLoop : IDisposable
         int maxIterations = 1000,
         int agentDepth = 0,
         Func<string?>? dequeuePendingUserInput = null,
-        Action<string>? onPendingUserInputInjected = null)
+        Action<string>? onPendingUserInputInjected = null,
+        PermissionStore? store = null)
     {
         _llm = llm;
         _tools = tools;
@@ -90,9 +91,11 @@ public sealed class ConversationLoop : IDisposable
 
 
 
+            // ACP path: reuse the session's store so grants survive across loops.
+            // A fresh store keeps standalone (non-ACP) construction working.
             var adapter = new AcpInputReaderAdapter(interaction);
             _input = adapter;
-            _permissions = new PermissionEngine(config, output, adapter);
+            _permissions = new PermissionEngine(config, output, adapter, store: store);
         }
         _liveFeedback = liveFeedback;
         _config = config;
