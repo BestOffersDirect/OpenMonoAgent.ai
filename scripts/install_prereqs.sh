@@ -386,53 +386,65 @@ else
 
     if [ "$_cuda_ok" = false ]; then
         _cuda_arch="$(dpkg --print-architecture 2>/dev/null || echo x86_64)"
-        _cuda_repo_cn="$(ubuntu_codename)"
-        _cuda_repo_url="https://developer.download.nvidia.com/compute/cuda/repos/ubuntu${_cuda_repo_cn}/${_cuda_arch}"
-        if ! curl -fsSL --max-time 20 "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu${_cuda_repo_cn}/${_cuda_arch}/cuda-keyring_1.1-1_all.deb" -o /dev/null 2>&1; then
-            # NVIDIA has not published a repo for this (new) codename yet.
-            # Fall back to the newest codename that has one, newest first.
-            for _try in noble jammy focal; do
+        # NVIDIA names its CUDA repo dirs by release number (ubuntu2404), not
+        # by lsb-release codename (noble) — the codename path 404s even on the
+        # distros where the repo exists.
+        _cuda_release="$(sed -n 's/^VERSION_ID=//p' /etc/os-release 2>/dev/null | tr -d '.')"
+        if [ -z "$_cuda_release" ]; then
+            _cuda_release="$(ubuntu_codename)"
+        fi
+        _cuda_repo_dir="ubuntu${_cuda_release}"
+        _cuda_repo_url="https://developer.download.nvidia.com/compute/cuda/repos/${_cuda_repo_dir}/${_cuda_arch}"
+        if ! curl -fsSL --max-time 20 "${_cuda_repo_url}/cuda-keyring_1.1-1_all.deb" -o /dev/null 2>&1; then
+            # NVIDIA has not published a repo for this release yet (e.g. a
+            # brand-new Ubuntu). Fall back to the newest release that has one,
+            # newest first.
+            for _try in 2404 2204 2004; do
                 if curl -fsSL --max-time 20 "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu${_try}/${_cuda_arch}/cuda-keyring_1.1-1_all.deb" -o /dev/null 2>&1; then
-                    warn "NVIDIA CUDA repo has no 'ubuntu${_cuda_repo_cn}' codename — using the 'ubuntu${_try}' repo (packages are compatible)"
-                    _cuda_repo_cn="$_try"
+                    warn "NVIDIA has no CUDA repo for Ubuntu $(sed -n 's/^VERSION_ID=//p' /etc/os-release) yet — using the ubuntu${_try} repo (packages are compatible)"
+                    _cuda_repo_dir="ubuntu${_try}"
                     _cuda_repo_url="https://developer.download.nvidia.com/compute/cuda/repos/ubuntu${_try}/${_cuda_arch}"
                     break
                 fi
             done
         fi
-
-        info "Adding NVIDIA CUDA apt repository (ubuntu${_cuda_repo_cn} / ${_cuda_arch})..."
-        if run bash -c "curl -fsSL '$_cuda_repo_url/cuda-keyring_1.1-1_all.deb' | $SUDO dpkg -i" && \
-           run $SUDO apt-get update -qq; then
-            info "Installing CUDA 13.x toolkit (cuda-toolkit-13-0, ~4 GB)..."
-            if run $SUDO apt-get install -y -qq cuda-toolkit-13-0; then
-                # Prefer the NVIDIA toolkit over any stale distro nvcc on PATH.
-                _cuda_link="$(ls -d /usr/local/cuda-13.0 /usr/local/cuda-13* 2>/dev/null | head -1 || true)"
-                if [ -z "$_cuda_link" ] && [ -e /usr/local/cuda ]; then
-                    _cuda_link="$(readlink -f /usr/local/cuda)"
+        if ! curl -fsSL --max-time 20 "${_cuda_repo_url}/cuda-keyring_1.1-1_all.deb" -o /dev/null 2>&1; then
+            warn "Could not reach any NVIDIA CUDA apt repo — skipping the toolkit install for now."
+            warn "Fix later with: bash scripts/strata.sh update-cuda"
+        else
+            info "Adding NVIDIA CUDA apt repository (${_cuda_repo_dir} / ${_cuda_arch})..."
+            if run bash -c "curl -fsSL '${_cuda_repo_url}/cuda-keyring_1.1-1_all.deb' | $SUDO dpkg -i" && \
+               run $SUDO apt-get update -qq; then
+                info "Installing CUDA 13.x toolkit (cuda-toolkit-13-0, ~4 GB)..."
+                if run $SUDO apt-get install -y -qq cuda-toolkit-13-0; then
+                    # Prefer the NVIDIA toolkit over any stale distro nvcc on PATH.
+                    _cuda_link="$(ls -d /usr/local/cuda-13.0 /usr/local/cuda-13* 2>/dev/null | head -1 || true)"
+                    if [ -z "$_cuda_link" ] && [ -e /usr/local/cuda ]; then
+                        _cuda_link="$(readlink -f /usr/local/cuda)"
+                    fi
+                    if [ -n "$_cuda_link" ] && [ -x "$_cuda_link/bin/nvcc" ]; then
+                        export PATH="$_cuda_link/bin:$PATH"
+                        for rc in "$HOME/.bashrc" "$HOME/.profile" "$HOME/.zshrc"; do
+                            if [ -f "$rc" ] && ! grep -q "local/cuda" "$rc" 2>/dev/null; then
+                                {
+                                    echo ""
+                                    echo "# CUDA toolkit"
+                                    echo 'export PATH="/usr/local/cuda/bin:$PATH"'
+                                } >> "$rc"
+                                detail "Added /usr/local/cuda/bin to PATH in $(basename "$rc")"
+                            fi
+                        done
+                    fi
+                    ok "CUDA 13.x toolkit installed"
+                    detail "$(nvcc --version 2>/dev/null | grep -m1 release || true)"
+                else
+                    warn "CUDA 13.x toolkit install failed — the Docker path still works, but the Strata backend will need it."
+                    warn "Fix later with: bash scripts/strata.sh update-cuda"
                 fi
-                if [ -n "$_cuda_link" ] && [ -x "$_cuda_link/bin/nvcc" ]; then
-                    export PATH="$_cuda_link/bin:$PATH"
-                    for rc in "$HOME/.bashrc" "$HOME/.profile" "$HOME/.zshrc"; do
-                        if [ -f "$rc" ] && ! grep -q "local/cuda" "$rc" 2>/dev/null; then
-                            {
-                                echo ""
-                                echo "# CUDA toolkit"
-                                echo 'export PATH="/usr/local/cuda/bin:$PATH"'
-                            } >> "$rc"
-                            detail "Added /usr/local/cuda/bin to PATH in $(basename "$rc")"
-                        fi
-                    done
-                fi
-                ok "CUDA 13.x toolkit installed"
-                detail "$(nvcc --version 2>/dev/null | grep -m1 release || true)"
             else
-                warn "CUDA 13.x toolkit install failed — the Docker path still works, but the Strata backend will need it."
+                warn "Could not add the NVIDIA CUDA repo — Strata's own installer may still set it up."
                 warn "Fix later with: bash scripts/strata.sh update-cuda"
             fi
-        else
-            warn "Could not add the NVIDIA CUDA repo — Strata's own installer may still set it up."
-            warn "Fix later with: bash scripts/strata.sh update-cuda"
         fi
     fi
 

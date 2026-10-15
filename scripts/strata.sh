@@ -56,7 +56,10 @@ CUDA_MIN="13.0"
 # NVIDIA publishes one CUDA apt repo per Ubuntu codename; newer releases
 # (e.g. 26.04 "resolute") appear there only after NVIDIA ships packages for
 # them, so we fall back to the newest codename that has one, newest first.
-CUDA_REPO_FALLBACKS=(noble jammy focal)
+# NOTE: these are the codenames as NVIDIA names their repo dirs (release
+# numbers, not lsb-release codenames) — the dir for 24.04 "noble" is
+# "ubuntu2404", NOT "ubuntunoble" (that path 404s).
+CUDA_REPO_FALLBACKS=(2404 2204 2004)
 CUDA_KEYRING_DEB="cuda-keyring_1.1-1_all.deb"
 
 RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[1;33m'
@@ -230,20 +233,32 @@ install_cuda_toolkit() {
         return 1
     fi
     arch="$(dpkg --print-architecture 2>/dev/null || echo x86_64)"
-    repo_url="https://developer.download.nvidia.com/compute/cuda/repos/ubuntu${cn}/${arch}"
+    # NVIDIA's repo dirs are named by release number (ubuntu2404), not by
+    # lsb-release codename (noble) — the codename path 404s even on the
+    # distros where the repo exists.
+    local cn_num="${ver//./}"
+    [[ -n "$cn_num" ]] || cn_num="${cn//[^0-9]/}"
+    [[ -n "$cn_num" ]] || { err "Cannot determine the Ubuntu release number from /etc/os-release."; return 1; }
+    repo_url="https://developer.download.nvidia.com/compute/cuda/repos/ubuntu${cn_num}/${arch}"
     if ! curl -fsSL --max-time 20 "${repo_url}/${CUDA_KEYRING_DEB}" -o /dev/null 2>&1; then
         local t
         for t in "${CUDA_REPO_FALLBACKS[@]}"; do
             if curl -fsSL --max-time 20 "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu${t}/${arch}/${CUDA_KEYRING_DEB}" -o /dev/null 2>&1; then
-                warn "NVIDIA has no CUDA repo for Ubuntu ${ver} ('${cn}') yet — using the '${t}' repo (packages are compatible)."
+                warn "NVIDIA has no CUDA repo for Ubuntu ${ver} yet — using the ubuntu${t} repo (packages are compatible)."
                 repo_url="https://developer.download.nvidia.com/compute/cuda/repos/ubuntu${t}/${arch}"
                 break
             fi
         done
-        [[ "$repo_url" == *"${cn}"* ]] && { err "Could not reach any NVIDIA CUDA apt repo."; return 1; }
+    fi
+    # If neither the distro's own repo nor any fallback answered, the network
+    # (or NVIDIA's) is not reachable.
+    if ! curl -fsSL --max-time 20 "${repo_url}/${CUDA_KEYRING_DEB}" -o /dev/null 2>&1; then
+        err "Could not reach any NVIDIA CUDA apt repo."
+        err "Checked: $(for t in "${CUDA_REPO_FALLBACKS[@]}"; do printf 'ubuntu%s ' "$t"; done)ubuntu${cn_num}"
+        return 1
     fi
 
-    info "Adding NVIDIA CUDA apt repo (ubuntu$(basename "$(dirname "$repo_url")") / ${arch}) ..."
+    info "Adding NVIDIA CUDA apt repo (ubuntu$(basename "$(dirname "$(dirname "$repo_url")")") / ${arch}) ..."
     if ! curl -fsSL "${repo_url}/${CUDA_KEYRING_DEB}" | sudo dpkg -i; then
         err "Failed to install the CUDA keyring package."
         return 1
