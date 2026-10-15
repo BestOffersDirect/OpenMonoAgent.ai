@@ -534,7 +534,7 @@ public sealed class OpenAiCompatClient : ILlmClient, IDisposable
         {
             var effort = !string.IsNullOrEmpty(options.ReasoningEffort)
                 ? options.ReasoningEffort
-                : options.EnableThinking.Value ? "medium" : "none";
+                : options.EnableThinking == true ? "medium" : "none";
             // Strata has no xhigh level — clamp to its documented max.
             if (string.Equals(effort, "xhigh", StringComparison.OrdinalIgnoreCase))
                 effort = "high";
