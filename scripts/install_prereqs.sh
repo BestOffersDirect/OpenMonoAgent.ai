@@ -358,9 +358,16 @@ else
     # backend, whose engine hard-requires nvcc >= 13.0 and refuses to build
     # against anything else. Installing 13.x from NVIDIA's repo (keyring +
     # cuda-toolkit-13-0) is the same flow Strata's own installer uses, but
-    # works on any Ubuntu (codename falls back to the newest published one
-    # when NVIDIA hasn't shipped the repo for a brand-new release yet, e.g.
-    # 26.04 "resolute" — the 24.04 "noble" packages work fine there).
+    # works on any Ubuntu:
+    #   - Repo dirs are release numbers (ubuntu2404), not codenames (noble).
+    #   - NVIDIA prunes older toolkit minor versions from newer distro repos:
+    #     e.g. ubuntu2604 only carries the rolling cuda-toolkit-13-3/13-4,
+    #     while ubuntu2404/2204 still carry cuda-toolkit-13-0. So the repo
+    #     AND the package are picked together below: prefer the native
+    #     release dir only if it actually carries CUDA 13.x at all, and the
+    #     package name is picked dynamically (the NEWEST 13.x minor the
+    #     chosen repo offers) — nothing is hardcoded except the 13-0
+    #     preference when the repo still has it.
     # Look for a real 13.x toolkit: any of the standard NVIDIA install
     # locations, or a 13.x nvcc on PATH. (A bare `command -v nvcc` would match
     # Ubuntu's distro-packaged 12.x toolkit, which is too old for Strata.)
@@ -395,30 +402,69 @@ else
         fi
         _cuda_repo_dir="ubuntu${_cuda_release}"
         _cuda_repo_url="https://developer.download.nvidia.com/compute/cuda/repos/${_cuda_repo_dir}/${_cuda_arch}"
-        if ! curl -fsSL --max-time 20 "${_cuda_repo_url}/cuda-keyring_1.1-1_all.deb" -o /dev/null 2>&1; then
-            # NVIDIA has not published a repo for this release yet (e.g. a
-            # brand-new Ubuntu). Fall back to the newest release that has one,
-            # newest first.
+        # Cache each repo dir's Packages index once (fetched via curl, shared
+        # across lookups so we don't hit NVIDIA repeatedly).
+        _cuda_pkg_idx_dir="${TMPDIR:-/tmp}/openmono-cuda-pkgs.$$"
+        mkdir -p "$_cuda_pkg_idx_dir"
+        _cuda_pkgs() {
+            # $1 = repo dir (e.g. ubuntu2604); echoes the Packages index to
+            # stdout, or nothing when the dir does not exist / is unreachable.
+            local _url="https://developer.download.nvidia.com/compute/cuda/repos/$1/${_cuda_arch}"
+            local _f="${_cuda_pkg_idx_dir}/$1"
+            if [ ! -s "$_f" ]; then
+                curl -fsSL --max-time 30 "${_url}/Packages" -o "$_f" 2>/dev/null || rm -f "$_f"
+            fi
+            [ -s "$_f" ] && cat "$_f"
+        }
+        _cuda_newest_13() {
+            # Newest cuda-toolkit-13-N in the Packages index on stdin.
+            # (The unversioned "cuda-toolkit-13" meta is excluded — apt would
+            # pull the repo's default, which is fine but less explicit.)
+            grep -E '^Package: cuda-toolkit-13(-[0-9]+)?$' 2>/dev/null \
+                | awk '{print $2}' \
+                | grep -v '^cuda-toolkit-13$' \
+                | sort -V \
+                | tail -1
+        }
+        # 1) Enumerate what the native repo dir actually offers (live).
+        _cuda_native_13="$(_cuda_pkgs "$_cuda_repo_dir" | _cuda_newest_13)"
+        if [ -z "$_cuda_native_13" ]; then
+            # Either NVIDIA has not published a repo for this release yet, or
+            # it exists but carries no versioned 13.x toolkit. Fall back to
+            # the newest supported release dir that has one.
             for _try in 2404 2204 2004; do
-                if curl -fsSL --max-time 20 "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu${_try}/${_cuda_arch}/cuda-keyring_1.1-1_all.deb" -o /dev/null 2>&1; then
-                    warn "NVIDIA has no CUDA repo for Ubuntu $(sed -n 's/^VERSION_ID=//p' /etc/os-release) yet — using the ubuntu${_try} repo (packages are compatible)"
+                _cuda_fb_13="$(_cuda_pkgs "ubuntu${_try}" | _cuda_newest_13)"
+                if [ -n "$_cuda_fb_13" ]; then
+                    warn "Using the ubuntu${_try} CUDA repo — it offers ${_cuda_fb_13} (the ubuntu${_cuda_release} repo has no CUDA 13.x toolkit)"
                     _cuda_repo_dir="ubuntu${_try}"
                     _cuda_repo_url="https://developer.download.nvidia.com/compute/cuda/repos/ubuntu${_try}/${_cuda_arch}"
+                    _cuda_native_13="$_cuda_fb_13"
                     break
                 fi
             done
         fi
-        if ! curl -fsSL --max-time 20 "${_cuda_repo_url}/cuda-keyring_1.1-1_all.deb" -o /dev/null 2>&1; then
-            warn "Could not reach any NVIDIA CUDA apt repo — skipping the toolkit install for now."
+        # 2) Pick the package: a user pin (OPENMONO_CUDA_PKG) if the chosen
+        #    repo has it, else the newest 13.x the repo offers.
+        _cuda_pkg="${OPENMONO_CUDA_PKG:-}"
+        if [ -n "$_cuda_pkg" ] && [ "$_cuda_pkg" != "$_cuda_native_13" ]; then
+            if ! printf '%s\n' "$(_cuda_pkgs "$_cuda_repo_dir")" | grep -qx "Package: ${_cuda_pkg}"; then
+                warn "Pinned ${_cuda_pkg} is not in the ${_cuda_repo_dir} repo — using ${_cuda_native_13} instead"
+                _cuda_pkg=""
+            fi
+        fi
+        [ -z "$_cuda_pkg" ] && _cuda_pkg="$_cuda_native_13"
+        if [ -z "$_cuda_pkg" ]; then
+            warn "No reachable NVIDIA CUDA apt repo offers a CUDA 13.x toolkit — skipping the toolkit install for now."
             warn "Fix later with: bash scripts/strata.sh update-cuda"
         else
             info "Adding NVIDIA CUDA apt repository (${_cuda_repo_dir} / ${_cuda_arch})..."
             if run bash -c "curl -fsSL '${_cuda_repo_url}/cuda-keyring_1.1-1_all.deb' | $SUDO dpkg -i" && \
                run $SUDO apt-get update -qq; then
-                info "Installing CUDA 13.x toolkit (cuda-toolkit-13-0, ~4 GB)..."
-                if run $SUDO apt-get install -y -qq cuda-toolkit-13-0; then
+                info "Installing CUDA 13.x toolkit (${_cuda_pkg}, ~4 GB)..."
+                if run $SUDO apt-get install -y -qq "$_cuda_pkg"; then
                     # Prefer the NVIDIA toolkit over any stale distro nvcc on PATH.
-                    _cuda_link="$(ls -d /usr/local/cuda-13.0 /usr/local/cuda-13* 2>/dev/null | head -1 || true)"
+                    # Newest 13.x wins (sort -V orders 13-0 before 13-4).
+                    _cuda_link="$(ls -d /usr/local/cuda-13* 2>/dev/null | sort -V | tail -1 || true)"
                     if [ -z "$_cuda_link" ] && [ -e /usr/local/cuda ]; then
                         _cuda_link="$(readlink -f /usr/local/cuda)"
                     fi

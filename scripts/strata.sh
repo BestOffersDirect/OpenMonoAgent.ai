@@ -212,12 +212,58 @@ cmd_check() {
     (cd "$STRATA_DIR" && ./setup.sh --check)
 }
 
+# List the exact cuda-toolkit-13-N package names visible to apt right now
+# (the caller has already added the repo and run apt-get update). Enumerated
+# from `apt-cache` itself — nothing is hardcoded — so whatever NVIDIA ships
+# in the active repos (13-0, 13-3, 13-4, 13-5, ...) is discovered live.
+_cuda_available_pkgs() {
+    apt-cache show "cuda-toolkit-13" 2>/dev/null | awk '/^Package: /{print $2}' \
+        | grep -E '^cuda-toolkit-13(-[0-9]+)?$' \
+        | sort -uV
+}
+
+# Pick the CUDA toolkit package to install:
+#   - OPENMONO_CUDA_PKG, if it is actually visible to apt;
+#   - else the pinned default (cuda-toolkit-13-0, what Strata's prebuilt
+#     engine was built with), if apt has it;
+#   - else the NEWEST 13.x minor apt can see (e.g. ubuntu2604 only carries
+#     the rolling 13-3/13-4 — fine, Strata only needs nvcc >= 13.0).
+# Echoes the package name; returns 1 when no CUDA 13.x package is visible.
+_cuda_pick_package() {
+    local pinned="${OPENMONO_CUDA_PKG:-cuda-toolkit-13-0}"
+    local avail p
+    avail="$(_cuda_available_pkgs)"
+    [[ -n "$avail" ]] || return 1
+    local want="${OPENMONO_CUDA_PKG:-}"
+    if [[ -n "$want" ]] && printf '%s\n' "$avail" | grep -qxF "$want"; then
+        echo "$want"
+        return 0
+    fi
+    if [[ "$pinned" != "cuda-toolkit-13-0" ]] && printf '%s\n' "$avail" | grep -qxF "$pinned"; then
+        echo "$pinned"
+        return 0
+    fi
+    if printf '%s\n' "$avail" | grep -qxF "cuda-toolkit-13-0"; then
+        echo "cuda-toolkit-13-0"
+        return 0
+    fi
+    p="$(printf '%s\n' "$avail" | grep -vxF 'cuda-toolkit-13' | sort -V | tail -1)"
+    [[ -n "$p" ]] || return 1
+    echo "$p"
+}
+
 # Install the CUDA 13.x toolkit via NVIDIA's official apt repo (same keyring
-# flow Strata's own installer uses, but with a codename fallback so brand-new
-# Ubuntu releases — e.g. 26.04, where NVIDIA has no repo yet — still work by
-# using the newest published one). Returns 0 when a usable 13.x nvcc exists.
+# flow Strata's own installer uses), but robust against both known failure
+# modes on new Ubuntu releases:
+#   - no repo dir for the release yet (brand-new Ubuntu) → fall back to the
+#     newest published dir;
+#   - the repo exists but NVIDIA has pruned the pinned package (e.g.
+#     ubuntu2604 only carries the rolling cuda-toolkit-13-3/13-4) → use the
+#     newest dir that still has it, or a newer 13.x package from the native
+#     repo. Strata only needs nvcc >= 13.0.
+# Returns 0 when a usable 13.x nvcc exists.
 install_cuda_toolkit() {
-    local id ver cn arch repo_url cur
+    local id ver cn arch cn_num repo_dir repo_url cur
     id="$(sed -n 's/^ID=//p' /etc/os-release 2>/dev/null | tr -d '"')"
     ver="$(sed -n 's/^VERSION_ID=//p' /etc/os-release 2>/dev/null | tr -d '"')"
     cn="$(. /etc/os-release 2>/dev/null && echo "${UBUNTU_CODENAME:-}")"
@@ -236,45 +282,79 @@ install_cuda_toolkit() {
     # NVIDIA's repo dirs are named by release number (ubuntu2404), not by
     # lsb-release codename (noble) — the codename path 404s even on the
     # distros where the repo exists.
-    local cn_num="${ver//./}"
+    cn_num="${ver//./}"
     [[ -n "$cn_num" ]] || cn_num="${cn//[^0-9]/}"
     [[ -n "$cn_num" ]] || { err "Cannot determine the Ubuntu release number from /etc/os-release."; return 1; }
-    repo_url="https://developer.download.nvidia.com/compute/cuda/repos/ubuntu${cn_num}/${arch}"
-    if ! curl -fsSL --max-time 20 "${repo_url}/${CUDA_KEYRING_DEB}" -o /dev/null 2>&1; then
-        local t
+    repo_dir="ubuntu${cn_num}"
+    repo_url="https://developer.download.nvidia.com/compute/cuda/repos/${repo_dir}/${arch}"
+    # Pinned by default (Strata's prebuilt engine is built with 13.0 and the
+    # upstream installer installs 13-0 too); overridable, and _cuda_pick_package
+    # falls back to a newer 13.x minor when the repo has pruned it.
+    local pinned="${OPENMONO_CUDA_PKG:-cuda-toolkit-13-0}"
+    local fallbacks=() t
+    for t in "${CUDA_REPO_FALLBACKS[@]}"; do
+        fallbacks+=("https://developer.download.nvidia.com/compute/cuda/repos/ubuntu${t}/${arch}")
+    done
+
+    info "Adding NVIDIA CUDA apt repo (${repo_dir} / ${arch}) ..."
+    if ! curl -fsSL --max-time 30 "${repo_url}/${CUDA_KEYRING_DEB}" | sudo dpkg -i; then
+        # The native dir does not exist yet (brand-new release) — fall back to
+        # the newest published dir, newest first.
         for t in "${CUDA_REPO_FALLBACKS[@]}"; do
-            if curl -fsSL --max-time 20 "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu${t}/${arch}/${CUDA_KEYRING_DEB}" -o /dev/null 2>&1; then
-                warn "NVIDIA has no CUDA repo for Ubuntu ${ver} yet — using the ubuntu${t} repo (packages are compatible)."
+            info "Trying the ubuntu${t} repo ..."
+            if curl -fsSL --max-time 30 "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu${t}/${arch}/${CUDA_KEYRING_DEB}" | sudo dpkg -i; then
+                warn "No CUDA repo for Ubuntu ${ver} yet — using the ubuntu${t} repo (packages are compatible)."
+                repo_dir="ubuntu${t}"
                 repo_url="https://developer.download.nvidia.com/compute/cuda/repos/ubuntu${t}/${arch}"
                 break
             fi
         done
+        [[ "$repo_dir" == "ubuntu${cn_num}" ]] || { err "Could not reach any NVIDIA CUDA apt repo."
+            err "Checked: ${repo_dir} $(for t in "${CUDA_REPO_FALLBACKS[@]}"; do printf 'ubuntu%s ' "$t"; done)"; return 1; }
     fi
-    # If neither the distro's own repo nor any fallback answered, the network
-    # (or NVIDIA's) is not reachable.
-    if ! curl -fsSL --max-time 20 "${repo_url}/${CUDA_KEYRING_DEB}" -o /dev/null 2>&1; then
-        err "Could not reach any NVIDIA CUDA apt repo."
-        err "Checked: $(for t in "${CUDA_REPO_FALLBACKS[@]}"; do printf 'ubuntu%s ' "$t"; done)ubuntu${cn_num}"
+    if ! sudo apt-get update; then
+        err "apt-get update failed after adding the CUDA repo."
         return 1
     fi
 
-    info "Adding NVIDIA CUDA apt repo (ubuntu$(basename "$(dirname "$(dirname "$repo_url")")") / ${arch}) ..."
-    if ! curl -fsSL "${repo_url}/${CUDA_KEYRING_DEB}" | sudo dpkg -i; then
-        err "Failed to install the CUDA keyring package."
-        return 1
+    # Which package? The pinned one if the active repo has it; otherwise the
+    # newest 13.x minor the active repo carries (e.g. ubuntu2604 only ships
+    # the rolling 13-3/13-4 — fine, Strata only needs nvcc >= 13.0).
+    local pkg=""
+    pkg="$(_cuda_pick_package)"
+    if [[ -z "$pkg" && "$repo_dir" != "ubuntu${cn_num}" ]]; then
+        # Native repo was used because the distro's dir is missing — the
+        # fallbacks may still carry the pinned package.
+        for url in "${fallbacks[@]}"; do
+            [[ "$url" == "$repo_url" ]] && continue
+            local d
+            d="$(basename "$(dirname "$(dirname "$url")")")"
+            if curl -fsSL --max-time 30 "${url}/${CUDA_KEYRING_DEB}" | sudo dpkg -i && sudo apt-get update; then
+                info "Also added the ${d} CUDA repo ..."
+                pkg="$(_cuda_pick_package)"
+                [[ -n "$pkg" ]] && { repo_dir="$d"; repo_url="$url"; break; }
+            fi
+        done
     fi
-    sudo apt-get update
-    info "Installing cuda-toolkit-13-0 (about 4 GB; sudo may ask for your password) ..."
-    if ! sudo apt-get install -y cuda-toolkit-13-0; then
-        err "apt install cuda-toolkit-13-0 failed."
+    if [[ -z "$pkg" ]]; then
+        err "No CUDA 13.x package is installable from any reachable NVIDIA repo (${pinned} expected in ${repo_dir})."
+        err "Install it manually: https://developer.nvidia.com/cuda-downloads (CUDA 13.x), then retry."
         return 1
     fi
 
-    # Prefer the NVIDIA 13.0 toolkit over any stale distro nvcc (e.g. the
+    info "Installing ${pkg} from ${repo_dir} (about 4 GB; sudo may ask for your password) ..."
+    if ! sudo apt-get install -y "$pkg"; then
+        err "apt install ${pkg} failed."
+        return 1
+    fi
+
+    # Prefer the NVIDIA 13.x toolkit over any stale distro nvcc (e.g. the
     # 12.x from Ubuntu's own nvidia-cuda-toolkit) by putting it first on PATH
     # for this session and for future shells.
     local c13
-    c13="$(ls -d /usr/local/cuda-13.0 /usr/local/cuda-13* 2>/dev/null | head -1 || true)"
+    # Newest 13.x (e.g. cuda-13.4 when both 13.0 and 13.4 are installed —
+    # 13-4 sorts after 13.0 in plain lexicographic order).
+    c13="$(ls -d /usr/local/cuda-13* 2>/dev/null | sort -V | tail -1 || true)"
     [[ -n "$c13" ]] || c13="$(readlink -f /usr/local/cuda 2>/dev/null || true)"
     if [[ -n "$c13" && -x "$c13/bin/nvcc" ]]; then
         export PATH="$c13/bin:$PATH"
@@ -311,7 +391,16 @@ cmd_update_cuda() {
     if [[ "$cur" =~ ^13\. ]]; then
         info "Refreshing CUDA 13.x packages (sudo may ask for your password) ..."
         sudo apt-get update
-        sudo apt-get install --only-upgrade -y cuda-toolkit-13-0 || true
+        # Refresh whichever 13.x package this box actually has installed
+        # (e.g. cuda-toolkit-13-3 on ubuntu2604, where 13-0 is not published).
+        local refresh_pkg
+        refresh_pkg="$(dpkg-query -W -f'${Package}\n' 'cuda-toolkit-13*' 2>/dev/null | grep -v '^cuda-toolkit-13$' | head -1 || true)"
+        [[ -n "$refresh_pkg" ]] || refresh_pkg="$(dpkg-query -W -f'${Package}\n' 'cuda-toolkit-13*' 2>/dev/null | head -1 || true)"
+        if [[ -n "$refresh_pkg" ]]; then
+            sudo apt-get install --only-upgrade -y "$refresh_pkg" || true
+        else
+            sudo apt-get install --only-upgrade -y cuda-toolkit-13-0 || true
+        fi
         ok "CUDA toolkit refreshed to $(cuda_toolkit_version)."
         return 0
     fi
