@@ -1083,7 +1083,14 @@ cmd_agent_sandbox() {
     fi
 
      if [[ "$is_local" == "true" && "$NATIVE_INFERENCE" != "true" ]]; then
-        export OPENMONO_ENDPOINT="http://llama-server:7474"
+        if [[ "$(_inference_backend)" == "strata" ]]; then
+            # Strata serves host-native — there is no llama-server container to
+            # reach. The agent container talks to it via the host gateway at the
+            # Strata port (root; the client appends /v1 itself).
+            export OPENMONO_ENDPOINT="http://host.docker.internal:$(_strata_port)"
+        else
+            export OPENMONO_ENDPOINT="http://llama-server:7474"
+        fi
     else
         export OPENMONO_ENDPOINT="$cfg_endpoint"
     fi

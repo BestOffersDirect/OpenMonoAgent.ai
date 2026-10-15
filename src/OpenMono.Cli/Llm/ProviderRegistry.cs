@@ -83,7 +83,8 @@ internal sealed class LocalLlamaProvider : IProvider
 /// </summary>
 internal sealed class StrataProvider : IProvider
 {
-    public const string DefaultEndpoint = "http://localhost:8080/v1";
+    // Root URL (no /v1): OpenAiCompatClient appends "/v1/chat/completions".
+    public const string DefaultEndpoint = "http://localhost:8080";
 
     public string Name => "strata";
     public string[] SupportedModels => ["Qwen3.8-Flash-Next"];

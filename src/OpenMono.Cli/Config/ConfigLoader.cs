@@ -58,9 +58,33 @@ public static class ConfigLoader
 
         ApplyActiveModelPreset(config);
 
+        // Endpoints are base URLs: every HTTP call site appends "/v1/..." itself
+        // (OpenAI/Anthropic clients, the model catalog, health/props checks). A
+        // trailing "/v1" — as written by the Strata install and
+        // ProviderRegistry — would otherwise double to "/v1/v1/...". Strip it
+        // here, the one point all config flows through.
+        config.Llm.Endpoint = NormalizeEndpoint(config.Llm.Endpoint);
+        foreach (var provider in config.Providers.Values)
+            provider.Endpoint = NormalizeEndpoint(provider.Endpoint);
+
         EnsureWritableDataDirectory(config, warn);
 
         return config;
+    }
+
+    /// <summary>
+    /// Reduce an inference endpoint to its base root by dropping a single
+    /// trailing "/v1" path segment, so callers can safely append "/v1/...".
+    /// A no-op for the legacy root endpoints (e.g. http://localhost:7474).
+    /// </summary>
+    private static string NormalizeEndpoint(string? endpoint)
+    {
+        if (string.IsNullOrWhiteSpace(endpoint))
+            return endpoint ?? "";
+        var trimmed = endpoint.TrimEnd('/');
+        if (trimmed.EndsWith("/v1", StringComparison.OrdinalIgnoreCase))
+            trimmed = trimmed[..^3].TrimEnd('/');
+        return trimmed;
     }
 
     private static readonly string[] DataSubdirectories = ["sessions", "memory", "artifacts"];
