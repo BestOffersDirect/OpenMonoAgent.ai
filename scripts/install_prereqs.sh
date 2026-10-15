@@ -420,20 +420,24 @@ else
             # Newest cuda-toolkit-13-N in the Packages index on stdin.
             # (The unversioned "cuda-toolkit-13" meta is excluded — apt would
             # pull the repo's default, which is fine but less explicit.)
+            #
+            # `|| true`: a repo with no 13.x at all makes the first grep
+            # exit 1, and under `set -euo pipefail` that would kill the
+            # whole script instead of yielding an empty result.
             grep -E '^Package: cuda-toolkit-13(-[0-9]+)?$' 2>/dev/null \
                 | awk '{print $2}' \
                 | grep -v '^cuda-toolkit-13$' \
                 | sort -V \
-                | tail -1
+                | tail -1 || true
         }
         # 1) Enumerate what the native repo dir actually offers (live).
-        _cuda_native_13="$(_cuda_pkgs "$_cuda_repo_dir" | _cuda_newest_13)"
+        _cuda_native_13="$(_cuda_pkgs "$_cuda_repo_dir" | _cuda_newest_13 || true)"
         if [ -z "$_cuda_native_13" ]; then
             # Either NVIDIA has not published a repo for this release yet, or
             # it exists but carries no versioned 13.x toolkit. Fall back to
             # the newest supported release dir that has one.
             for _try in 2404 2204 2004; do
-                _cuda_fb_13="$(_cuda_pkgs "ubuntu${_try}" | _cuda_newest_13)"
+                _cuda_fb_13="$(_cuda_pkgs "ubuntu${_try}" | _cuda_newest_13 || true)"
                 if [ -n "$_cuda_fb_13" ]; then
                     warn "Using the ubuntu${_try} CUDA repo — it offers ${_cuda_fb_13} (the ubuntu${_cuda_release} repo has no CUDA 13.x toolkit)"
                     _cuda_repo_dir="ubuntu${_try}"
