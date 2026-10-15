@@ -128,7 +128,24 @@ cmd_install() {
     info "Installing Strata model (this downloads ~70 GB on first run; resumable) ..."
     info "  setup args: ${setup_args[*]} ${extra[*]}"
     info "  Strata will prompt unless --yes was passed (non-interactive installs add it)."
-    (cd "$STRATA_DIR" && ./setup.sh "${setup_args[@]}" "${extra[@]}")
+    # Stream Strata's output live AND capture it in its own log file. A bare
+    # `./setup.sh` call would let its error output vanish into the terminal
+    # (interleaved with prompts) or the OpenMono log (stderr only) — neither
+    # is easy to find later. On failure we tail the capture so the real error
+    # is always on screen and in the OpenMono log.
+    local strata_out
+    mkdir -p "$OPENMONO_STATE_DIR"
+    strata_out="$OPENMONO_STATE_DIR/strata-setup.log"
+    (cd "$STRATA_DIR" && ./setup.sh "${setup_args[@]}" "${extra[@]}") 2>&1 | tee -a "$strata_out"
+    local setup_rc=${PIPESTATUS[0]}
+    if [ "$setup_rc" -ne 0 ]; then
+        echo ""
+        err "Strata ./setup.sh failed (exit $setup_rc) — last 30 lines:"
+        tail -n 30 "$strata_out" | sed 's/^/    /'
+        echo ""
+        err "Full Strata setup output: $strata_out"
+        exit "$setup_rc"
+    fi
     save_env
     ok "Strata installed. Start it with: openmono start   (or scripts/strata.sh start)"
     ok "Browse the model UI at: $(strata_base_url)  (after start)"

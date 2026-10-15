@@ -361,7 +361,7 @@ if [ "$INFERENCE_BACKEND" = "strata" ] && [ "$OPENMONO_ROLE" != "agent" ]; then
         info "Non-interactive shell — passing --yes (recommended size for this box)."
     fi
     if ! STRATA_YES="$([[ ! -t 0 ]] && echo 1 || echo 0)" bash "$SCRIPT_DIR/strata.sh" install "${_strata_flags[@]}"; then
-        die "Strata install failed — retry: bash scripts/strata.sh install (see docs/STRATA.md)"
+        die "Strata install failed — retry: bash scripts/strata.sh install (see docs/STRATA.md). Strata's own output: ~/.openmono/strata-setup.log"
     fi
     ok "Strata model ready (server starts in the final step)"
 fi
