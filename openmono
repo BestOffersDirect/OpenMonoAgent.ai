@@ -392,8 +392,8 @@ cmd_help() {
     echo "             llm.endpoint (local or relay)."
     echo ""
     echo "Inference box (inference backend lifecycle):"
-    printf "  %-14s %s\n" "start"   "Start inference backend in the background"
-    printf "  %-14s %s\n" "stop"    "Stop inference backend"
+    printf "  %-14s %s\n" "start"   "Start inference backend + gateway services in the background"
+    printf "  %-14s %s\n" "stop"    "Stop the stack (flags: --llama --gateway --search --scraper --agent-host --agent --all)"
     printf "  %-14s %s\n" "restart" "Restart inference backend"
     printf "  %-14s %s\n" "logs"    "Tail inference backend logs"
     printf "  %-14s %s\n" "status"  "Show container + GPU + model status"
@@ -479,9 +479,12 @@ cmd_setup() {
                 echo "  --verbose     Show detailed command output (default: step-level progress)"
                 echo ""
                 echo "Server sub-agent (opt-in add-on, full/agent only — never inference):"
-                echo "  Setup asks once (default No). For non-interactive installs:"
-                echo "    OPENMONO_HOST_BRIDGE=1 openmono setup --agent   # include it"
-                echo "    OPENMONO_HOST_BRIDGE=0 openmono setup --agent   # skip the prompt"
+                echo "  Setup asks once (default No, breaks container sandbox when installed)."
+                echo "  On Yes it asks again: ask-every-time (default) vs allow-routine."
+                echo "  For non-interactive installs:"
+                echo "    OPENMONO_HOST_BRIDGE=1 OPENMONO_HOST_EXEC_DEFAULT=ask openmono setup --agent     # confirm each host cmd"
+                echo "    OPENMONO_HOST_BRIDGE=1 OPENMONO_HOST_EXEC_DEFAULT=allow openmono setup --agent   # routine runs without asking"
+                echo "    OPENMONO_HOST_BRIDGE=0 openmono setup --agent   # skip the prompt (default)"
                 echo "  Add it later any time with: bash scripts/install-host-bridge.sh"
                 echo ""
                 echo "A full log is written to ~/.openmono/logs/setup-<timestamp>.log"
@@ -770,44 +773,206 @@ cmd_start() {
     _start_web_services || true
 }
 
-cmd_stop() {
-    if [[ "$NATIVE_INFERENCE" == "true" ]]; then
-        native_cmd_stop || return $?
-        if docker info &>/dev/null 2>&1; then
-            (cd "$DOCKER_DIR" && docker compose down 2>/dev/null || true)
-        fi
-        return 0
-    fi
-
-    # Strata backend: stop the host server, then any gateway containers.
+# Inventory for bare `openmono stop`: everything actually running relative
+# to OMA, so the operator confirms against reality instead of assumptions.
+_stop_inventory() {
+    echo ""
+    echo "Running OpenMono pieces:"
     if [[ "$(_inference_backend)" == "strata" ]]; then
-        bash "$REPO_DIR/scripts/strata.sh" stop || true
-        if docker info &>/dev/null 2>&1; then
-            (cd "$DOCKER_DIR" && _compose down 2>/dev/null || true)
-        fi
-        return 0
-    fi
-
-    _ensure_docker
-    cd "$DOCKER_DIR"
-    export LLAMA_PORT
-    if ! curl -sf "http://localhost:${LLAMA_PORT}/health" &>/dev/null; then
-        warn "llama-server is not responding on port ${LLAMA_PORT}"
-    fi
-
-    info "Stopping llama-server..."
-    if docker compose stop llama-server 2>/dev/null; then
-        ok "Stopped"
-    else
-        if docker compose kill llama-server 2>/dev/null; then
-            ok "Force-stopped"
+        if pgrep -f 'strata' &>/dev/null; then
+            echo "  - Strata inference server (host-native) — stop with: openmono stop"
         else
-            err "Failed to stop llama-server. Try: cd docker && docker compose kill llama-server"
-            return 1
+            echo "  - Strata inference server: not running"
+        fi
+    elif [[ "$NATIVE_INFERENCE" == "true" ]]; then
+        # Native port lives in settings (inference.port), not LLAMA_PORT.
+        local nport="$LLAMA_PORT"
+        if command -v jq &>/dev/null && [[ -f "$HOME/.openmono/settings.json" ]]; then
+            local cfg_port
+            cfg_port="$(jq -r '.inference.port // empty' "$HOME/.openmono/settings.json" 2>/dev/null || true)"
+            [[ "$cfg_port" =~ ^[0-9]+$ ]] && nport="$cfg_port"
+        fi
+        if curl -sf "http://localhost:${nport}/health" &>/dev/null; then
+            echo "  - llama-server (native, Metal) on port ${nport}"
+        else
+            echo "  - llama-server (native): not responding on port ${nport}"
+        fi
+    else
+        if curl -sf "http://localhost:${LLAMA_PORT}/health" &>/dev/null; then
+            echo "  - llama-server (docker) healthy on port ${LLAMA_PORT}"
+        else
+            echo "  - llama-server (docker): not responding"
+        fi
+    fi
+    if docker info &>/dev/null 2>&1; then
+        local running
+        running="$(cd "$DOCKER_DIR" && docker compose ps --format '{{.Service}} ({{.State}})' 2>/dev/null | grep -v '^$' || true)"
+        if [[ -n "$running" ]]; then
+            echo "$running" | while IFS= read -r line; do echo "  - $line"; done
+        else
+            echo "  - no compose services running"
+        fi
+        local extra
+        extra="$(docker ps -a --filter 'name=openmono-host-bridge' --filter 'name=openmono-agent' \
+            --format '{{.Names}} ({{.State}})' 2>/dev/null || true)"
+        if [[ -n "$extra" ]]; then
+            echo "$extra" | while IFS= read -r line; do echo "  - $line [agent container — kept unless --agent-host/--agent]"; done
+        fi
+        if pgrep -f 'host-bridge' &>/dev/null; then
+            echo "  - host-bridge process is LIVE (stop it with Ctrl-C / /quit first — stop never kills it)"
+        fi
+    else
+        echo "  - Docker daemon not accessible — container state unknown"
+    fi
+    echo ""
+}
+
+cmd_stop() {
+    # Selectors: default = full compose stack (llama + gateway + search +
+    # scraper). Run-created agent containers are NEVER touched by default —
+    # stopping those would kill someone's live `openmono agent` session in
+    # another terminal. Ask for them explicitly (--agent-host, --agent) or
+    # take everything with --all.
+    local sel_llama=false sel_gateway=false sel_search=false sel_scraper=false
+    local sel_bridge=false sel_agent=false sel_all=false rm_orphans=false
+    local a
+    for a in ${1+"$@"}; do
+        case "$a" in
+            --llama) sel_llama=true ;;
+            --gateway) sel_gateway=true ;;
+            --search) sel_search=true ;;
+            --scraper) sel_scraper=true ;;
+            --agent-host) sel_bridge=true ;;
+            --agent) sel_agent=true ;;
+            --all) sel_all=true ;;
+            --remove-orphans) rm_orphans=true ;;
+            -h|--help)
+                echo "Usage: openmono stop [--llama] [--gateway] [--search] [--scraper] [--agent-host] [--agent] [--all] [--remove-orphans]"
+                echo ""
+                echo "  (no flags)   Stop the full compose stack: llama-server + gateway/search/scraper."
+                echo "  --agent-host  Also remove the openmono-host-bridge container (agent --host)."
+                echo "                Stop the host-bridge process itself with Ctrl-C / /quit first."
+                echo "  --agent       Also remove live openmono-agent run containers (sandbox sessions)."
+                echo "  --all         Everything above + 'compose down --remove-orphans'."
+                return 0 ;;
+            *)
+                err "Unknown flag for stop: $a (see: openmono stop --help)"
+                return 1 ;;
+        esac
+    done
+    if [[ "$sel_all" == "true" ]]; then
+        sel_llama=true; sel_gateway=true; sel_search=true; sel_scraper=true
+        sel_bridge=true; sel_agent=true
+    elif [[ "$sel_llama" == "false" && "$sel_gateway" == "false" && \
+            "$sel_search" == "false" && "$sel_scraper" == "false" && \
+            "$sel_bridge" == "false" && "$sel_agent" == "false" ]]; then
+        sel_llama=true; sel_gateway=true; sel_search=true; sel_scraper=true
+    fi
+    local no_flags=true
+    [[ "$sel_bridge" == "true" || "$sel_agent" == "true" || "$sel_all" == "true" || \
+       "$sel_llama" == "false" || "$sel_gateway" == "false" || \
+       "$sel_search" == "false" || "$sel_scraper" == "false" ]] && no_flags=false
+    # Bare `openmono stop`: show everything actually running relative to OMA
+    # and require confirmation. Explicit flags proceed without asking.
+    if [[ "$no_flags" == "true" ]]; then
+        if [[ -t 0 ]]; then
+            _stop_inventory
+            local confirm=""
+            read -r -p "Stop all of the above? [y/N] " confirm || confirm=""
+            case "$confirm" in
+                [yY]|[yY]es) ;;
+                *)
+                    info "Aborted — nothing stopped. Target pieces explicitly, e.g.: openmono stop --llama"
+                    return 0 ;;
+            esac
+        else
+            info "Non-interactive — proceeding with the full compose stack (no agent containers)."
         fi
     fi
 
-    docker compose down 2>/dev/null || true
+    local rc=0
+
+    # Native inference (macOS): never early-return. A dead llama-server must
+    # not skip the compose cleanup below — that ordering bug used to leave
+    # gateway/search/scraper running forever after `openmono stop`.
+    local backend; backend="$(_inference_backend)"
+
+    if [[ "$NATIVE_INFERENCE" == "true" ]]; then
+        if [[ "$sel_llama" == "true" ]]; then
+            native_cmd_stop || { warn "native llama-server stop failed — continuing with containers."; rc=1; }
+        fi
+    elif [[ "$backend" == "strata" ]]; then
+        # Strata serves host-native (it is not a compose service): stop it via its
+        # manager. The gateway/agent containers are still torn down below.
+        if [[ "$sel_llama" == "true" ]]; then
+            bash "$REPO_DIR/scripts/strata.sh" stop || { warn "Strata stop failed — continuing with containers."; rc=1; }
+        fi
+    else
+        _ensure_docker
+        if [[ "$sel_llama" == "true" ]]; then
+            if ! curl -sf "http://localhost:${LLAMA_PORT}/health" &>/dev/null; then
+                warn "llama-server is not responding on port ${LLAMA_PORT}"
+            fi
+        fi
+    fi
+
+    if docker info &>/dev/null 2>&1; then
+        cd "$DOCKER_DIR"
+        export LLAMA_PORT
+        # Explicit service names bypass compose profile filtering, so every
+        # selected service is stopped regardless of which profiles started it.
+        local svcs=()
+        [[ "$sel_llama" == "true" && "$backend" != "strata" ]] && svcs+=(llama-server)
+        [[ "$sel_gateway" == "true" ]] && svcs+=(caddy)
+        [[ "$sel_search" == "true" ]] && svcs+=(searxng)
+        [[ "$sel_scraper" == "true" ]] && svcs+=(scrapling)
+        if [[ ${#svcs[@]} -gt 0 ]]; then
+            info "Stopping ${svcs[*]}..."
+            if docker compose stop "${svcs[@]}" 2>/dev/null; then
+                ok "Stopped: ${svcs[*]}"
+            else
+                warn "Some services did not stop cleanly — check: docker compose ps"
+                rc=1
+            fi
+        fi
+        # Run-created containers are invisible to `compose down` (they come
+        # from `compose run -d --name`, not `up`), so remove them by name.
+        # `rm -f` on a non-existent name is a silent no-op success.
+        if [[ "$sel_bridge" == "true" ]]; then
+            if docker rm -f openmono-host-bridge 2>/dev/null; then
+                ok "Removed openmono-host-bridge container"
+            else
+                info "No openmono-host-bridge container to remove"
+            fi
+        fi
+        if [[ "$sel_agent" == "true" ]]; then
+            if docker rm -f openmono-agent 2>/dev/null; then
+                ok "Removed openmono-agent container"
+            else
+                info "No openmono-agent container to remove"
+            fi
+        fi
+        # Full-stack selections finish with `down` (previous behaviour): this
+        # removes stopped containers + the project network. Subset selections
+        # only stop, so unrelated services keep running.
+        if [[ "$sel_llama" == "true" && "$sel_gateway" == "true" && \
+              "$sel_search" == "true" && "$sel_scraper" == "true" ]]; then
+            if [[ "$rm_orphans" == "true" || "$sel_all" == "true" ]]; then
+                docker compose down --remove-orphans 2>/dev/null || rc=1
+            else
+                docker compose down 2>/dev/null || rc=1
+            fi
+        fi
+        if [[ "$rc" == "0" ]]; then
+            ok "Stop complete — verify: docker compose ps"
+        else
+            warn "Stop finished with warnings — verify: docker compose ps"
+        fi
+    else
+        warn "Docker daemon is not accessible — native processes (if any) handled above; containers untouched."
+        rc=1
+    fi
+    return $rc
 }
 
 cmd_restart() {
@@ -1143,12 +1308,13 @@ cmd_agent_sandbox() {
     fi
 
 
-    # Docker socket: lets the agent run `docker` / `docker compose` against the
-    # host daemon (deploy + troubleshoot containerized backends on a server box).
-    # Mounted only when the socket exists — mirrors docker/openmono-wrapper.sh.
-    # Opt out with OPENMONO_NO_DOCKER_SOCK=1.
+    # Docker socket is opt-in only: the default sandbox must NOT get the host
+    # daemon. Set OPENMONO_DOCKER_SOCK=1 when the task actually needs docker
+    # against the host (deploy + troubleshoot containerized backends).
+    # OPENMONO_NO_DOCKER_SOCK=1 remains supported as an explicit veto (and as
+    # a harmless no-op for existing configs that set it).
     local docker_sock_args=()
-    if [[ "${OPENMONO_NO_DOCKER_SOCK:-0}" != "1" && -S /var/run/docker.sock ]]; then
+    if [[ "${OPENMONO_DOCKER_SOCK:-0}" == "1" && "${OPENMONO_NO_DOCKER_SOCK:-0}" != "1" && -S /var/run/docker.sock ]]; then
         docker_sock_args+=(-v /var/run/docker.sock:/var/run/docker.sock)
     fi
 
@@ -1437,35 +1603,126 @@ cmd_upgrade() {
     echo "  Run the agent: openmono agent"
 }
 
+# Build a jq path like .llm.api_key from dotted input "llm.api_key".
+_openmono_jq_path() {
+    local p="$1"
+    p="${p//\"/\\\"}"
+    # shellcheck disable=SC2001
+    echo ".$(echo "$p" | sed 's/\./.\"/g; s/$/\"/; s/^\.\"/./')"
+}
+
+# host.* config lives in the bridge's own file (~/.openmono/host-bridge.json),
+# NOT settings.json (which is owned by the typed AppConfig). Keys:
+#   host.exec_default  ask|allow|deny        -> .host_exec.default
+#   host.sudo_policy   ask|allow|deny        -> .allow_sudo
+#   host.run_as        username              -> .run_as
+#   host.allow_list    comma-separated       -> .host_exec.allow  (array)
+#   host.deny_list     comma-separated       -> .host_exec.deny   (array)
+#   host.timeout_ms    integer milliseconds  -> .timeout_ms
+_openmono_host_key_to_jq() {
+    case "$1" in
+        host.exec_default)  echo ".host_exec.default" ;;
+        host.sudo_policy)   echo ".allow_sudo" ;;
+        host.run_as)        echo ".run_as" ;;
+        host.allow_list)    echo ".host_exec.allow" ;;
+        host.deny_list)     echo ".host_exec.deny" ;;
+        host.timeout_ms)    echo ".timeout_ms" ;;
+        *) return 1 ;;
+    esac
+}
+
 cmd_config() {
     local settings="$HOME/.openmono/settings.json"
+    local bridgecfg="$HOME/.openmono/host-bridge.json"
 
     # Help works even without jq installed
     if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
         echo "Usage: openmono config <subcommand>"
         echo ""
         echo "  get <key>           Read a setting (dotted path, e.g. llm.endpoint)"
-        echo "  set <key> <value>   Write a setting"
+        echo "  set <key> <value>   Write a setting (type-aware: number/bool/array)"
         echo "  unset <key>         Remove a setting"
         echo "  list                Print the whole settings file (default)"
         echo ""
+        echo "Settings file: ~/.openmono/settings.json"
+        echo ""
+        echo "Host-bridge settings (openmono agent --host) live in"
+        echo "~/.openmono/host-bridge.json and use host.* keys:"
+        echo "  host.exec_default   ask | allow | deny   default policy for host commands"
+        echo "  host.sudo_policy    ask | allow | deny   escalation policy (ask = y/N per command)"
+        echo "  host.run_as         username             account host commands run as"
+        echo "  host.allow_list     a, b, c              allow-list patterns (comma-separated)"
+        echo "  host.deny_list      a, b, c              deny-list patterns (comma-separated)"
+        echo "  host.timeout_ms     number               per-command timeout in ms"
+        echo ""
         echo "Examples:"
         echo "  openmono config set llm.endpoint http://10.0.0.5:17474"
-        echo "  openmono config set llm.api_key mytoken123"
         echo "  openmono config get llm.endpoint"
-        echo "  openmono config unset llm.api_key"
-        echo ""
-        echo "Settings file: ~/.openmono/settings.json"
+        echo "  openmono config set host.sudo_policy allow"
+        echo "  openmono config set host.exec_default ask"
+        echo "  openmono config set host.timeout_ms 600000"
+        echo "  openmono config unset host.run_as"
         return 0
     fi
-
-    mkdir -p "$(dirname "$settings")"
-    [[ -f "$settings" ]] || echo '{}' > "$settings"
 
     if ! command -v jq &>/dev/null; then
         err "jq is required for 'openmono config'. Install it: sudo apt install jq"
         return 1
     fi
+
+    # Coerce a raw CLI value into a type-correct jq expression for the key.
+    # Strings stay strings; pure integers become JSON numbers; true/false
+    # become booleans; comma lists become JSON arrays.
+    _openmono_config_value() {
+        local key="$1" value="$2"
+        case "$key" in
+            *.allow_list|*.deny_list|host.allow_list|host.deny_list)
+            # Split on commas without bash-4 arrays (macOS ships bash 3.2).
+            local out="" item
+            local IFS=','
+            for item in $value; do
+                item="$(echo "$item" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+                [[ -z "$item" ]] && continue
+                item="${item//\"/\\\"}"
+                out="${out:+$out, }\"$item\""
+            done
+            printf '[%s]' "$out"
+            return 0
+            ;;
+            host.timeout_ms)
+                if [[ "$value" =~ ^[0-9]+$ ]]; then
+                    printf '%s' "$value"
+                    return 0
+                fi
+                err "host.timeout_ms must be a whole number of milliseconds (got: $value)"
+                return 1
+                ;;
+            host.exec_default|host.sudo_policy)
+                # Portable lowercasing (no ${var,,} — macOS ships bash 3.2).
+                local lowered
+                lowered="$(echo "$value" | tr '[:upper:]' '[:lower:]')"
+                case "$lowered" in
+                    ask|allow|deny) printf '"%s"' "$lowered"; return 0 ;;
+                esac
+                err "$key must be one of: ask, allow, deny (got: $value)"
+                return 1
+                ;;
+            host.run_as)
+                if ! [[ "$value" =~ ^[a-z_][a-z0-9_-]*[$]?$ ]]; then
+                    err "host.run_as must match ^[a-z_][a-z0-9_-]*[$]?\$ (got: $value)"
+                    return 1
+                fi
+                ;;
+        esac
+        if [[ "$value" =~ ^-?[0-9]+$ ]]; then
+            printf '%s' "$value"
+        elif [[ "$value" == "true" || "$value" == "false" ]]; then
+            printf '%s' "$value"
+        else
+            value="${value//\"/\\\"}"
+            printf '"%s"' "$value"
+        fi
+    }
 
     case "${1:-}" in
         get)
@@ -1473,7 +1730,14 @@ cmd_config() {
                 err "Usage: openmono config get <key>"
                 return 1
             fi
-            jq -r ".$2 // empty" "$settings"
+            local key="$2" target file
+            if target="$(_openmono_host_key_to_jq "$key")"; then
+                file="$bridgecfg"
+            else
+                file="$settings"
+            fi
+            [[ -f "$file" ]] || { echo "(missing: $file — run 'openmono agent --host' or 'openmono config set $key <value>')"; return 1; }
+            jq -r "$target // empty" "$file"
             ;;
         set)
             if [[ -z "${2:-}" || -z "${3:-}" ]]; then
@@ -1481,13 +1745,46 @@ cmd_config() {
                 return 1
             fi
             local path="$2" value="$3"
-            # Build a jq path like .llm.api_key from dotted input "llm.api_key"
-            # shellcheck disable=SC2001
+            local target file
+            if target="$(_openmono_host_key_to_jq "$path")"; then
+                file="$bridgecfg"
+            else
+                file="$settings"
+            fi
             local jq_path
-            jq_path=".$(echo "$path" | sed 's/\./.\"/g; s/$/\"/; s/^\.\"/./')"
-            jq "$jq_path = \"$value\"" "$settings" > "$settings.tmp"
-            mv "$settings.tmp" "$settings"
-            chmod 0600 "$settings"
+            # Host keys use the mapped path (.allow_sudo, .host_exec.allow, …);
+            # settings keys use the dotted path (.llm.api_key, …).
+            if [[ -n "$target" ]]; then
+                jq_path="$target"
+            else
+                jq_path="$(_openmono_jq_path "$path")"
+            fi
+            local jq_value
+            if ! jq_value="$(_openmono_config_value "$path" "$value")"; then
+                return 1
+            fi
+            mkdir -p "$(dirname "$file")"
+            if [[ "$file" == "$bridgecfg" && ! -f "$file" ]]; then
+                # Create the bridge config from its own defaults if missing:
+                # the sample carries the ask-by-default policy and tool allow-list.
+                local hb_bin
+                if ! hb_bin="$(cmd_agent_host_bin 2>/dev/null)" || [[ ! -x "$hb_bin" ]]; then
+                    err "host-bridge binary not found — install it first (bash scripts/install-host-bridge.sh)"
+                    return 1
+                fi
+                if ! "$hb_bin" --init --non-interactive >/dev/null 2>&1; then
+                    err "could not create $file with 'host-bridge --init --non-interactive'"
+                    return 1
+                fi
+            fi
+            [[ -f "$file" ]] || { echo '{}' > "$file"; }
+            if ! jq "$jq_path = $jq_value" "$file" > "$file.tmp"; then
+                rm -f "$file.tmp"
+                err "failed to set $path (invalid value?)"
+                return 1
+            fi
+            mv "$file.tmp" "$file"
+            chmod 0600 "$file"
             ok "$path = $value"
             ;;
         unset)
@@ -1496,14 +1793,26 @@ cmd_config() {
                 return 1
             fi
             local upath="$2"
-            local ujq
-            ujq=".$(echo "$upath" | sed 's/\./.\"/g; s/$/\"/; s/^\.\"/./')"
-            jq "del($ujq)" "$settings" > "$settings.tmp"
-            mv "$settings.tmp" "$settings"
-            chmod 0600 "$settings"
+            local ufile
+            if _openmono_host_key_to_jq "$upath" >/dev/null; then
+                ufile="$bridgecfg"
+            else
+                ufile="$settings"
+            fi
+            [[ -f "$ufile" ]] || { err "$ufile not found — nothing to unset"; return 1; }
+            local ujq target
+            if target="$(_openmono_host_key_to_jq "$upath")"; then
+                ujq="$target"
+            else
+                ujq="$(_openmono_jq_path "$upath")"
+            fi
+            jq "del($ujq)" "$ufile" > "$ufile.tmp"
+            mv "$ufile.tmp" "$ufile"
+            chmod 0600 "$ufile"
             ok "unset $upath"
             ;;
         list|"")
+            [[ -f "$settings" ]] || echo '{}' > "$settings"
             jq . "$settings"
             ;;
         *)
@@ -1737,9 +2046,9 @@ fi
 
 case "$COMMAND" in
     setup)          cmd_setup "$@";;
-    start)          cmd_start ;;
-    stop)           cmd_stop ;;
-    restart)        cmd_restart ;;
+    start)          cmd_start "$@" ;;
+    stop)           cmd_stop "$@" ;;
+    restart)        cmd_restart "$@" ;;
     agent)          cmd_agent "${AGENT_FORWARD[@]+"${AGENT_FORWARD[@]}"}" "$@" ;;
     logs)           cmd_logs ;;
     status)         cmd_status ;;

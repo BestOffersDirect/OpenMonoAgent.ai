@@ -5,11 +5,21 @@
 # Publishes src/OpenMono.HostBridge (Release) to $HOME/.openmono/bin/host-bridge
 # and writes a sample ~/.openmono/host-bridge.json when none exists.
 #
+# The bridge is ON-DEMAND: installing it never starts or runs it. This script
+# only publishes the binary and writes the sample config. The run-as identity
+# and sudo policy are chosen at install time by scripts/install.sh (which
+# prompts and exports OPENMONO_HOST_SUDO); the run-as user is confirmed on the
+# first real `openmono agent --host` run if it was left blank. Everything
+# below is therefore strictly non-interactive — a prompt here would look like
+# a hang when this script is run from `openmono setup`, which redirects stderr
+# to the install log.
+#
 # .NET 10 is required. When it is missing, this script reuses the EXISTING
-# prerequisite path (scripts/install_prereqs.sh — the same installer that
-# provides .NET 10 for the main agent) instead of inventing a second one.
-# That path also ensures Docker, git, curl, and jq, which the server role
-# needs for its in-container agent.
+# prerequisite path (scripts/install_prereqs.sh on Linux, or
+# scripts/install_prereqs_macos.sh with OPENMONO_ROLE=agent on macOS — the
+# same installers that provide .NET 10 for the main agent) instead of
+# inventing a second one. That path also ensures Docker, git, curl, and jq,
+# which the server role needs for its in-container agent.
 # ──────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -27,8 +37,16 @@ dotnet10_present() {
 
 if ! dotnet10_present; then
     echo "[host-bridge] .NET 10 SDK not found — running the existing prerequisites installer..."
-    bash "$SCRIPT_DIR/install_prereqs.sh" \
-        || { echo "ERROR: prerequisites installer failed." >&2; exit 1; }
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        # macOS: the Ubuntu/apt prereqs path cannot run here. The macOS
+        # prereqs installer covers the server role with OPENMONO_ROLE=agent
+        # (Homebrew, Xcode CLT, core tools, Docker, .NET — no llama.cpp).
+        OPENMONO_ROLE="${OPENMONO_ROLE:-agent}" bash "$SCRIPT_DIR/install_prereqs_macos.sh" \
+            || { echo "ERROR: prerequisites installer failed." >&2; exit 1; }
+    else
+        bash "$SCRIPT_DIR/install_prereqs.sh" \
+            || { echo "ERROR: prerequisites installer failed." >&2; exit 1; }
+    fi
     # prereqs installs the SDK under ~/.dotnet and updates rc files, neither of
     # which affects this shell — pick it up explicitly.
     if [[ -x "$HOME/.dotnet/dotnet" ]]; then
@@ -60,24 +78,69 @@ fi
 
 "$BIN_DIR/host-bridge" --version
 
-# Sudo opt-in (never silent): configure run-as identity + sudo choice now when
-# interactive; otherwise leave allow_sudo unasked so the bridge asks once on
-# first run. OPENMONO_HOST_SUDO=1/0 presets it for non-interactive installs.
+# Sudo policy preset (never interactive at install time): OPENMONO_HOST_SUDO
+# writes allow_sudo into the config; install.sh prompts for it and exports this
+# (1/yes→--allow-sudo, 0/no→--no-sudo). When unset the config keeps its default
+# ("ask") and the bridge confirms the run-as user on the first real
+# `openmono agent --host` run.
+# Host-exec policy (never silent): OPENMONO_HOST_EXEC_DEFAULT=allow|ask selects
+# the default. Anything but an explicit "allow" stays "ask" (fail closed).
+# install.sh prompts for this; direct script runs default to ask.
+# Re-runs preserve an existing config: host_exec.default (and everything else)
+# is only written for a fresh config, unless the user explicitly set
+# OPENMONO_HOST_EXEC_DEFAULT to change it.
+_HOST_BRIDGE_CONFIG="${OPENMONO_HOST_BRIDGE_CONFIG:-$HOME/.openmono/host-bridge.json}"
+_HOST_BRIDGE_PREEXISTED=0
+[[ -f "$_HOST_BRIDGE_CONFIG" ]] && _HOST_BRIDGE_PREEXISTED=1
 case "${OPENMONO_HOST_SUDO:-}" in
     1|[Yy]|[Yy]es)
-        "$BIN_DIR/host-bridge" --init --allow-sudo --non-interactive
+        # Always --non-interactive: --init must never prompt here.
+        "$BIN_DIR/host-bridge" --init --allow-sudo --non-interactive 2>&1
         ;;
     0|[Nn]|[Nn]o)
-        "$BIN_DIR/host-bridge" --init --no-sudo --non-interactive
+        "$BIN_DIR/host-bridge" --init --no-sudo --non-interactive 2>&1
         ;;
     *)
-        if [[ -t 0 ]]; then
-            "$BIN_DIR/host-bridge" --init \
-                || echo "[host-bridge] identity setup skipped — first run will ask." >&2
-        else
-            echo "[host-bridge] non-interactive: leaving sudo unasked (first run will ask)."
-        fi
+        # Ensure the config exists even on the default path: a flag-less
+        # --non-interactive --init only writes the sample when missing and
+        # preserves every existing value — so the host-exec default block
+        # below always has a file to update (a fresh exec=allow answer would
+        # otherwise be silently dropped).
+        "$BIN_DIR/host-bridge" --init --non-interactive 2>&1
+        echo "[host-bridge] sudo policy left as default (ask) — each escalation is confirmed [y/N] at run time."
         ;;
 esac
 
-echo "[host-bridge] OK — run it with: openmono agent --host"
+echo "[host-bridge] OK — run it with: openmono agent --host (first run confirms the run-as user if left blank; change later with: openmono config host.run_as / host.sudo_policy)"
+
+# Apply the host-exec default. Fresh configs get a default (ask unless
+# OPENMONO_HOST_EXEC_DEFAULT=allow). Existing configs are preserved as-is
+# unless the user explicitly set OPENMONO_HOST_EXEC_DEFAULT to change them.
+_HOST_EXEC_DEFAULT="ask"
+_HOST_EXEC_EXPLICIT=0
+case "${OPENMONO_HOST_EXEC_DEFAULT:-}" in
+    [Aa]llow) _HOST_EXEC_DEFAULT="allow"; _HOST_EXEC_EXPLICIT=1 ;;
+    [Aa]sk) _HOST_EXEC_DEFAULT="ask"; _HOST_EXEC_EXPLICIT=1 ;;
+esac
+if [[ "$_HOST_BRIDGE_PREEXISTED" == "1" && "$_HOST_EXEC_EXPLICIT" != "1" ]]; then
+    echo "[host-bridge] preserving existing config $_HOST_BRIDGE_CONFIG (set OPENMONO_HOST_EXEC_DEFAULT=allow|ask to change host_exec.default)."
+elif [[ -f "$_HOST_BRIDGE_CONFIG" ]] && command -v python3 &>/dev/null; then
+    _HOST_EXEC_DEFAULT="$_HOST_EXEC_DEFAULT" _HOST_BRIDGE_CONFIG="$_HOST_BRIDGE_CONFIG" python3 - <<'PYEOF' || echo "[host-bridge] WARNING: could not set host_exec.default; edit $_HOST_BRIDGE_CONFIG manually." >&2
+import json, os
+cfg_path = os.environ["_HOST_BRIDGE_CONFIG"]
+want = os.environ["_HOST_EXEC_DEFAULT"]
+try:
+    with open(cfg_path) as f:
+        cfg = json.load(f)
+    cfg.setdefault("host_exec", {})["default"] = want
+    with open(cfg_path, "w") as f:
+        json.dump(cfg, f, indent=2)
+        f.write("\n")
+    print(f"[host-bridge] host-exec default: {want} ({cfg_path})")
+except Exception as ex:
+    print(f"[host-bridge] WARNING: {ex}")
+    raise SystemExit(1)
+PYEOF
+else
+    echo "[host-bridge] host-exec default: $_HOST_EXEC_DEFAULT (ask = confirm each command; allow = run routine without asking)"
+fi

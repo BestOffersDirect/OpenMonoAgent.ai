@@ -4,6 +4,23 @@ using System.Security.Cryptography;
 namespace OpenMono.HostBridge;
 
 /// <summary>
+/// Privilege-escalation policy for the bridge (config key: allow_sudo).
+/// Mirrors host_exec.default.
+/// </summary>
+public enum SudoPolicy
+{
+    /// <summary>Every elevation asks the operator per command (y/N). A "yes"
+    /// is in-memory only for that command — the config stays ask until the
+    /// operator explicitly changes it. Non-interactive runs fail closed (deny).</summary>
+    Ask,
+    /// <summary>Elevations run without prompting (password still prompted
+    /// once in memory when needed).</summary>
+    Allow,
+    /// <summary>Hard refusal of every elevation.</summary>
+    Deny,
+}
+
+/// <summary>
 /// Who bare-metal commands run as. The username is ordinary config; the
 /// password (when elevation needs one) lives ONLY in this object, in memory,
 /// zeroed on dispose. It is never serialized, never logged, and never passed
@@ -15,17 +32,31 @@ public sealed class HostIdentity : IDisposable
     private bool _disposed;
 
     public string RunAsUser { get; }
-    public bool AllowSudo { get; }
+    public SudoPolicy Sudo { get; }
     public bool HasPassword => _password is { Length: > 0 };
 
-    public HostIdentity(string runAsUser, bool allowSudo, char[]? password)
+    public HostIdentity(string runAsUser, SudoPolicy sudo, char[]? password)
     {
         RunAsUser = string.IsNullOrWhiteSpace(runAsUser) ? Environment.UserName : runAsUser;
-        AllowSudo = allowSudo;
+        Sudo = sudo;
         _password = password;
     }
 
     public static string CurrentUser => Environment.UserName;
+
+    // Linux accounts are lowercase by convention, but macOS short names may
+    // contain capitals — accept both. Still rejects shell metacharacters,
+    // whitespace, and paths so the value can never escape `sudo -u`.
+    private static readonly System.Text.RegularExpressions.Regex ValidUsername =
+        new(@"^[A-Za-z_][A-Za-z0-9_-]*[$]?$", System.Text.RegularExpressions.RegexOptions.Compiled);
+
+    /// <summary>
+    /// Validates a run-as username before it is interpolated into
+    /// <c>sudo -u</c>. Rejects shell metacharacters and paths so a hostile or
+    /// mistyped config value can never escape the username position.
+    /// </summary>
+    public static bool IsValidUsername(string? username) =>
+        !string.IsNullOrWhiteSpace(username) && ValidUsername.IsMatch(username);
 
     /// <summary>
     /// Reads a password from a file without ever echoing it. The file must be
@@ -109,6 +140,16 @@ public sealed class HostIdentity : IDisposable
     {
         ClearPassword();
         _password = password;
+    }
+
+    /// <summary>
+    /// Zeroes and drops the in-memory sudo password (e.g. after an
+    /// authentication failure) so the next elevation re-prompts instead of
+    /// reusing a known-bad secret.
+    /// </summary>
+    public void ForgetPassword()
+    {
+        ClearPassword();
     }
 
     private void ClearPassword()

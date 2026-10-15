@@ -32,6 +32,7 @@ public interface IBridgeUi
     void PlaybookDecision(string name, bool allow);
     void ModeNotice(string mode);
     Task<bool> ConfirmAsync(string question, CancellationToken ct);
+    Task<(bool Allow, string Scope)> PermissionAsync(string tool, string summary, CancellationToken ct);
     Task<string> InputAsync(string question, CancellationToken ct);
     Task<bool> PlaybookAsync(string name, IReadOnlyList<PlaybookStep> steps, IReadOnlyList<PlaybookTool> tools, bool requiresModeSwitch, CancellationToken ct);
     Task<char[]> PasswordAsync(string prompt, CancellationToken ct);
@@ -89,20 +90,50 @@ public sealed class LineUi : IBridgeUi
     {
         if (_nonInteractive)
         {
-            _err.WriteLine($"[bridge] --non-interactive: answering No: {question}");
+            _err.WriteLine($"[bridge] --non-interactive: answering No (fail closed): {question}");
             return Task.FromResult(false);
         }
-        _err.Write($"{question} [y/N] ");
+        // Always render the [y/N] affordance — but only once: callers may
+        // already include one in the question text.
+        var shown = question.Contains("[y/N]") || question.Contains("[Y/N]")
+            ? question
+            : question + " [y/N]";
+        _err.Write($"{shown} ");
         var answer = Console.ReadLine();
         return Task.FromResult(answer is not null &&
             (answer.Trim().Equals("y", StringComparison.OrdinalIgnoreCase) ||
              answer.Trim().Equals("yes", StringComparison.OrdinalIgnoreCase)));
     }
 
+    /// <summary>
+    /// Line-mode twin of the regular agent's permission menu
+    /// (<c>TerminalRenderer.AskPermissionAsync</c>): Allow / Allow all /
+    /// Deny / Deny all. Anything unrecognized fails closed to Deny.
+    /// </summary>
+    public Task<(bool Allow, string Scope)> PermissionAsync(string tool, string summary, CancellationToken ct)
+    {
+        if (_nonInteractive)
+        {
+            _err.WriteLine($"[bridge] --non-interactive: denying {tool} (fail closed): {summary}");
+            return Task.FromResult((false, "once"));
+        }
+        _err.WriteLine($"\n[permission] {tool}");
+        _err.WriteLine(summary);
+        _err.Write("[y] Allow  [a] Allow all  [n] Deny  [!] Deny all  Permission? [y/n/a/!] ");
+        var answer = (Console.ReadLine() ?? "").Trim().ToLowerInvariant();
+        return Task.FromResult(answer switch
+        {
+            "y" or "yes" or "allow" => (true, "once"),
+            "a" or "all" or "allow all" => (true, "session"),
+            "!" or "deny all" => (false, "session"),
+            _ => (false, "once"),
+        });
+    }
+
     public Task<string> InputAsync(string question, CancellationToken ct)
     {
         _err.WriteLine($"\n[agent asks] {question}");
-        _err.Write("> ");
+        _err.Write("Your answer (type it and press Enter; Enter alone = empty): ");
         return Task.FromResult(Console.ReadLine() ?? "");
     }
 

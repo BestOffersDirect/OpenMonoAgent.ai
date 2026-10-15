@@ -41,12 +41,29 @@ public sealed class BridgeConfig
     public string RunAs { get; set; } = "";
 
     /// <summary>
-    /// Whether host commands may escalate with sudo. Null = never asked:
-    /// the bridge prompts once on first run (or <c>--init</c>) and persists
-    /// the answer. False = sudo is never used, period.
+    /// Privilege-escalation policy for host commands. One of
+    /// "ask" (default: confirm each elevation with y/N — a yes is in-memory
+    /// only for that command), "allow" (elevate without prompting), or
+    /// "deny" (never escalate). Legacy JSON values are mapped on load:
+    /// missing/null → ask, true → allow, false → deny.
     /// </summary>
     [JsonPropertyName("allow_sudo")]
-    public bool? AllowSudo { get; set; }
+    public string? AllowSudo { get; set; } = "ask";
+
+    /// <summary>
+    /// <see cref="AllowSudo"/> as an enum, with legacy bool/null back-compat.
+    /// </summary>
+    [JsonIgnore]
+    public SudoPolicy SudoPolicy
+    {
+        get => AllowSudo?.Trim() switch
+        {
+            null or "" => SudoPolicy.Ask,
+            var s when s.Equals("allow", StringComparison.OrdinalIgnoreCase) => SudoPolicy.Allow,
+            var s when s.Equals("deny", StringComparison.OrdinalIgnoreCase) => SudoPolicy.Deny,
+            _ => SudoPolicy.Ask,
+        };
+    }
 
     public static string DefaultPath =>
         Path.Combine(
@@ -62,8 +79,37 @@ public sealed class BridgeConfig
         try
         {
             var json = File.ReadAllText(resolved);
-            return JsonSerializer.Deserialize<BridgeConfig>(json, WebOptions())
+            // Legacy configs hold allow_sudo as a JSON boolean (or omit it).
+            // Pull the raw token out BEFORE deserializing: a bool token in a
+            // string property throws, and we must survive it to normalize.
+            string? rawAllowSudo = null;
+            var boolToken = false;
+            using (var doc = JsonDocument.Parse(json))
+            {
+                if (doc.RootElement.TryGetProperty("allow_sudo", out var v))
+                {
+                    rawAllowSudo = v.ValueKind switch
+                    {
+                        JsonValueKind.True => "allow",
+                        JsonValueKind.False => "deny",
+                        JsonValueKind.String => v.GetString(),
+                        _ => null,
+                    };
+                    boolToken = v.ValueKind is JsonValueKind.True or JsonValueKind.False;
+                }
+            }
+            // Neutralize a legacy bool token so the typed deserializer accepts it
+            // (whitespace-tolerant: the file may be pretty-printed).
+            if (boolToken)
+                json = System.Text.RegularExpressions.Regex.Replace(
+                    json, "\"allow_sudo\"\\s*:\\s*(true|false)",
+                    "\"allow_sudo\":\"ask\"",
+                    System.Text.RegularExpressions.RegexOptions.Singleline);
+            var cfg = JsonSerializer.Deserialize<BridgeConfig>(json, WebOptions())
                 ?? new BridgeConfig();
+            if (!string.IsNullOrWhiteSpace(rawAllowSudo))
+                cfg.AllowSudo = rawAllowSudo;
+            return cfg;
         }
         catch (Exception ex) when (ex is JsonException or IOException or UnauthorizedAccessException)
         {
@@ -83,8 +129,10 @@ public sealed class BridgeConfig
             Directory.CreateDirectory(Path.GetDirectoryName(resolved)!);
             var sample = new BridgeConfig
             {
-                // allow_sudo intentionally left unset (null): the bridge asks
-                // once on first run / --init and persists the answer.
+                // allow_sudo = "ask": every elevation confirms with y/N; a
+                // yes is in-memory only for that command (config stays "ask"
+                // until the operator runs openmono config host.sudo_policy).
+                AllowSudo = "ask",
                 RunAs = "",
                 Tools = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
                 {
@@ -95,14 +143,19 @@ public sealed class BridgeConfig
                 },
                 HostExec = new HostExecPolicy
                 {
-                    // allow-by-default: this sub-agent exists to manage the
-                    // server, so routine host commands run without a y/N each
-                    // time. The deny list still blocks destructive patterns,
-                    // sudo still needs its own opt-in, and every command is
-                    // audited. Set Default back to "ask" to confirm each one.
-                    Allow = [.. HostExecPolicy.SampleAllow],
+                    // ask-by-default: every host command confirms with y/N
+                    // unless the operator explicitly chose "allow routine"
+                    // at install (OPENMONO_HOST_EXEC_DEFAULT=allow). The deny
+                    // list still blocks destructive patterns, sudo still needs
+                    // its own opt-in, and every command is audited. Install
+                    // flips this to "allow" only on explicit opt-in — never
+                    // silently. macOS samples ship read-only launchd/log
+                    // patterns instead of the Linux systemctl/journalctl ones.
+                    Allow = [.. (OperatingSystem.IsMacOS()
+                        ? HostExecPolicy.SampleAllowMacOS
+                        : HostExecPolicy.SampleAllow)],
                     Deny = [.. HostExecPolicy.SampleDeny],
-                    Default = "allow",
+                    Default = "ask",
                 },
             };
             File.WriteAllText(resolved,
@@ -128,23 +181,15 @@ public sealed class BridgeConfig
     }
 
     /// <summary>
-    /// One-time upgrade: configs that still carry the OLD shipped sample
-    /// (default ask, untouched) move to the allow default — the sub-agent
-    /// manages the server, so routine host commands must not ask y/N each
-    /// time. Deny list, sudo rules, and auditing are untouched, and any
-    /// operator-customized policy is never migrated. Returns true when it
-    /// changed and saved the file.
+    /// Legacy upgrade hook — now a no-op. We used to move untouched stock
+    /// "ask" samples to "allow"; that silent escalation is retired. "Always"
+    /// now requires explicit opt-in at install
+    /// (OPENMONO_HOST_EXEC_DEFAULT=allow). Existing configs are never
+    /// changed here. Returns false always (kept for call-site compat).
     /// </summary>
     public static bool MigrateStockAskToAllow(string? path, BridgeConfig config, TextWriter log)
     {
-        if (!config.HostExec.IsUncustomizedAskSample())
-            return false;
-        config.HostExec.Default = "allow";
-        Save(path, config);
-        log.WriteLine("[bridge] host-exec policy: untouched stock sample (default ask) → allow. " +
-            "Deny list + sudo rules unchanged; every command still audited. " +
-            "Set host_exec.default back to \"ask\" to confirm each command.");
-        return true;
+        return false;
     }
 
     /// <summary>
@@ -188,7 +233,15 @@ public sealed class HostExecPolicy
 {
     /// <summary>Allow patterns shipped in the sample config.</summary>
     public static readonly IReadOnlyList<string> SampleAllow =
-        ["git *", "docker *", "systemctl status *", "journalctl *", "curl *"];
+        ["git *", "systemctl status *", "journalctl *"];
+
+    /// <summary>
+    /// macOS sample-config twin: read-only launchd/log patterns instead of
+    /// the Linux systemctl/journalctl ones. Ask-by-default still prompts for
+    /// each; this list only matters under an explicit allow default.
+    /// </summary>
+    public static readonly IReadOnlyList<string> SampleAllowMacOS =
+        ["git *", "launchctl list *", "log show *"];
 
     /// <summary>Deny patterns shipped in the sample config.</summary>
     public static readonly IReadOnlyList<string> SampleDeny =
@@ -204,12 +257,13 @@ public sealed class HostExecPolicy
     public string Default { get; set; } = "ask";
 
     /// <summary>
-    /// True when this policy is byte-for-byte the OLD shipped sample (default
+    /// True when this policy is byte-for-byte a shipped sample (default
     /// ask): the operator never customized it, so upgrades may move it to the
-    /// new allow default. Anything customized is left strictly alone.
+    /// new allow default. Anything customized is left strictly alone. Accepts
+    /// the macOS sample twin as well as the Linux one.
     /// </summary>
     public bool IsUncustomizedAskSample() =>
         Default.Trim().Equals("ask", StringComparison.OrdinalIgnoreCase) &&
-        Allow.SequenceEqual(SampleAllow) &&
+        (Allow.SequenceEqual(SampleAllow) || Allow.SequenceEqual(SampleAllowMacOS)) &&
         Deny.SequenceEqual(SampleDeny);
 }

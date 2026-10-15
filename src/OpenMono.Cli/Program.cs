@@ -374,6 +374,7 @@ static async Task RunAgentAsync(string? endpoint, string? model, string? workdir
     commands.Register(new CheckpointCommand(checkpointer));
     commands.Register(new ThinkCommand());
     commands.Register(new ModeCommand());
+    commands.Register(new HostCommand());
     commands.Register(new PromptCommand());
     commands.Register(new ModelCommand());
     commands.Register(new BtwCommand());

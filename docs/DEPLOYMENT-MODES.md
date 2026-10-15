@@ -1,4 +1,4 @@
-# Deployment modes — single-box vs split-box
+# Deployment modes - single-box vs split-box
 
 This page makes the two supported deployment shapes explicit: **where
 inference lives** vs **where the agent and its tools live**, how to install
@@ -24,9 +24,9 @@ Wherever an agent runs below, it runs in one of two modes. Inference
 | | `--sandbox` (default) | `--host` (server sub-agent) |
 |---|---|---|
 | What runs | Agent in a Docker container, project bind-mounted as `/workspace` | .NET bare-metal sub-agent (`src/OpenMono.HostBridge`) that drives this box's in-container agent over ACP and executes host commands itself |
-| Model loop | In the container | In the container (unchanged) — the bridge never runs inference |
-| Inference | `llm.endpoint` — local (`localhost:7474`) or relay | `llm.endpoint` — local or relay (remote, like agent-only) |
-| VS Code / Cursor extension (`--acp-only`) | **Yes — sandbox only, by design** | No — rejected with an error directing you to sandbox mode |
+| Model loop | In the container | In the container (unchanged) - the bridge never runs inference |
+| Inference | `llm.endpoint` - local (`localhost:7474`) or relay | `llm.endpoint` - local or relay (remote, like agent-only) |
+| VS Code / Cursor extension (`--acp-only`) | **Yes - sandbox only, by design** | No - rejected with an error directing you to sandbox mode |
 | Best for | Contained coding work; the only mode the editor extension drives | Operating the machine itself: pull, build, install, redeploy, troubleshoot |
 
 ```bash
@@ -37,7 +37,7 @@ OPENMONO_AGENT_MODE=host openmono agent   # same thing via env
 
 ### How the bridge talks ACP (no protocol changes)
 
-The bridge is an ACP **client** against the stock container API — the same
+The bridge is an ACP **client** against the stock container API - the same
 endpoints the VS Code extension and `scripts/acp-smoke.sh` use:
 
 - `GET /api/v1/discovery` (wait until ready), `POST /api/v1/sessions`,
@@ -56,11 +56,11 @@ Project layout (`src/OpenMono.HostBridge/`, .NET 10, references the CLI project 
 
 | File | Responsibility |
 |---|---|
-| `Program.cs` / `BridgeOptions.cs` | CLI (`--task`, `--session`, `--acp`, `--port`, `--keep`, `--non-interactive`, `--tui`, `--classic`, `--plan`, …), TUI/line loops, discovery wait, mode ensure |
+| `Program.cs` / `BridgeOptions.cs` | CLI (`--task`, `--session`, `--acp`, `--port`, `--keep`, `--init`, `--run-as`, `--allow-sudo`, `--no-sudo`, `--non-interactive`, `--tui`, `--classic`, `--plan`, …), TUI/line loops, discovery wait, mode ensure |
 | `AcpClient.cs` | HTTP + SSE client for the stock ACP API (+ `{"mode":…}` ensure) |
-| `AgentContainer.cs` | Spawns the unmodified `agent` service detached (`--acp-only`, loopback port publish, git passthrough, endpoint mapping), stops what it started |
+| `AgentContainer.cs` | Spawns the unmodified `agent` service detached (`--acp-only`, loopback port publish, git passthrough, endpoint mapping: Linux `llama-server:7474` / `caddy:8080`, macOS `host.docker.internal` for native Metal inference), stops what it started |
 | `HostExecutor.cs` | `HOST_EXEC` envelope parse, allow → deny → default policy, foreground/background bare-metal execution, sudo via run-as identity, audit |
-| `HostIdentity.cs` | Run-as identity: username (config) + password (memory-only, zeroed on dispose; `--password-file` / `OPENMONO_HOST_PASSWORD_FILE`) |
+| `HostIdentity.cs` | Run-as identity: username (config) + sudo policy (`ask`/`allow`/`deny`) + password (memory-only, zeroed on dispose; `--password-file` / `OPENMONO_HOST_PASSWORD_FILE`) |
 | `AuditLog.cs` / `LogRedactor` | Paper trail: every host command appended to the existing agent log |
 | `Bridge.cs` | Turn pump: renders stream, auto-resolves policy pauses, prompts the operator otherwise |
 | `BridgeUi.cs` / `TuiFrontend.cs` | Operator surface: full-screen agent TUI on a TTY, plain lines otherwise |
@@ -76,7 +76,7 @@ Project layout (`src/OpenMono.HostBridge/`, .NET 10, references the CLI project 
   (`/mode`, `/build`, `/plan`, `/compact`, `/think`, `/playbook`) run on the
   server; only `/quit`, `/exit`, `/clear` are local.
 - **Build mode by default.** Fresh and attached host sessions are explicitly set
-  to `build` via the stock `{"mode": …}` turn — new ACP sessions default to plan
+  to `build` via the stock `{"mode": …}` turn - new ACP sessions default to plan
   (read-only), which cannot operate a server. `--plan` opts back into read-only.
   A build-toggle request while already in build is approved without prompting.
 - **Standing orders.** The first turn of every fresh host session carries a
@@ -87,45 +87,92 @@ Project layout (`src/OpenMono.HostBridge/`, .NET 10, references the CLI project 
   `/root/...` or `~/.openmono/...`). Attached (`--session`) conversations are
   never re-preambled.
 - **Wrong-user fail-fast.** If `run_as` differs from the bridge process user and
-  sudo is off, the bridge exits immediately with how to fix it (run as that user
-  or enable sudo) instead of failing command by command mid-session.
+  sudo is **denied** (`allow_sudo: "deny"`), the bridge exits immediately with how
+  to fix it (run as that user or change the sudo policy) instead of failing command
+  by command mid-session. `ask` does not fail fast - it confirms per escalation
+  at run time.
 
 ### Failure modes walked
 
 | Symptom | Cause | Fix in this design |
 |---|---|---|
 | Agent Greps `/root/.openmono/...` or `~/.openmono/...` and fails | Container tools cannot see host paths; agent guessed | Preamble + playbook route all host reads through `HOST_EXEC`; logs documented at the run-as user's `~/.openmono/logs` |
-| y/N prompt for every host command | Old stock policy defaulted to `ask` | Default is now `allow` (stock configs migrate once; custom policies untouched); deny list + sudo rules still enforced, all commands audited |
+| y/N prompt for every host command | Stock policy defaults to `ask` (every command prompts) | Expected in ask mode; the allow list never skips the prompt. Opt in to `OPENMONO_HOST_EXEC_DEFAULT=allow` at install for routine commands to run without asking; deny list + sudo rules still enforced, all commands audited |
 | Launch line becomes the first task | Stale keystrokes in the console buffer at TUI startup | Stdin drained on entry; `openmono agent --host`-shaped first lines are never sent |
 | Big HOST_EXEC stalls on PENDING_RESPONSE with no prompt | Model sends envelope JSON with literal newlines (invalid JSON); bridge parked the operator in front of raw JSON | Lenient parse accepts raw heredocs (truncation fails closed); unparseable envelopes get an auto-reply with re-send shapes instead of waiting on the operator |
 | Pasted paragraph splits into queued lines, tail dropped | Unbracketed paste submits per line; queue capped at 2 | Queue holds 32; the bridge joins everything pending into one turn |
 | Turn error 400 "must contain either 'content' or 'tool_calls'" | A turn that produced no text and no calls stored an empty assistant message, rejected on the next request | Empty assistant messages are never stored (warn-logged); the per-request sanitizer drops any already in history, so old sessions heal |
 | Agent stays in Plan, proposes but never acts | New ACP sessions default to plan | Bridge sets `build` explicitly unless `--plan` |
 | Host commands fail as the wrong user | Bridge run as root (or another user) while `run_as` is the login user | Fail-fast startup check; run the bridge as the login user |
-| `as_root` refused | Sudo never opted in | Expected: enable via `--init`/first-run prompt, or keep off and do root steps by hand |
-| Sudo password prompt mid-turn | Timestamp expired and no password in memory | Masked prompt (TUI stands down fullscreen so the secret never touches its input box), or pre-seed `--password-file` / `OPENMONO_HOST_PASSWORD_FILE` |
+| `as_root` refused | Sudo policy is `deny` | Expected: change with `openmono config host.sudo_policy ask` (or `allow`), or keep off and do root steps by hand |
+| Sudo password prompt mid-turn | Timestamp expired and no password in memory, or wrong password typed | Masked in-TUI prompt (never echoed/logged), up to 3 tries with the bad secret wiped from memory each time; or pre-seed `--password-file` / `OPENMONO_HOST_PASSWORD_FILE` |
+| Turn error "Name or service not known (llama-server:7474)" on macOS | Container aimed at the Linux compose-network name, but macOS inference runs natively on the host | Fixed: loopback endpoints map to `host.docker.internal` (native port preserved) on macOS, `llama-server:7474` on Linux |
 | VS Code driving the host | Extension integration is sandbox-only by design | `openmono agent --host --acp-only …` is refused; run without `--host` for the extension |
 
 ### Run-as identity, sudo, and the paper trail
 
 - **Identity.** Host commands run as `run_as` from `~/.openmono/host-bridge.json`
-  (empty = whoever runs the bridge). Set it at install, with `host-bridge --init`,
-  `--run-as <user>`, or `OPENMONO_HOST_RUN_AS`. The password for that account is
+  (empty = whoever runs the bridge). Set it with `host-bridge --init` (interactive),
+  `--run-as <user>`, `OPENMONO_HOST_RUN_AS` at install, or `openmono config
+  host.run_as <user>` any time after. The password for that account is
   **never** stored in settings, logs, or the repo: it lives only in bridge memory
   (masked prompt when an escalation first needs it, zeroed on exit), optionally
   pre-seeded from a root-owned-or-owner-only `0600` file via `--password-file` /
   `OPENMONO_HOST_PASSWORD_FILE` (loose permissions are refused). It travels to
   sudo over piped stdin, never a command line.
-- **Sudo.** The installer / `--init` / first run asks once whether sudo is allowed
-  (default **No**); the answer persists as `allow_sudo`. `false` means sudo is never
-  used — `as_root` requests and cross-user runs are refused with how to enable it.
-  `--allow-sudo` / `--no-sudo` override per run (explicit, never silent).
-- **Host commands run without a y/N each time.** `host_exec.default` ships as
-  `allow`: routine commands run straight through (deny list first, sudo rules
-  enforced, everything audited). Existing untouched stock configs migrate
-  `ask` → `allow` once on upgrade; any customized policy is never touched. Set
-  `host_exec.default` back to `"ask"` to confirm each command.
-- **Paper trail.** Every host command — runs **and** denials — is appended to the
+- **Sudo policy (`allow_sudo`: `ask` / `allow` / `deny`).** The escalation policy
+  is a three-state value, not a bool. Default is **`ask`**: every elevation
+  (`as_root` requests, cross-user runs, any command segment whose program is
+  `sudo`, `su`, `doas`, `pkexec`, or `run0` - including path-prefixed,
+  backslash-escaped, or quoted forms such as `/usr/bin/sudo` or `\sudo`) prompts
+  the operator with y/N, and a **yes is in-memory only for that one command** -
+  it is never persisted. The config stays `ask` until the operator explicitly
+  runs `openmono config host.sudo_policy <ask|allow|deny>` or re-runs an
+  interactive `host-bridge --init`. Non-interactive runs (piped stdin, no TTY)
+  can never be asked, so an `ask` escalation is **denied** there (fail closed).
+  `allow` escalates without prompting; `deny` refuses every escalation with how
+  to change the policy. `--allow-sudo` / `--no-sudo` override per run (explicit,
+  never silent) and win over the config. `run_as` is validated against
+  `^[A-Za-z_][A-Za-z0-9_-]*[$]?$` before use in `sudo -u` (capitals allowed
+  for macOS short names; shell metacharacters never are).
+- **Wrong password: retry + wipe.** A failed elevation zeroes and drops the
+  in-memory secret immediately, then re-prompts in the same surface (TUI chat
+  lane, masked — or a masked line-mode prompt), up to 3 entries per command.
+  After the third failure the secret is wiped and the command reports
+  authentication failure; re-run it to try again. Non-interactive and
+  background runs fail fast instead of prompting.
+- **macOS + Touch ID.** If this Mac unlocks sudo with Touch ID (`pam_tid.so`
+  in `/etc/pam.d/sudo`), bridge elevations still need the typed password:
+  the bridge feeds sudo over piped stdin (`sudo -S`), which bypasses Touch ID
+  — Touch ID only answers TTY prompts. Type the password when asked.
+- **Legacy bool configs.** Old `host-bridge.json` files stored `allow_sudo` as a
+  JSON boolean; it is mapped on load (`true` → `allow`, `false` → `deny`,
+  missing/null → `ask`) and normalized to the string form on the next save.
+- **Timeouts.** A timed-out foreground command is killed (whole process tree;
+  via passwordless sudo when the command ran elevated) and the report says
+  `was terminated` only when the process is confirmed gone. Otherwise it says
+  the timeout fired but the process may still be running, with the pid.
+- **Host policy (ask by default).** `host_exec.default` ships as `ask`: every
+  host command prompts with y/N. The allow list does not skip the prompt in
+  ask mode. Set `host_exec.default` to `"allow"` only by explicit opt-in
+  (`OPENMONO_HOST_EXEC_DEFAULT=allow` at install) to run routine commands
+  without asking. In allow mode an allow pattern only matches a single simple
+  command: any command containing `; & |` backtick `$(` `${` `>` `<` or a
+  newline never allow-matches and falls to the default (usually ask). The
+  shipped allow sample is `git *`, `systemctl status *`, `journalctl *`
+  (`docker *` and `curl *` were removed as too broad). The deny list is
+  checked first, per command segment (split on `; & |` and newlines), with the
+  program word normalized so `/bin/rm`, `/usr/bin/rm`, and `\rm` match `rm`
+  patterns, plus an explicit guard for `rm` with recursive+force flags
+  targeting `/` or `~`.
+- **Deny list is best-effort, not a sandbox.** It blocks known destructive
+  shapes and common obfuscations (path-prefixed programs, chained segments,
+  `rm` flag variants), but shell is expressive enough that a determined
+  prompt can work around any pattern list. Treat the deny list as a guardrail
+  against mistakes, not as a security boundary. The only real isolation
+  is running the agent sandboxed (`openmono agent --sandbox`) or reviewing
+  each host command in ask mode.
+- **Paper trail.** Every host command - runs **and** denials - is appended to the
   **existing** agent log (`~/.openmono/logs/openmono-<date>.log`, same file and line
   format the container agent writes through its mount), tagged `[host-exec]` with
   command, user it ran as, `as_root`, exit code, elapsed ms, and timestamp. Command
@@ -145,13 +192,26 @@ OPENMONO_HOST_BRIDGE=1 openmono setup --agent   # non-interactive: include it
 ```
 
 Answering yes runs `scripts/install-host-bridge.sh`, which publishes
-`src/OpenMono.HostBridge` to `~/.openmono/bin/host-bridge`. .NET 10 is
+`src/OpenMono.HostBridge` to `~/.openmono/bin/host-bridge` and writes a sample
+`~/.openmono/host-bridge.json` (0600) when one does not exist. .NET 10 is
 required: when it is missing, the script reuses the **existing** prerequisite
-path (`scripts/install_prereqs.sh` — the same installer that provides .NET 10
+path (`scripts/install_prereqs.sh` - the same installer that provides .NET 10
 for the main agent) instead of inventing a second one, then publishes. Add it
 to any existing agent box later with `bash scripts/install-host-bridge.sh`.
 
-## Mode A — single-box (inference + agent on one machine)
+The install itself is strictly **non-interactive and on-demand**: it never
+starts or runs the bridge, and it never prompts. `--init` is only ever invoked
+as `--non-interactive` from the installer (with `--allow-sudo` / `--no-sudo`
+only when `OPENMONO_HOST_SUDO` was set at install); an interactive `--init`
+prompt would look like a hang, because `openmono setup` redirects the installer's
+stderr to the setup log. The sudo policy is chosen at install time
+(`OPENMONO_HOST_SUDO`, prompted by `scripts/install.sh`) and defaults to `ask`
+when unset; the run-as user defaults to whoever runs the bridge. Either can be
+changed by hand any time with `host-bridge --init` (interactive) or
+`openmono config host.*` - see
+[Configuration](CONFIG.md#host-bridge-host-sub-agent)).
+
+## Mode A - single-box (inference + agent on one machine)
 
 Use this when one server (or workstation) has the whole stack: it runs the
 model **and** the agent you operate software with.
@@ -162,7 +222,7 @@ model **and** the agent you operate software with.
 bash <(curl -fsSL https://raw.githubusercontent.com/StartupHakk/OpenMonoAgent.ai/refs/heads/main/get-openmono.sh)
 ```
 
-When prompted, pick **1 — Both** (agent + inference server). Non-interactive
+When prompted, pick **1 - Both** (agent + inference server). Non-interactive
 equivalent:
 
 ```bash
@@ -226,23 +286,27 @@ commit or config, fix it, redeploy, and verify /health returns 200.
 What makes this work on a server box (sandbox notes; host mode uses your
 native git/docker/shell directly, no passthrough needed):
 
-- **Git auth passthrough (sandbox)** — `openmono agent` forwards your host
+- **Git auth passthrough (sandbox)** - `openmono agent` forwards your host
   `~/.gitconfig`, `~/.ssh`, `~/.git-credentials` (read-only) plus the SSH
   agent socket, so the agent can clone/pull/push as you. Opt out with
   `OPENMONO_NO_GIT_AUTH=1`.
-- **Docker socket (sandbox)** — `openmono agent` bind-mounts `/var/run/docker.sock`
-  when it exists (opt out with `OPENMONO_NO_DOCKER_SOCK=1`), and the agent
+- **Docker socket (sandbox, opt-in only)** - the default `openmono agent`
+  sandbox does NOT get the host daemon. Set `OPENMONO_DOCKER_SOCK=1` when the
+  task actually needs `docker` against the host (deploy + troubleshoot a
+  containerized backend), and the agent
   image ships the Docker CLI + compose plugin, so `docker ps`,
   `docker compose up -d --build`, and `docker logs` work from inside the
-  agent. If you invoke compose directly instead of via `openmono agent`, add
+  agent when the socket is opted in. `OPENMONO_NO_DOCKER_SOCK=1` remains
+  supported as an explicit veto for existing configs. If you invoke compose
+  directly instead of via `openmono agent`, add
   `- /var/run/docker.sock:/var/run/docker.sock` to the agent service volumes
   yourself.
-- **Workspace scoping** — the agent sees only the mounted project
+- **Workspace scoping** - the agent sees only the mounted project
   (`/workspace`). Point `WORKSPACE=/srv/my-backend openmono agent` at the repo
   you want it to operate on. Host paths outside the mount are unreachable by
   design; run host-level commands (`systemctl`, firewall) yourself or via your
   own shell, not the agent.
-- **Long-running backends** — ask the agent to start servers with
+- **Long-running backends** - ask the agent to start servers with
   `background=true` (`Bash` tool flag); it returns a PID + log path you can
   `tail` on follow-up turns.
 
@@ -264,14 +328,14 @@ native git/docker/shell directly, no passthrough needed):
 > }
 > ```
 
-## Mode B — split-box (inference remote, agent on your box)
+## Mode B - split-box (inference remote, agent on your box)
 
 Use this when the model runs somewhere else (GPU server) and the agent runs on
 the box you are working on (server, laptop, or workstation). The agent still
-does the same server work as Mode A — only `llm.endpoint` points at a remote
+does the same server work as Mode A - only `llm.endpoint` points at a remote
 address. Two transports are supported; pick one.
 
-### Option B1 — direct connection (no relay, no account)
+### Option B1 - direct connection (no relay, no account)
 
 Best for machines on the same LAN, VPN, or Tailscale-style network.
 
@@ -300,7 +364,7 @@ sudo ufw allow from <AGENT_BOX_IP> to any port 7474 proto tcp
 ```
 
 If you also installed the Caddy gateway (`openmono setup gateway|search|scraper`),
-open that port instead (default `47480`) — the gateway fronts llama plus any
+open that port instead (default `47480`) - the gateway fronts llama plus any
 web services, and the agent auto-detects them via `/services`.
 
 **On the agent box:**
@@ -314,7 +378,7 @@ openmono config set llm.api_key <LLAMA_API_KEY>
 (`config-examples/split-agent-box.settings.json` shows the same two keys as a
 file. `<INFERENCE_HOST>` is the inference box's LAN/VPN address;
 `<LLAMA_API_KEY>` is the value of `LLAMA_API_KEY` in the inference box's
-`docker/.env`. Both are placeholders — no real secrets are checked in.)
+`docker/.env`. Both are placeholders - no real secrets are checked in.)
 
 Verify from the agent box before starting the agent:
 
@@ -340,7 +404,7 @@ openmono config set llm.endpoint http://localhost:7474
 openmono config set llm.api_key <LLAMA_API_KEY>
 ```
 
-### Option B2 — relay (internet, no port forwarding)
+### Option B2 - relay (internet, no port forwarding)
 
 Best for an agent laptop + remote GPU box over the internet. This is the
 pre-existing hosted path and is unchanged:
@@ -350,7 +414,7 @@ pre-existing hosted path and is unchanged:
 2. Agent box: `openmono setup --agent`, then `openmono config set llm.endpoint`
    + `llm.api_key` with the relay endpoint/key from the setup email.
 
-Full steps: [SETUP.md — Dual-box setup](SETUP.md#dual-box-setup).
+Full steps: [SETUP.md - Dual-box setup](SETUP.md#dual-box-setup).
 
 ## Troubleshooting
 
@@ -361,7 +425,7 @@ Full steps: [SETUP.md — Dual-box setup](SETUP.md#dual-box-setup).
 | Agent `docker: command not found` (sandbox) | Stale agent image (built before the Docker CLI was added) | Rebuild: `cd docker && docker compose build agent` |
 | `openmono agent --host`: "Host sub-agent is not installed" | `~/.openmono/bin/host-bridge` missing and no .NET SDK to run from source | `bash scripts/install-host-bridge.sh` (installs .NET 10 via existing prereqs when missing), or use `--sandbox` |
 | `openmono agent --host --acp-only ...` refused | VS Code / extension integration is sandbox-only by design | Run without `--host`: `openmono agent --acp-only --acp-port 7475` |
-| Agent `Cannot connect to the Docker daemon` | Socket not mounted | Run via `openmono agent` (auto-mounts when `/var/run/docker.sock` exists); for direct compose use, add the socket volume (see Mode A) |
+| Agent `Cannot connect to the Docker daemon` | Socket not mounted (opt-in only) | Set `OPENMONO_DOCKER_SOCK=1` and retry via `openmono agent`; for direct compose use, add the socket volume (see Mode A) |
 | Agent prompts on every git/docker command | Default `Bash` permission level is `Ask` | Add `allow` patterns as in the Mode A tip, or approve per-session when prompted |
 | Model slow on single-box CPU | CPU inference needs ~20 GB RAM and dual-channel DDR5 | See [MODELS.md](MODELS.md); consider split-box with a GPU inference host |
 

@@ -89,8 +89,15 @@ public sealed class AgentContainer
         args.Append("-e HOME=/home/agent ");
         args.Append($"-e WORKSPACE=\"{_workDir}\" ");
         args.Append($"-e OPENMONO_ENDPOINT={endpoint} ");
+        string? apiKeyValue = null;
         if (!string.IsNullOrWhiteSpace(settings.ApiKey))
-            args.Append($"-e OPENMONO_API_KEY={settings.ApiKey} ");
+        {
+            // Pass the key via the child process environment (-e NAME with the
+            // value in process env), never on the docker command line where
+            // it would be visible in ps output.
+            args.Append("-e OPENMONO_API_KEY ");
+            apiKeyValue = settings.ApiKey;
+        }
         if (!string.IsNullOrWhiteSpace(gateway))
             args.Append($"-e OPENMONO_WEB_GATEWAY={gateway} ");
         if (!string.IsNullOrWhiteSpace(settings.Search))
@@ -102,7 +109,7 @@ public sealed class AgentContainer
         args.Append("agent --acp-only --acp-port 7475");
 
         _log.WriteLine("[bridge] starting ACP agent container...");
-        var rc = await RunDockerAsync(args.ToString(), ct);
+        var rc = await RunDockerAsync(args.ToString(), ct, apiKeyValue);
         if (rc != 0)
             throw new InvalidOperationException("docker compose run failed — is the Docker daemon running?");
         return $"http://127.0.0.1:{hostPort}";
@@ -170,7 +177,7 @@ public sealed class AgentContainer
         }
     }
 
-    private async Task<int> RunDockerAsync(string args, CancellationToken ct)
+    private async Task<int> RunDockerAsync(string args, CancellationToken ct, string? apiKeyValue = null)
     {
         var psi = new ProcessStartInfo("docker", args)
         {
@@ -180,6 +187,8 @@ public sealed class AgentContainer
             CreateNoWindow = true,
             WorkingDirectory = _workDir,
         };
+        if (!string.IsNullOrEmpty(apiKeyValue))
+            psi.Environment["OPENMONO_API_KEY"] = apiKeyValue;
         using var process = Process.Start(psi)
             ?? throw new InvalidOperationException("failed to start docker");
         var stdout = await process.StandardOutput.ReadToEndAsync(ct);
@@ -240,38 +249,72 @@ public sealed class AgentContainer
         args.Append("-e GIT_SSH_COMMAND=\"ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes\" ");
     }
 
+    /// <summary>
+    /// Rewrites a host-side loopback LLM endpoint for the agent container.
+    ///
+    /// Strata-style endpoints carry the OpenAI base path (/v1) and serve
+    /// host-native on every OS (Linux default, see docs/STRATA.md), so loopback
+    /// becomes the host gateway on macOS and Linux alike — preserving the port
+    /// and path so :8080/v1 (or a custom --port) keeps working.
+    ///
+    /// Legacy llama.cpp endpoints (no base path): on Linux the compose network
+    /// serves the model as <c>llama-server</c> (container port 7474, fixed); on
+    /// macOS inference runs natively on the Mac host (Metal), so the container
+    /// reaches it through Docker Desktop's <c>host.docker.internal</c>,
+    /// preserving the native port (configurable via inference.port).
+    /// Anything non-loopback passes through untouched.
+    /// </summary>
     internal static string MapEndpoint(string endpoint)
     {
-        // Strata-style endpoints carry the OpenAI base path (/v1) and serve
-        // host-native (Linux default, see docs/STRATA.md). Inside the agent
-        // container, loopback must become the host gateway — preserving the
-        // port and path so :8080/v1 (or a custom --port) keeps working.
-        if (Uri.TryCreate(endpoint, UriKind.Absolute, out var uri) &&
-            (uri.Host.Equals("localhost", StringComparison.OrdinalIgnoreCase) ||
-             uri.Host.Equals("127.0.0.1", StringComparison.Ordinal) ||
-             uri.Host.Equals("host.docker.internal", StringComparison.OrdinalIgnoreCase)) &&
+        // Strata (host-native, any OS): the /v1 base path is the tell. Keep the
+        // port + path, swap only the host to the container's route to the host.
+        if (IsLoopbackHttp(endpoint) &&
+            Uri.TryCreate(endpoint, UriKind.Absolute, out var uri) &&
             uri.AbsolutePath.StartsWith("/v1", StringComparison.OrdinalIgnoreCase))
         {
-            return $"http://host.docker.internal:{(uri.Port == -1 ? 80 : uri.Port)}{uri.PathAndQuery}";
+            return $"http://host.docker.internal:{uri.Port}{uri.PathAndQuery}";
         }
 
-        // Legacy llama.cpp Docker path (no base path): the container reaches
-        // the llama-server service directly.
-        return endpoint.StartsWith("http://localhost:", StringComparison.OrdinalIgnoreCase) ||
-            endpoint.StartsWith("http://127.0.0.1:", StringComparison.OrdinalIgnoreCase) ||
-            endpoint.StartsWith("http://host.docker.internal:", StringComparison.OrdinalIgnoreCase)
-                ? "http://llama-server:7474"
-                : endpoint;
+        return IsLoopbackHttp(endpoint)
+            ? OperatingSystem.IsMacOS()
+                ? $"http://host.docker.internal:{LoopbackPortOr(endpoint, "7474")}"
+                : "http://llama-server:7474"
+            : endpoint;
     }
 
+    /// <summary>
+    /// Same rewrite for the optional web gateway. Linux keeps the compose
+    /// <c>caddy:8080</c> mapping; macOS targets the host via
+    /// <c>host.docker.internal</c>, preserving the configured port.
+    /// </summary>
     internal static string MapGateway(string gateway) =>
         string.IsNullOrWhiteSpace(gateway)
             ? ""
-            : gateway.StartsWith("http://localhost:", StringComparison.OrdinalIgnoreCase) ||
-              gateway.StartsWith("http://127.0.0.1:", StringComparison.OrdinalIgnoreCase) ||
-              gateway.StartsWith("http://host.docker.internal:", StringComparison.OrdinalIgnoreCase)
-                ? "http://caddy:8080"
+            : IsLoopbackHttp(gateway)
+                ? OperatingSystem.IsMacOS()
+                    ? $"http://host.docker.internal:{LoopbackPortOr(gateway, "8080")}"
+                    : "http://caddy:8080"
                 : gateway;
+
+    private static bool IsLoopbackHttp(string value) =>
+        value.StartsWith("http://localhost:", StringComparison.OrdinalIgnoreCase) ||
+        value.StartsWith("http://127.0.0.1:", StringComparison.OrdinalIgnoreCase) ||
+        value.StartsWith("http://host.docker.internal:", StringComparison.OrdinalIgnoreCase);
+
+    private static string LoopbackPortOr(string endpoint, string fallback)
+    {
+        try
+        {
+            var port = new Uri(endpoint).Port;
+            return port > 0
+                ? port.ToString(System.Globalization.CultureInfo.InvariantCulture)
+                : fallback;
+        }
+        catch (Exception)
+        {
+            return fallback;
+        }
+    }
 
     private static string Str(JsonElement? parent, string name)
     {

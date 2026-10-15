@@ -1,6 +1,7 @@
 using System.Text.Json;
 using OpenMono.Config;
 using OpenMono.Memory;
+using OpenMono.Permissions;
 using OpenMono.Playbooks;
 using OpenMono.Session;
 using OpenMono.Utils;
@@ -159,7 +160,7 @@ public sealed class AcpTurnRunner : IAcpEventSink
 
             case "/compact":
             {
-                var loop = _loopFactory.Create(_acpSession.State, this, _interaction);
+                var loop = _loopFactory.Create(_acpSession.State, this, _interaction, _acpSession.Store);
                 var before = _acpSession.State.Messages.Count;
                 await loop.RunManualCompactionAsync(string.IsNullOrWhiteSpace(args) ? null : args, ct);
                 var after = _acpSession.State.Messages.Count;
@@ -271,7 +272,7 @@ public sealed class AcpTurnRunner : IAcpEventSink
 
         var sessionState = _acpSession.State;
         sessionState.Meta.TokenTracker ??= new TokenTracker();
-        using var loop = _loopFactory.Create(sessionState, sink: this, interaction: _interaction);
+        using var loop = _loopFactory.Create(sessionState, sink: this, interaction: _interaction, store: _acpSession.Store);
         try
         {
             var result = await loop.ExecutePlaybookDirectAsync(name, playbookArgs, resume, ct);
@@ -329,10 +330,7 @@ public sealed class AcpTurnRunner : IAcpEventSink
         // "once"    → for an allow, seed a TEMPORARY grant so the resumed execution does
         //             not re-prompt, then forget it (below) so a later call prompts again.
         var isCaching = string.Equals(scope, "session", StringComparison.Ordinal);
-        if (allow)
-            _acpSession.RememberPermission(ctx.ContextKey, true, scope);
-        else
-            _acpSession.RememberPermission(ctx.ContextKey, false, scope);
+        _acpSession.Store.Remember(ctx.ContextKey, allow, GrantScopeExtensions.FromWireString(scope));
 
         Log.Info($"[OMA_PERM] Resolved: id={id} decision={decision} scope={scope} caching={isCaching} contextKey={ctx.ContextKey}");
 
@@ -343,7 +341,7 @@ public sealed class AcpTurnRunner : IAcpEventSink
         // Uses shared session state; modifications are persisted automatically.
         var sessionState = _acpSession.State;
         sessionState.Meta.TokenTracker ??= new TokenTracker();
-        using var loop = _loopFactory.Create(sessionState, sink: this, interaction: _interaction);
+        using var loop = _loopFactory.Create(sessionState, sink: this, interaction: _interaction, store: _acpSession.Store);
         try
         {
             try
@@ -354,7 +352,7 @@ public sealed class AcpTurnRunner : IAcpEventSink
             {
                 // Strict "once": the temporary grant only ever covers the resumed execution.
                 if (!isCaching)
-                    _acpSession.ForgetPermission(ctx.ContextKey);
+                    _acpSession.Store.Forget(ctx.ContextKey);
             }
 
             // Check if there are queued permissions to process
@@ -416,8 +414,8 @@ public sealed class AcpTurnRunner : IAcpEventSink
         if (!_acpSession.TryResolvePause(id, new AcpUserInputResponse(resolvedValue)))
             throw new InvalidOperationException($"failed to resolve pause id: {id}");
 
-        _acpSession.RememberUserInput(ctx.ContextKey, resolvedValue);
-
+        // No general user-input caching: each free-form question prompts fresh.
+        // (HOST_EXEC authorization is grant-cached bridge-side, never as answers.)
         AppendSyntheticToolMessages(resolvedValue);
 
         // A user_input answer is genuine user direction.
@@ -464,7 +462,7 @@ public sealed class AcpTurnRunner : IAcpEventSink
             throw new InvalidOperationException($"failed to resolve pause id: {id}");
 
         // Remember the decision so the tool doesn't re-prompt if resumed
-        _acpSession.RememberPermission(ctx.ContextKey, allow);
+        _acpSession.Store.Remember(ctx.ContextKey, allow, OpenMono.Permissions.GrantScope.Session);
 
         if (!allow)
         {
@@ -481,7 +479,7 @@ public sealed class AcpTurnRunner : IAcpEventSink
 
         var sessionState = _acpSession.State;
         sessionState.Meta.TokenTracker ??= new TokenTracker();
-        using var loop = _loopFactory.Create(sessionState, sink: this, interaction: _interaction);
+        using var loop = _loopFactory.Create(sessionState, sink: this, interaction: _interaction, store: _acpSession.Store);
         try
         {
             await loop.ResolvePendingToolCallsAsync(true, ct);
@@ -532,7 +530,7 @@ public sealed class AcpTurnRunner : IAcpEventSink
 
         // Cache the approval decision so RequestPlaybookApprovalAsync finds it
         // when the pending PlaybookTool is re-executed
-        _acpSession.RememberPermission(ctx.Value.ContextKey, allow);
+        _acpSession.Store.Remember(ctx.Value.ContextKey, allow, OpenMono.Permissions.GrantScope.Session);
 
         // Execute the pending PlaybookTool with the approval decision.
         // Same pattern as FileWrite: find the pending tool call, execute it,
@@ -540,7 +538,7 @@ public sealed class AcpTurnRunner : IAcpEventSink
         // pause icon → cog → check.
         var sessionState = _acpSession.State;
         sessionState.Meta.TokenTracker ??= new TokenTracker();
-        using var loop = _loopFactory.Create(sessionState, sink: this, interaction: _interaction);
+        using var loop = _loopFactory.Create(sessionState, sink: this, interaction: _interaction, store: _acpSession.Store);
         try
         {
             try
@@ -582,7 +580,7 @@ public sealed class AcpTurnRunner : IAcpEventSink
         var sessionState = _acpSession.State;
         sessionState.Meta.TokenTracker ??= new TokenTracker();
 
-        using var loop = _loopFactory.Create(sessionState, sink: this, interaction: _interaction);
+        using var loop = _loopFactory.Create(sessionState, sink: this, interaction: _interaction, store: _acpSession.Store);
 
         try
         {

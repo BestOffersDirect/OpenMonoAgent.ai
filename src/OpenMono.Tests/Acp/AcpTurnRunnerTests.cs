@@ -102,7 +102,7 @@ public sealed class AcpTurnRunnerTests
         toolMsg.IsError.Should().BeFalse();
 
         // "once" scope must NOT persist: a later call this session prompts again.
-        session.TryGetRememberedPermission(ctx.ContextKey).Should().BeNull(
+        session.Store.TryResolve(ctx.ContextKey).Should().BeNull(
             "an allow-once decision is temporary and must not be cached for the session");
 
         ParseSseEvents(body).Last().name.Should().Be("done");
@@ -134,10 +134,10 @@ public sealed class AcpTurnRunnerTests
         using var payload = JsonDocument.Parse($"{{\"id\":\"{pauseId}\",\"decision\":\"allow\",\"scope\":\"session\"}}");
         await runner.ResumeWithPermissionAsync(payload.RootElement, CancellationToken.None);
 
-        var cached = session.TryGetRememberedPermission(ctx.ContextKey);
+        var cached = session.Store.TryResolve(ctx.ContextKey);
         cached.Should().NotBeNull("an allow-session decision must persist so the tool is not re-prompted this session");
-        cached.Value.Allow.Should().BeTrue();
-        cached.Value.Scope.Should().Be("session");
+        cached.Allow.Should().BeTrue();
+        cached.Scope.Should().Be(OpenMono.Permissions.GrantScope.Session);
     }
 
     [Fact]
@@ -318,7 +318,8 @@ public sealed class AcpTurnRunnerTests
         using var payload = JsonDocument.Parse("{\"id\":\"ask_42\",\"value\":\"AES-256-GCM\"}");
         await runner.ResumeWithUserInputAsync(payload.RootElement, CancellationToken.None);
 
-        session.TryGetRememberedUserInput("which?").Should().Be("AES-256-GCM");
+        // No general user-input caching: the answer resolves the pause but is not remembered.
+        session.Store.TryResolve("which?").Should().BeNull();
 
 
         var toolMsg = session.Messages.LastOrDefault(m => m.Role == MessageRole.Tool);
@@ -413,10 +414,10 @@ public sealed class AcpTurnRunnerTests
         await runner.ResumeWithPermissionAsync(payload.RootElement, CancellationToken.None);
 
         // Verify permission is cached with session scope
-        var cached = session.TryGetRememberedPermission(ctx.ContextKey);
+        var cached = session.Store.TryResolve(ctx.ContextKey);
         cached.Should().NotBeNull();
-        cached.Value.Allow.Should().BeTrue();
-        cached.Value.Scope.Should().Be("session");
+        cached.Allow.Should().BeTrue();
+        cached.Scope.Should().Be(OpenMono.Permissions.GrantScope.Session);
     }
 
     [Fact]
@@ -451,7 +452,7 @@ public sealed class AcpTurnRunnerTests
         await runner.ResumeWithPermissionAsync(payload.RootElement, CancellationToken.None);
 
         // Verify permission is not cached (forgotten after execution)
-        var cached = session.TryGetRememberedPermission(ctx.ContextKey);
+        var cached = session.Store.TryResolve(ctx.ContextKey);
         cached.Should().BeNull("scope=once should be forgotten after execution");
     }
 

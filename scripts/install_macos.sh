@@ -484,8 +484,12 @@ if [ "$OPENMONO_ROLE" != "agent" ]; then
     next_step "Installing llama.cpp (Metal)"
 
     # llama.cpp from Homebrew runs natively on the host, enabling Metal GPU
-    # acceleration on Apple Silicon. The agent Docker container reaches it via
-    # host.docker.internal, which Docker Desktop resolves automatically on macOS.
+    # acceleration on Apple Silicon. The endpoint is stored as 127.0.0.1
+    # (resolves everywhere on the host); every container consumer maps it
+    # for its own network — the bridge and the openmono CLI rewrite loopback
+    # to host.docker.internal on macOS (Docker Desktop) and to the compose
+    # service names on Linux. Never store host.docker.internal here: macOS
+    # itself does not resolve it, so host-side readers would break.
     if ! command -v llama-server &>/dev/null; then
         info "Installing llama.cpp via Homebrew..."
         run brew install llama.cpp || die "brew install llama.cpp failed"
@@ -536,7 +540,7 @@ import json, sys
 path, port, model_name, model_alias, ctx_size, install_dir, api_key, mmproj_path, binary = sys.argv[1:10]
 with open(path) as f:
     cfg = json.load(f)
-cfg.setdefault("llm", {})["endpoint"] = f"http://host.docker.internal:{port}"
+cfg.setdefault("llm", {})["endpoint"] = f"http://127.0.0.1:{port}"
 cfg.setdefault("llm", {})["api_key"] = api_key
 cfg["inference"] = {
     "mode": "native-metal",
@@ -555,7 +559,7 @@ PYEOF
     detail "  model     : $MODEL_NAME"
     detail "  binary    : ${PRISM_BINARY:-$(command -v llama-server)}"
     detail "  ctx_size  : $_CTX_SIZE"
-    detail "  endpoint  : http://host.docker.internal:${LLAMA_PORT:-7474}"
+    detail "  endpoint  : http://127.0.0.1:${LLAMA_PORT:-7474}"
     detail "  api_key   : [generated, stored in docker/.env]"
 
     # Update docker/.env with model and vision state
@@ -609,6 +613,108 @@ if [ "$OPENMONO_ROLE" != "agent" ]; then
         warn "Check the log: openmono logs"
         warn "Or restart manually: openmono start"
     fi
+fi
+
+# ── Optional: bare-metal host sub-agent (agent roles only — never inference)
+# Mirrors the Linux installer: prompt (TTY only; non-interactive defaults to
+# No), then host-command policy, then sudo policy, then install-host-bridge.sh
+# with the answers as non-interactive presets. Deliberately outside the step
+# counter so TOTAL_STEPS stays valid for every role.
+if [ "$OPENMONO_ROLE" != "inference" ]; then
+    _bridge_answer="${OPENMONO_HOST_BRIDGE:-}"
+    if [[ -z "$_bridge_answer" ]]; then
+        if [[ ! -t 0 ]]; then
+            info "Skipping host sub-agent (non-interactive, default No). Add it later with:"
+            info "  OPENMONO_HOST_BRIDGE=1 bash scripts/install_macos.sh  # or: bash scripts/install-host-bridge.sh"
+        else
+            echo ""
+            echo "  ── OPTIONAL: bare-metal host operator (DEFAULT: No) ──"
+            echo "  This BREAKS the container sandbox. If installed, the agent can"
+            echo "  run HOST commands directly on THIS MAC as your user (pull, build,"
+            echo "  install, docker, launchctl, redeploy, troubleshoot). Every command"
+            echo "  is audit-logged, sudo stays OFF unless you separately opt in."
+            echo "  Only install on a Mac you operate. Coding laptops: say No."
+            echo "  You can add it later with: bash scripts/install-host-bridge.sh"
+            echo ""
+            printf "  Install the host sub-agent? Default No [y/N] (Enter=No): "
+            read -r _bridge_answer || _bridge_answer=""
+            echo ""
+        fi
+    fi
+    case "${_bridge_answer:-}" in
+        1|[Yy]|[Yy]es)
+            # Second explicit consent: "allow" must be chosen, never assumed.
+            # OPENMONO_HOST_EXEC_DEFAULT=ask|allow presets it non-interactively.
+            _bridge_policy="${OPENMONO_HOST_EXEC_DEFAULT:-}"
+            if [[ -z "$_bridge_policy" && -t 0 ]]; then
+                echo "  Host commands run as your user. Choose how to confirm them:"
+                echo "    1) Ask every time (recommended) — prompt [y/N] per host command"
+                echo "    2) Allow routine without asking — git/docker/status run immediately"
+                echo "       (deny list + sudo rules + audit log still apply)"
+                echo ""
+                printf "  Host command policy? [1/2] (Default 1=Ask): "
+                read -r _bridge_policy_answer || _bridge_policy_answer=""
+                echo ""
+                case "${_bridge_policy_answer:-}" in
+                    2|[Aa]llow) _bridge_policy="allow" ;;
+                    *) _bridge_policy="ask" ;;
+                esac
+            fi
+            # Fail closed: anything but an explicit "allow" becomes "ask".
+            case "${_bridge_policy:-}" in
+                [Aa]llow) export OPENMONO_HOST_EXEC_DEFAULT="allow" ;;
+                *) export OPENMONO_HOST_EXEC_DEFAULT="ask" ;;
+            esac
+            # Sudo policy preset (never silent): OPENMONO_HOST_SUDO presets
+            # it non-interactively. When unset and on a TTY, ask; fail
+            # closed to the default (ask) otherwise. install-host-bridge.sh
+            # turns this into the --allow-sudo / --no-sudo --init flag.
+            _bridge_sudo="${OPENMONO_HOST_SUDO:-}"
+            if [[ -z "$_bridge_sudo" && -t 0 ]]; then
+                echo "  The agent may need sudo for host commands that require it"
+                echo "  (service restarts, package installs, log reads). Note: Touch ID"
+                echo "  does not satisfy bridge sudo — the typed password is required."
+                echo "  Choose how to handle privilege escalation:"
+                echo "    1) Ask (recommended) — confirm each escalation with [y/N];"
+                echo "       non-interactive sessions fail closed to No"
+                echo "    2) Allow — run escalations without confirming (still audited)"
+                echo "    3) Deny — never escalate; host commands run as your user only"
+                echo ""
+                printf "  Sudo policy? [1/2/3] (Default 1=Ask): "
+                read -r _bridge_sudo_answer || _bridge_sudo_answer=""
+                echo ""
+                case "${_bridge_sudo_answer:-}" in
+                    2|[Aa]llow|[Yy]|[Yy]es) _bridge_sudo="1" ;;
+                    3|[Dd]eny|[Nn]|[Nn]o)  _bridge_sudo="0" ;;
+                    *) _bridge_sudo="" ;;   # default: ask
+                esac
+            fi
+            case "${_bridge_sudo:-}" in
+                1|[Yy]|[Yy]es) export OPENMONO_HOST_SUDO="1" ;;
+                0|[Nn]|[Nn]o)  export OPENMONO_HOST_SUDO="0" ;;
+                *) : ;;   # leave unset → bridge defaults to "ask"
+            esac
+            info "Installing host sub-agent (host-exec default: $OPENMONO_HOST_EXEC_DEFAULT)..."
+            if bash "$SCRIPT_DIR/install-host-bridge.sh"; then
+                ok "Host sub-agent installed"
+                export OPENMONO_HOST_BRIDGE=1
+                case "${OPENMONO_HOST_SUDO:-}" in
+                    1|[Yy]|[Yy]es)
+                        info "Sudo: allow — privilege escalations run without confirming (still audited)." ;;
+                    0|[Nn]|[Nn]o)
+                        info "Sudo: deny — host commands run as your user only; escalation is refused." ;;
+                    *)
+                        info "Sudo: ask — each escalation is confirmed [y/N]; non-interactive sessions fail closed to No." ;;
+                esac
+                info "First run of 'openmono agent --host' confirms the run-as user."
+                info "Change later with: openmono config host.sudo_policy ask|allow|deny"
+                info "Host settings: openmono config host.exec_default / host.run_as / host.timeout_ms"
+            else
+                warn "Host sub-agent install failed — container agent still works; retry: bash scripts/install-host-bridge.sh"
+                export OPENMONO_HOST_BRIDGE=0
+            fi
+            ;;
+    esac
 fi
 
 # ── Shell integration ─────────────────────────────────────────────────────────
