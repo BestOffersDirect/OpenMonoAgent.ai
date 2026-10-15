@@ -132,9 +132,25 @@ strata_curl() {
 # also repairs installs made before that and any manual edits. Idempotent.
 ensure_server_config() {
     local run_script="$1" cfg_path key
-    cfg_path="$(sed -n 's/.*--config[[:space:]]*"\([^"]*\)".*/\1/p' "$run_script" 2>/dev/null | head -1)"
-    [[ -n "$cfg_path" && -f "$cfg_path" ]] || return 0
-    command -v python3 >/dev/null 2>&1 || return 0
+    # Strata's run script quotes EVERY token, the flag included — the line reads
+    #   ... "--engine" "strata" "--config" "/path/strata-x.json" "--port" "8080"
+    # so the path sits between the flag's closing quote and the path's quote.
+    # (Matching `--config[[:space:]]*"` there captured a lone space and silently
+    # did nothing.)
+    cfg_path="$(sed -n 's/.*--config["[:space:]]*"\([^"]*\)".*/\1/p' "$run_script" 2>/dev/null | head -1)"
+    if [[ -z "$cfg_path" || ! -f "$cfg_path" ]]; then
+        # Fall back to the most recently written model config beside Strata.
+        cfg_path="$(ls -t "$STRATA_DIR"/strata-*.json 2>/dev/null | head -1 || true)"
+    fi
+    if [[ -z "$cfg_path" || ! -f "$cfg_path" ]]; then
+        warn "Could not find Strata's model config to set host/api-key — the agent container may not reach it."
+        warn "Set it by hand: add  \"host\": \"$STRATA_HOST\"  to the strata-*.json beside Strata, then restart."
+        return 0
+    fi
+    if ! command -v python3 >/dev/null 2>&1; then
+        warn "python3 not found — skipping the Strata run-config update (host/api-key)."
+        return 0
+    fi
     key="$(strata_api_key)"
     python3 - "$cfg_path" "$STRATA_HOST" "$key" <<'PY' || true
 import json, sys
