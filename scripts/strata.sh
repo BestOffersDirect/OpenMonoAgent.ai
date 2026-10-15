@@ -19,12 +19,13 @@ set -euo pipefail
 #
 # Usage:
 #   strata.sh check            # hardware preflight (no changes besides Strata's own python venv probe)
-#   strata.sh install [--yes] [--family qwen --model IQ2_XS ...]  # clone + ./setup.sh --no-start
+#   strata.sh install [--yes] [--family qwen --model IQ2_XS ...]  # clone + auto-install CUDA 13.x if needed + ./setup.sh --no-start
 #   strata.sh start            # launch run-<model>.sh detached, wait for /health
 #   strata.sh stop             # stop the server process
 #   strata.sh status           # /health + /v1/models summary (for `openmono status`)
 #   strata.sh logs [--tail N]  # tail the server log
 #   strata.sh update           # git pull + ./update.sh (no start)
+#   strata.sh update-cuda      # install/refresh the CUDA 13.x toolkit (sudo)
 #
 # Env overrides:
 #   STRATA_DIR     where Strata lives            (default ~/strata)
@@ -48,6 +49,15 @@ OPENMONO_STATE_DIR="${OPENMONO_STATE_DIR:-$HOME/.openmono}"
 STRATA_ENV_FILE="$OPENMONO_STATE_DIR/strata.env"
 STRATA_PID_FILE="$OPENMONO_STATE_DIR/strata.pid"
 STRATA_LOG="$OPENMONO_STATE_DIR/strata-server.log"
+
+# Strata's engine is built with CUDA 13.0 and refuses to compile against
+# anything older (setup.py: need_cuda = (13, 0)).
+CUDA_MIN="13.0"
+# NVIDIA publishes one CUDA apt repo per Ubuntu codename; newer releases
+# (e.g. 26.04 "resolute") appear there only after NVIDIA ships packages for
+# them, so we fall back to the newest codename that has one, newest first.
+CUDA_REPO_FALLBACKS=(noble jammy focal)
+CUDA_KEYRING_DEB="cuda-keyring_1.1-1_all.deb"
 
 RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[1;33m'
 BLUE=$'\033[38;2;163;255;102m'; NC=$'\033[0m'
@@ -105,18 +115,209 @@ find_run_script() {
     echo "$s"
 }
 
+# ── CUDA toolkit detection ─────────────────────────────────────────────────────
+# Strata's ready-made Linux engine is built with CUDA 13.0; when it must compile
+# the engine itself it hard-requires nvcc >= 13.0 (setup.py: need_cuda = (13, 0)).
+# Strata's own find_nvcc() looks, in order: $STRATA_NVCC, `nvcc` on PATH,
+# $CUDA_HOME/bin/nvcc, $CUDA_PATH/bin/nvcc, /usr/local/cuda*/bin/nvcc,
+# /opt/cuda*/bin/nvcc — and rejects anything older than 13.0.
+#
+# We mirror that search here so `check` / `update` can tell the user exactly what
+# is missing before Strata's 40- minute auto-installer (which only knows
+# Ubuntu 22.04/24.04 and Debian 12/13) gives up on any other distro.
+cuda_toolkit_root() {
+    local cand
+    if [[ -n "${STRATA_NVCC:-}" && -x "$STRATA_NVCC" ]]; then
+        echo "$STRATA_NVCC"; return
+    fi
+    # If a nvcc on PATH is already 13.x, it wins (matches Strata's own order).
+    if command -v nvcc >/dev/null 2>&1; then
+        local pv
+        pv="$(nvcc --version 2>/dev/null | sed -n 's/.*release \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | head -1)"
+        if [[ "$pv" =~ ^13\. ]]; then
+            command -v nvcc; return
+        fi
+        # Stale distro toolkit (e.g. Ubuntu's 12.x nvidia-cuda-toolkit) on PATH:
+        # keep looking for a proper 13.x install below, and only fall back to
+        # the PATH one if nothing better is found.
+        _stale_nvcc="$(command -v nvcc)"
+    fi
+    # NOTE: this script is bash-only (#!/usr/bin/env bash). In bash, an
+    # unmatched glob stays a literal string, so the -x test below is false
+    # and the loop simply moves on — no special handling needed.
+    for cand in \
+        "${CUDA_HOME:-/usr/local/cuda}/bin/nvcc" \
+        "${CUDA_PATH:-/usr/local/cuda}/bin/nvcc" \
+        /usr/local/cuda*/bin/nvcc \
+        /opt/cuda*/bin/nvcc; do
+        [[ -x "$cand" ]] && { echo "$cand"; return; }
+    done
+    if [[ -n "${_stale_nvcc:-}" ]]; then
+        echo "$_stale_nvcc"; return
+    fi
+    return 1
+}
+
+cuda_toolkit_version() {
+    local nvcc
+    nvcc="$(cuda_toolkit_root || true)"
+    [[ -z "$nvcc" ]] && { echo ""; return; }
+    "$nvcc" --version 2>/dev/null | sed -n 's/.*release \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | head -1
+}
+
+cuda_driver_version() {
+    nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1
+}
+
+# Print a one-screen summary of the CUDA toolchain state. Used by `check` and
+# `update` so a failing install says what is wrong instead of "install from
+# nvidia.com".
+print_cuda_status() {
+    local distro_id distro_ver nvcc_path cuda_v drv
+    distro_id="$(sed -n 's/^ID=//p' /etc/os-release 2>/dev/null | tr -d '"' | head -1)"
+    distro_ver="$(sed -n 's/^VERSION_ID=//p' /etc/os-release 2>/dev/null | tr -d '"' | head -1)"
+    nvcc_path="$(cuda_toolkit_root || true)"
+    cuda_v="$(cuda_toolkit_version)"
+    drv="$(cuda_driver_version)"
+    echo "  distro:        ${distro_id:-?} ${distro_ver:-?}"
+    echo "  nvcc path:     ${nvcc_path:-<not found>}"
+    echo "  CUDA toolkit:  ${cuda_v:-<none>}"
+    echo "  GPU driver:    ${drv:-<nvidia-smi not available>}"
+    if [[ -z "$cuda_v" ]]; then
+        warn "No CUDA toolkit found. Strata needs CUDA >= ${CUDA_MIN} to compile its engine on Linux."
+        warn "Run 'bash scripts/strata.sh update-cuda' to install it automatically (sudo required)."
+    elif [[ ! "$cuda_v" =~ ^13\. ]]; then
+        warn "CUDA $cuda_v is older than Strata's minimum (${CUDA_MIN})."
+        warn "Run 'bash scripts/strata.sh update-cuda' to install CUDA 13.x automatically (sudo required)."
+    else
+        ok "CUDA $cuda_v is OK for Strata."
+    fi
+    if [[ -n "$drv" ]]; then
+        local drv_major="${drv%%.*}"
+        if [[ "$drv_major" =~ ^[0-9]+$ ]] && (( drv_major < 580 )); then
+            warn "GPU driver $drv is older than Strata's minimum (580 for CUDA 13). Update the driver and reboot."
+        fi
+    fi
+}
+
 cmd_check() {
     ensure_clone
+    info "CUDA toolchain:"
+    print_cuda_status
+    echo ""
     info "Running Strata hardware preflight (./setup.sh --check) ..."
     (cd "$STRATA_DIR" && ./setup.sh --check)
 }
 
+# Install the CUDA 13.x toolkit via NVIDIA's official apt repo (same keyring
+# flow Strata's own installer uses, but with a codename fallback so brand-new
+# Ubuntu releases — e.g. 26.04, where NVIDIA has no repo yet — still work by
+# using the newest published one). Returns 0 when a usable 13.x nvcc exists.
+install_cuda_toolkit() {
+    local id ver cn arch repo_url cur
+    id="$(sed -n 's/^ID=//p' /etc/os-release 2>/dev/null | tr -d '"')"
+    ver="$(sed -n 's/^VERSION_ID=//p' /etc/os-release 2>/dev/null | tr -d '"')"
+    cn="$(. /etc/os-release 2>/dev/null && echo "${UBUNTU_CODENAME:-}")"
+    if [[ -z "$cn" && -f /etc/upstream-release/lsb-release ]]; then
+        cn="$(. /etc/upstream-release/lsb-release 2>/dev/null && echo "${DISTRIB_CODENAME:-}")"
+    fi
+    [[ -z "$cn" ]] && cn="$(. /etc/os-release 2>/dev/null && echo "${VERSION_CODENAME:-}")"
+
+    if [[ "$id" != "ubuntu" ]] && ! printf '%s' "${ID_LIKE:-}" | grep -qw ubuntu; then
+        err "Automatic CUDA install supports Ubuntu and Ubuntu derivatives."
+        err "On this distro ($id $ver) install it yourself:"
+        err "  https://developer.nvidia.com/cuda-downloads   (needs CUDA 13.x)"
+        return 1
+    fi
+    arch="$(dpkg --print-architecture 2>/dev/null || echo x86_64)"
+    repo_url="https://developer.download.nvidia.com/compute/cuda/repos/ubuntu${cn}/${arch}"
+    if ! curl -fsSL --max-time 20 "${repo_url}/${CUDA_KEYRING_DEB}" -o /dev/null 2>&1; then
+        local t
+        for t in "${CUDA_REPO_FALLBACKS[@]}"; do
+            if curl -fsSL --max-time 20 "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu${t}/${arch}/${CUDA_KEYRING_DEB}" -o /dev/null 2>&1; then
+                warn "NVIDIA has no CUDA repo for Ubuntu ${ver} ('${cn}') yet — using the '${t}' repo (packages are compatible)."
+                repo_url="https://developer.download.nvidia.com/compute/cuda/repos/ubuntu${t}/${arch}"
+                break
+            fi
+        done
+        [[ "$repo_url" == *"${cn}"* ]] && { err "Could not reach any NVIDIA CUDA apt repo."; return 1; }
+    fi
+
+    info "Adding NVIDIA CUDA apt repo (ubuntu$(basename "$(dirname "$repo_url")") / ${arch}) ..."
+    if ! curl -fsSL "${repo_url}/${CUDA_KEYRING_DEB}" | sudo dpkg -i; then
+        err "Failed to install the CUDA keyring package."
+        return 1
+    fi
+    sudo apt-get update
+    info "Installing cuda-toolkit-13-0 (about 4 GB; sudo may ask for your password) ..."
+    if ! sudo apt-get install -y cuda-toolkit-13-0; then
+        err "apt install cuda-toolkit-13-0 failed."
+        return 1
+    fi
+
+    # Prefer the NVIDIA 13.0 toolkit over any stale distro nvcc (e.g. the
+    # 12.x from Ubuntu's own nvidia-cuda-toolkit) by putting it first on PATH
+    # for this session and for future shells.
+    local c13
+    c13="$(ls -d /usr/local/cuda-13.0 /usr/local/cuda-13* 2>/dev/null | head -1 || true)"
+    [[ -n "$c13" ]] || c13="$(readlink -f /usr/local/cuda 2>/dev/null || true)"
+    if [[ -n "$c13" && -x "$c13/bin/nvcc" ]]; then
+        export PATH="$c13/bin:$PATH"
+        local rc
+        for rc in "$HOME/.bashrc" "$HOME/.profile" "$HOME/.zshrc"; do
+            if [[ -f "$rc" ]] && ! grep -q "local/cuda" "$rc" 2>/dev/null; then
+                {
+                    echo ""
+                    echo "# CUDA toolkit (added by openmono strata.sh)"
+                    echo 'export PATH="/usr/local/cuda/bin:$PATH"'
+                } >> "$rc"
+                info "Added /usr/local/cuda/bin to PATH in $(basename "$rc")"
+            fi
+        done
+    fi
+
+    cur="$(cuda_toolkit_version)"
+    if [[ "$cur" =~ ^13\. ]]; then
+        ok "CUDA $cur installed at $(cuda_toolkit_root) (Strata minimum: ${CUDA_MIN})."
+        return 0
+    else
+        err "Install finished but the active nvcc reports '${cur:-unknown}', not 13.x."
+        err "Run: export PATH=/usr/local/cuda/bin:\$PATH   and check: nvcc --version"
+        return 1
+    fi
+}
+
+# Install (or refresh) the CUDA 13.x toolkit. Safe to run from `openmono setup`
+# — it is a no-op when a 13.x toolkit is already active.
+cmd_update_cuda() {
+    local cur
+    cur="$(cuda_toolkit_version)"
+    info "Current CUDA toolkit: ${cur:-<none>}"
+    if [[ "$cur" =~ ^13\. ]]; then
+        info "Refreshing CUDA 13.x packages (sudo may ask for your password) ..."
+        sudo apt-get update
+        sudo apt-get install --only-upgrade -y cuda-toolkit-13-0 || true
+        ok "CUDA toolkit refreshed to $(cuda_toolkit_version)."
+        return 0
+    fi
+    info "Installing CUDA 13.x toolkit (Strata needs >= ${CUDA_MIN}) ..."
+    install_cuda_toolkit
+}
+
 cmd_install() {
-    # Extra flags after `install` are forwarded to Strata's setup.sh verbatim,
+    # `--yes` is consumed here (added to setup args); everything else after
+    # `install` is forwarded to Strata's setup.sh verbatim,
     # e.g.: strata.sh install --yes --family coder
     ensure_clone
-    local extra=("$@")
+    local extra=()
     local setup_args=()
+    local arg
+    for arg in "$@"; do
+        case "$arg" in
+            --yes|-y) setup_args+=(--yes) ;;
+            *) extra+=("$arg") ;;
+        esac
+    done
     [[ "${STRATA_YES:-0}" == "1" ]] && setup_args+=(--yes)
     [[ -n "$STRATA_FAMILY" ]] && setup_args+=(--family "$STRATA_FAMILY")
     [[ -n "$STRATA_MODEL" ]] && setup_args+=(--model "$STRATA_MODEL")
@@ -125,6 +326,35 @@ cmd_install() {
     [[ "$STRATA_PORT" != "8080" ]] && setup_args+=(--port "$STRATA_PORT")
     [[ -n "$STRATA_DATA_DIR" ]] && setup_args+=(--data-dir "$STRATA_DATA_DIR")
     setup_args+=(--no-start)
+    info "CUDA toolchain (Strata needs >= ${CUDA_MIN} to compile the engine on Linux):"
+    print_cuda_status
+    # Auto-fix: if there is no usable 13.x toolkit, install one NOW instead of
+    # letting Strata's build burn ~40 minutes only to fail at the end.
+    # (Strata's own auto-installer only knows ubuntu2204/2404 + debian12/13;
+    # on any other Ubuntu this is the only working path.)
+    local cuda_v_now
+    cuda_v_now="$(cuda_toolkit_version)"
+    if [[ ! "$cuda_v_now" =~ ^13\. ]]; then
+        echo ""
+        if [[ "${STRATA_YES:-0}" == "1" || "${setup_args[*]:-}" == *--yes* || "${OPENMONO_ASSUME_YES:-0}" == "1" || ! -t 0 ]]; then
+            info "CUDA ${cuda_v_now:-none} does not satisfy the ${CUDA_MIN} requirement — installing it automatically (non-interactive mode) ..."
+        else
+            printf "  CUDA ${cuda_v_now:-none} does not satisfy the ${CUDA_MIN} requirement. Install CUDA 13.x now? [Y/n] "
+            local _cuda_answer
+            read -r _cuda_answer || _cuda_answer=""
+            case "${_cuda_answer:-Y}" in
+                [Nn]*) err "Aborted — run 'bash scripts/strata.sh update-cuda' later, then retry the install."; exit 1 ;;
+            esac
+        fi
+        if ! install_cuda_toolkit; then
+            err "Automatic CUDA install failed. Manual fallback: https://developer.nvidia.com/cuda-downloads (CUDA 13.x), then retry."
+            exit 1
+        fi
+        echo ""
+        info "CUDA toolchain after install:"
+        print_cuda_status
+        echo ""
+    fi
     info "Installing Strata model (this downloads ~70 GB on first run; resumable) ..."
     info "  setup args: ${setup_args[*]} ${extra[*]}"
     info "  Strata will prompt unless --yes was passed (non-interactive installs add it)."
@@ -264,13 +494,14 @@ cmd_update() {
 }
 
 case "${1:-help}" in
-    check)   shift; cmd_check "$@" ;;
-    install) shift; cmd_install "$@" ;;
-    start)   shift; cmd_start "$@" ;;
-    stop)    shift; cmd_stop "$@" ;;
-    status)  shift; cmd_status "$@" ;;
-    logs)    shift; cmd_logs "$@" ;;
-    update)  shift; cmd_update "$@" ;;
+    check)         shift; cmd_check "$@" ;;
+    install)       shift; cmd_install "$@" ;;
+    start)         shift; cmd_start "$@" ;;
+    stop)          shift; cmd_stop "$@" ;;
+    status)        shift; cmd_status "$@" ;;
+    logs)          shift; cmd_logs "$@" ;;
+    update)        shift; cmd_update "$@" ;;
+    update-cuda)   shift; cmd_update_cuda "$@" ;;
     help|--help|-h|*)
         sed -n '2,/^# ─*$/p' "$0" | sed 's/^# \?//'
         ;;
