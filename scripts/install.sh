@@ -506,6 +506,11 @@ fi
 # Strata backend: no llama-server override needed — Strata auto-detects the GPU
 # (NVIDIA CUDA / AMD HIP) during its own setup. We only record the backend.
 
+# Defined unconditionally: every backend's start step below reads/writes it
+# (Strata and llama alike), so it must not live inside a backend-specific
+# branch — that caused "DOCKER_ENV_FILE: unbound variable" on strata installs.
+DOCKER_ENV_FILE="$INSTALL_DIR/docker/.env"
+
 if [ "$OPENMONO_ROLE" != "agent" ] && [ "$INFERENCE_BACKEND" = "strata" ]; then
     next_step "Recording Strata backend configuration"
 
@@ -514,6 +519,14 @@ if [ "$OPENMONO_ROLE" != "agent" ] && [ "$INFERENCE_BACKEND" = "strata" ]; then
         info "Removing stale llama-server override ($OVERRIDE_FILE) — Strata serves on the host."
         rm -f "$OVERRIDE_FILE"
     fi
+    # Record the backend + port so openmono, healthcheck, and the tunnel script
+    # route to Strata instead of llama.
+    if [ -f "$DOCKER_ENV_FILE" ]; then
+        grep -v -E "^INFERENCE_BACKEND=|^STRATA_PORT=" "$DOCKER_ENV_FILE" > "${DOCKER_ENV_FILE}.tmp" || true
+        mv "${DOCKER_ENV_FILE}.tmp" "$DOCKER_ENV_FILE"
+    fi
+    printf "INFERENCE_BACKEND=strata\nSTRATA_PORT=%s\n" "${STRATA_PORT:-8080}" >> "$DOCKER_ENV_FILE"
+    detail "Persisted INFERENCE_BACKEND=strata STRATA_PORT=${STRATA_PORT:-8080} to $DOCKER_ENV_FILE"
     detail "Strata endpoint: http://127.0.0.1:${STRATA_PORT:-8080}/v1 (host-native, OpenAI-compatible)"
     detail "Caddy gateway (optional) can front it via docker/docker-compose.strata.yml"
 fi
@@ -798,17 +811,8 @@ EOF
     fi
 fi
 
-DOCKER_ENV_FILE="$INSTALL_DIR/docker/.env"
-if [ "$INFERENCE_BACKEND" = "strata" ] && [ "$OPENMONO_ROLE" != "agent" ]; then
-    # Strata serves host-native; record the backend + port so openmono,
-    # healthcheck, and the tunnel script route to Strata instead of llama.
-    if [ -f "$DOCKER_ENV_FILE" ]; then
-        grep -v -E "^INFERENCE_BACKEND=|^STRATA_PORT=" "$DOCKER_ENV_FILE" > "${DOCKER_ENV_FILE}.tmp" || true
-        mv "${DOCKER_ENV_FILE}.tmp" "$DOCKER_ENV_FILE"
-    fi
-    printf "INFERENCE_BACKEND=strata\nSTRATA_PORT=%s\n" "${STRATA_PORT:-8080}" >> "$DOCKER_ENV_FILE"
-    detail "Persisted INFERENCE_BACKEND=strata STRATA_PORT=${STRATA_PORT:-8080} to $DOCKER_ENV_FILE"
-elif [ "$INFERENCE_BACKEND" != "strata" ]; then
+# DOCKER_ENV_FILE is defined before Step 6's branch. This block only runs for
+# the non-Strata (llama) backend, so it just records the model selection.
 if [ -f "$DOCKER_ENV_FILE" ]; then
     grep -v -E "^MODEL_NAME=|^MODEL_ALIAS=|^MODEL_MMPROJ=|^OPENMONO_VISION_ENABLED=|^CTX_SIZE=" "$DOCKER_ENV_FILE" > "${DOCKER_ENV_FILE}.tmp" || true
     mv "${DOCKER_ENV_FILE}.tmp" "$DOCKER_ENV_FILE"
@@ -820,7 +824,6 @@ if [ -n "${MODEL_MMPROJ:-}" ]; then
 else
     printf "OPENMONO_VISION_ENABLED=0\n" >> "$DOCKER_ENV_FILE"
     detail "Persisted MODEL_NAME=$MODEL_NAME (vision disabled — no mmproj) to $DOCKER_ENV_FILE"
-fi
 fi
 
 fi  # End of Step 6 (skipped on agent role)
