@@ -232,7 +232,7 @@ try
     if (string.IsNullOrWhiteSpace(endpointHint))
         endpointHint = "llm endpoint (see ~/.openmono/settings.json)";
     var sudoMode = identity.Sudo.ToString().ToLowerInvariant();
-    var statusLine = $"host session · {workDir} · run as {identity.RunAsUser} · sudo={sudoMode} · {(buildMode ? "BUILD" : "PLAN")} · {endpointHint}";
+    var statusLine = $"host session · {workDir} · run as {identity.RunAsUser} · sudo={sudoMode} · {(buildMode ? "BUILD" : "PLAN")} · HOST:ON · {endpointHint}";
     if (options.Verbose)
     {
         Console.Error.WriteLine(
@@ -246,7 +246,7 @@ try
     TuiFrontend? tui = null;
     if (useTui)
     {
-        tui = new TuiFrontend(options.Model ?? "");
+        tui = new TuiFrontend(options.Model ?? "", workDir);
         tui.BuildMode = buildMode;
         ui = new TuiUi(tui);
     }
@@ -407,6 +407,12 @@ static int RunRepl(Bridge bridge, string baseUrl, string sessionId, string pream
             return 0;
         if (string.IsNullOrWhiteSpace(line))
             continue;
+        if (line.Trim() is "/host" or "/host status")
+        {
+            Console.Error.WriteLine("[bridge] HOST:ON — whole-machine session (HOST_EXEC audited + policy-gated).");
+            Console.Error.WriteLine("           Sandboxed instead: exit and run: openmono agent");
+            continue;
+        }
         if (TuiInputFilter.IsLauncherEcho(line))
             continue; // stale shell line (e.g. our own launch) — never a task.
         var message = first && preamble.Length > 0 ? preamble + line : line;
@@ -452,6 +458,16 @@ static async Task<int> RunTuiAsync(
             if (trimmed is "/clear")
             {
                 tui.ClearConversation();
+                continue;
+            }
+            if (trimmed is "/host" or "/host status" or "/host on")
+            {
+                tui.Info("HOST:ON — whole-machine session (HOST_EXEC audited + policy-gated). Sandboxed instead: /quit, then openmono agent.");
+                continue;
+            }
+            if (trimmed is "/host off")
+            {
+                tui.Info("To return to sandboxed mode: /quit, then run: openmono agent");
                 continue;
             }
             if (string.IsNullOrWhiteSpace(line))

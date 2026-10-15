@@ -85,10 +85,16 @@ internal sealed class TuiFrontend
     private readonly SessionState _session;
     private bool _responseOpen;
 
-    public TuiFrontend(string model)
+    public TuiFrontend(string model, string workDir)
     {
         _config = new AppConfig();
+        // The @-menu searches config.WorkingDirectory (AnsiSuggestionOverlay):
+        // point it at the bridge workdir explicitly instead of inheriting
+        // whatever cwd/env the process happened to start with.
+        if (!string.IsNullOrWhiteSpace(workDir))
+            _config.WorkingDirectory = workDir;
         _session = new SessionState { Model = model ?? "" };
+        _session.Meta.HostEnabled = true;
         _tui = new AnsiTuiRenderer(_config, _session, new BridgeTerminal());
     }
 

@@ -7,6 +7,7 @@
     <Description>Bare-metal operator sub-agent: drives the in-container OpenMono agent over ACP and executes host work (shell, git, files, installs) on the server.</Description>
   </PropertyGroup>
   <ItemGroup>
+    <ProjectReference Include="..\OpenMono.Core\OpenMono.Core.csproj" />
     <ProjectReference Include="..\OpenMono.Cli\OpenMono.Cli.csproj" />
   </ItemGroup>
   <ItemGroup>

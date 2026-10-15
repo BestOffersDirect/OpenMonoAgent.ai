@@ -1844,12 +1844,15 @@ internal sealed partial class AnsiPainter(AppConfig config, SessionState session
             var modeIndicator = session.Meta.PlanMode
                 ? $"{Fk}[{R}{Fy}PLAN{R}{Fk}]{R}{BgStatus} "
                 : $"{Fk}[{R}{Fg}BUILD{R}{Fk}]{R}{BgStatus} ";
+            var hostIndicator = session.Meta.HostEnabled
+                ? $"{Fk}[{R}{Fr}HOST:ON{R}{Fk}]{R}{BgStatus} "
+                : $"{Fk}[HOST:OFF]{R}{BgStatus} ";
             var thinkIndicator = !session.Meta.ThinkingEnabled
                 ? ""
                 : session.Meta.ThinkingLevel is { Length: > 0 } lvl && lvl != "off"
                     ? $"{Fk}[{R}{Fc}THINK:{R}{Fw}{lvl.ToUpperInvariant()}{R}{Fk}]{R}{BgStatus} "
                     : $"{Fk}[{R}{Fc}THINK{R}{Fk}]{R}{BgStatus} ";
-            mid = $"{modeIndicator}{thinkIndicator}{scrollIndicator}{cancelHint}";
+            mid = $"{hostIndicator}{modeIndicator}{thinkIndicator}{scrollIndicator}{cancelHint}";
         }
         var right = $"{Fk}ctrl+c{R}{BgStatus} {Fw}quit{R}{BgStatus}   {Fk}ctrl+p{R}{BgStatus} {Fw}commands{R}{BgStatus} ";
         var visM  = VisLen(mid);
