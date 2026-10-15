@@ -11,8 +11,16 @@ set -euo pipefail
 # Options (via env or openmono CLI flags):
 #   OPENMONO_ROLE         Install role: full (default), inference, or agent
 #                         full      = both sides on one machine (today's behaviour)
-#                         inference = GPU box only: model + llama-server, no agent tooling
+#                         inference = GPU box only: model + inference server, no agent tooling
 #                         agent     = laptop only: agent + code-review-graph, no model
+#   OPENMONO_INFERENCE_BACKEND
+#                         Inference engine on Linux: strata (default) or llama.
+#                         strata = Strata (Qwen3.8-Flash-Next, OpenAI-compatible
+#                                  :8080/v1) via scripts/strata.sh — no vendoring,
+#                                  see docs/STRATA.md. llama.cpp images stay
+#                                  available via OPENMONO_INFERENCE_BACKEND=llama.
+#                         llama  = legacy bundled llama.cpp Docker path.
+#                         (macOS Apple Silicon always uses its native path.)
 #   OPENMONO_GPU=1        Force GPU mode (writes GPU docker-compose override)
 #   OPENMONO_CPU=1        Force CPU mode (removes any GPU override)
 #   OPENMONO_VERBOSE=1    Show detailed command output
@@ -199,6 +207,26 @@ case "$OPENMONO_ROLE" in
     *) echo "ERROR: Invalid OPENMONO_ROLE='$OPENMONO_ROLE' (expected: full, inference, agent)" >&2; exit 1 ;;
 esac
 
+# ── Inference backend (Linux only; macOS uses its native path) ───────────────
+# strata = Strata/Qwen3.8-Flash-Next via scripts/strata.sh (default on Linux).
+# llama  = legacy bundled llama.cpp Docker path (still supported).
+# Agent role needs no local engine, so the backend is informational there.
+if [ "$OPENMONO_ROLE" != "agent" ]; then
+    INFERENCE_BACKEND="${OPENMONO_INFERENCE_BACKEND:-strata}"
+else
+    INFERENCE_BACKEND="${OPENMONO_INFERENCE_BACKEND:-none}"
+fi
+case "$INFERENCE_BACKEND" in
+    strata|llama|none) ;;
+    *) echo "ERROR: Invalid OPENMONO_INFERENCE_BACKEND='$INFERENCE_BACKEND' (expected: strata, llama)" >&2; exit 1 ;;
+esac
+if [ "$INFERENCE_BACKEND" = "strata" ]; then
+    info "Inference backend: Strata (Qwen3.8-Flash-Next, OpenAI-compatible :8080/v1)"
+    info "Docs: docs/STRATA.md — Strata is MIT-licensed upstream (github.com/Niko1221/Strata)"
+else
+    info "Inference backend: llama.cpp (legacy Docker path)"
+fi
+
 # Step counts vary by role. We keep numbering stable per-role rather than
 # printing "skipped" lines — cleaner UX.
 case "$OPENMONO_ROLE" in
@@ -323,7 +351,7 @@ MODEL_ALIAS=""
 MODEL_MMPROJ=""
 MODEL_MMPROJ_URL=""
 IS_BONSAI=0
-if [ "$OPENMONO_ROLE" != "agent" ]; then
+if [ "$OPENMONO_ROLE" != "agent" ] && [ "$INFERENCE_BACKEND" != "strata" ]; then
     if [ "${GPU_MODE:-0}" = "1" ]; then
         if command -v nvidia-smi &>/dev/null; then
             _VRAM_MB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | awk 'NR==1{print $1}')
@@ -435,8 +463,24 @@ fi
 cd "$INSTALL_DIR"
 
 # ── Step 4: Download model (inference + full only) ───────────────────────────
+# Strata backend: model fetch is owned by Strata's own installer
+# (scripts/strata.sh install → ./setup.sh), so there is nothing to do here.
 
-if [ "$OPENMONO_ROLE" != "agent" ]; then
+if [ "$INFERENCE_BACKEND" = "strata" ] && [ "$OPENMONO_ROLE" != "agent" ]; then
+    next_step "Strata model setup (delegated to Strata installer)"
+    info "Strata downloads its own Qwen3.8-Flash-Next weights (~70 GB, resumable)."
+    _strata_flags=()
+    if [[ ! -t 0 ]]; then
+        _strata_flags+=(--yes)
+        info "Non-interactive shell — passing --yes (recommended size for this box)."
+    fi
+    if ! STRATA_YES="$([[ ! -t 0 ]] && echo 1 || echo 0)" bash "$SCRIPT_DIR/strata.sh" install "${_strata_flags[@]}"; then
+        die "Strata install failed — retry: bash scripts/strata.sh install (see docs/STRATA.md). Strata's own output: ~/.openmono/strata-setup.log"
+    fi
+    ok "Strata model ready (server starts in the final step)"
+fi
+
+if [ "$OPENMONO_ROLE" != "agent" ] && [ "$INFERENCE_BACKEND" != "strata" ]; then
     MODEL_DIR="$INSTALL_DIR/models"
 
     next_step "Downloading $_MODEL_LABEL"
@@ -573,8 +617,35 @@ if [ "$OPENMONO_ROLE" != "inference" ]; then
 fi
 
 # ── Step 6: Configure GPU/CPU mode (inference + full only) ───────────────────
+# Strata backend: no llama-server override needed — Strata auto-detects the GPU
+# (NVIDIA CUDA / AMD HIP) during its own setup. We only record the backend.
 
-if [ "$OPENMONO_ROLE" != "agent" ]; then
+# Defined unconditionally: every backend's start step below reads/writes it
+# (Strata and llama alike), so it must not live inside a backend-specific
+# branch — that caused "DOCKER_ENV_FILE: unbound variable" on strata installs.
+DOCKER_ENV_FILE="$INSTALL_DIR/docker/.env"
+
+if [ "$OPENMONO_ROLE" != "agent" ] && [ "$INFERENCE_BACKEND" = "strata" ]; then
+    next_step "Recording Strata backend configuration"
+
+    OVERRIDE_FILE="$INSTALL_DIR/docker/docker-compose.override.yml"
+    if [ -f "$OVERRIDE_FILE" ]; then
+        info "Removing stale llama-server override ($OVERRIDE_FILE) — Strata serves on the host."
+        rm -f "$OVERRIDE_FILE"
+    fi
+    # Record the backend + port so openmono, healthcheck, and the tunnel script
+    # route to Strata instead of llama.
+    if [ -f "$DOCKER_ENV_FILE" ]; then
+        grep -v -E "^INFERENCE_BACKEND=|^STRATA_PORT=" "$DOCKER_ENV_FILE" > "${DOCKER_ENV_FILE}.tmp" || true
+        mv "${DOCKER_ENV_FILE}.tmp" "$DOCKER_ENV_FILE"
+    fi
+    printf "INFERENCE_BACKEND=strata\nSTRATA_PORT=%s\n" "${STRATA_PORT:-8080}" >> "$DOCKER_ENV_FILE"
+    detail "Persisted INFERENCE_BACKEND=strata STRATA_PORT=${STRATA_PORT:-8080} to $DOCKER_ENV_FILE"
+    detail "Strata endpoint: http://127.0.0.1:${STRATA_PORT:-8080}/v1 (host-native, OpenAI-compatible)"
+    detail "Caddy gateway (optional) can front it via docker/docker-compose.strata.yml"
+fi
+
+if [ "$OPENMONO_ROLE" != "agent" ] && [ "$INFERENCE_BACKEND" != "strata" ]; then
     next_step "Configuring GPU / CPU mode"
 
     if [ "${GPU_MODE:-0}" = "1" ]; then
@@ -901,7 +972,8 @@ EOF
     fi
 fi
 
-DOCKER_ENV_FILE="$INSTALL_DIR/docker/.env"
+# DOCKER_ENV_FILE is defined before Step 6's branch. This block only runs for
+# the non-Strata (llama) backend, so it just records the model selection.
 if [ -f "$DOCKER_ENV_FILE" ]; then
     grep -v -E "^MODEL_NAME=|^MODEL_ALIAS=|^MODEL_MMPROJ=|^OPENMONO_VISION_ENABLED=|^CTX_SIZE=" "$DOCKER_ENV_FILE" > "${DOCKER_ENV_FILE}.tmp" || true
     mv "${DOCKER_ENV_FILE}.tmp" "$DOCKER_ENV_FILE"
@@ -926,8 +998,9 @@ cd "$INSTALL_DIR/docker"
 info "Stopping any running containers..."
 run docker compose down || true
 
-# Only build the images this role actually needs.
-if [ "$OPENMONO_ROLE" != "agent" ]; then
+# Only build the images this role actually needs. Skip the llama-server build for
+# the agent role, the host-native Strata backend, and Bonsai (prebuilt Prism image).
+if [ "$OPENMONO_ROLE" != "agent" ] && [ "$INFERENCE_BACKEND" != "strata" ]; then
     if [ "${IS_BONSAI:-0}" = "1" ]; then
         _PRISM_BACKEND="$(prism_backend)"
         info "Bonsai selected — using prebuilt Prism image from Docker Hub (no llama-server build)"
@@ -952,13 +1025,74 @@ if [ "$OPENMONO_ROLE" != "inference" ]; then
     if ! run docker compose build agent; then
         die "agent build failed"
     fi
+
+    # Optional add-on (agent roles only — never inference): the bare-metal host
+    # sub-agent. It drives this box's in-container agent over ACP and executes
+    # host commands (pull, build, install, redeploy, troubleshoot). Default is
+    # No so a normal coding install is unchanged. Deliberately outside the
+    # step counter so TOTAL_STEPS stays valid for every role.
+    case "$OPENMONO_ROLE" in
+        full|agent)
+            _bridge_answer="${OPENMONO_HOST_BRIDGE:-}"
+            if [[ -z "$_bridge_answer" ]]; then
+                if [[ ! -t 0 ]]; then
+                    info "Skipping host sub-agent (non-interactive). Add it later with:"
+                    info "  OPENMONO_HOST_BRIDGE=1 bash scripts/install.sh  # or: bash scripts/install-host-bridge.sh"
+                else
+                    echo ""
+                    echo "  ── Optional: bare-metal server sub-agent ─────────────────"
+                    echo "  A .NET helper that talks to this box's in-container agent over"
+                    echo "  ACP and runs host commands (pull, build, install, redeploy,"
+                    echo "  troubleshoot). For server boxes; coding installs don't need it."
+                    echo "  (Its installer then asks which user to run as and whether"
+                    echo "  sudo is allowed — sudo stays off unless you say yes.)"
+                    echo ""
+                    printf "  Install the host sub-agent? [y/N] "
+                    read -r _bridge_answer || _bridge_answer=""
+                    echo ""
+                fi
+            fi
+            case "${_bridge_answer:-}" in
+                1|[Yy]|[Yy]es)
+                    info "Installing host sub-agent..."
+                    if bash "$SCRIPT_DIR/install-host-bridge.sh"; then
+                        ok "Host sub-agent installed"
+                        export OPENMONO_HOST_BRIDGE=1
+                    else
+                        warn "Host sub-agent install failed — container agent still works; retry: bash scripts/install-host-bridge.sh"
+                        export OPENMONO_HOST_BRIDGE=0
+                    fi
+                    ;;
+                *)
+                    export OPENMONO_HOST_BRIDGE=0
+                    ;;
+            esac
+            ;;
+    esac
 fi
 
 ok "Docker images built"
 
-# ── Step 8: Start llama-server (inference + full only) ───────────────────────
+# ── Step 8: Start inference backend (inference + full only) ──────────────────
 
-if [ "$OPENMONO_ROLE" != "agent" ]; then
+if [ "$OPENMONO_ROLE" != "agent" ] && [ "$INFERENCE_BACKEND" = "strata" ]; then
+    next_step "Starting Strata inference server"
+
+    export STRATA_PORT="${STRATA_PORT:-8080}"
+    if [ -f "$DOCKER_ENV_FILE" ]; then
+        grep -v -E "^STRATA_PORT=" "$DOCKER_ENV_FILE" > "${DOCKER_ENV_FILE}.tmp" || true
+        mv "${DOCKER_ENV_FILE}.tmp" "$DOCKER_ENV_FILE"
+    fi
+    echo "STRATA_PORT=${STRATA_PORT}" >> "$DOCKER_ENV_FILE"
+    detail "Persisted STRATA_PORT=${STRATA_PORT} to $DOCKER_ENV_FILE"
+
+    if ! bash "$SCRIPT_DIR/strata.sh" start; then
+        warn "Strata did not become healthy yet — first boot can take several minutes."
+        warn "Check: bash scripts/strata.sh logs   (or: openmono logs)"
+    fi
+fi
+
+if [ "$OPENMONO_ROLE" != "agent" ] && [ "$INFERENCE_BACKEND" != "strata" ]; then
     next_step "Starting llama-server"
 
     LLAMA_PORT="${LLAMA_PORT:-7474}"
@@ -1047,6 +1181,9 @@ export INSTALL_DIR="$INSTALL_DIR"
 export LLAMA_PORT="${LLAMA_PORT:-7474}"
 export GPU_MODE="${GPU_MODE:-0}"
 export OPENMONO_ROLE="$OPENMONO_ROLE"
+export OPENMONO_INFERENCE_BACKEND="${INFERENCE_BACKEND:-strata}"
+export STRATA_PORT="${STRATA_PORT:-8080}"
+export OPENMONO_HOST_BRIDGE="${OPENMONO_HOST_BRIDGE:-0}"
 export MODEL_NAME="${MODEL_NAME:-}"
 export MODEL_ACCURACY="${MODEL_ACCURACY:-standard}"
 ENVEOF

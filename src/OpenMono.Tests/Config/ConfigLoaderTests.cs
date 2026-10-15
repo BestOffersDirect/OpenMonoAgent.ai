@@ -126,6 +126,27 @@ public class ConfigLoaderTests : IDisposable
         }
     }
 
+    [Theory]
+    [InlineData("http://localhost:8080/v1", "http://localhost:8080")] // Strata install writes /v1
+    [InlineData("http://localhost:8080/v1/", "http://localhost:8080")]
+    [InlineData("http://localhost:8080", "http://localhost:8080")]   // llama: already root, unchanged
+    [InlineData("http://localhost:7474", "http://localhost:7474")]
+    [InlineData("https://api.openai.com", "https://api.openai.com")]
+    public void Load_StripsTrailingV1_SoClientsDontDoubleIt(string input, string expected)
+    {
+        Environment.SetEnvironmentVariable("OPENMONO_ENDPOINT", input);
+        try
+        {
+            var config = ConfigLoader.Load(_tempDir);
+            // Callers append "/v1/...", so the stored base must not carry /v1.
+            config.Llm.Endpoint.Should().Be(expected);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("OPENMONO_ENDPOINT", null);
+        }
+    }
+
     [Fact]
     public void Load_MalformedConfig_WarnsAndContinues()
     {

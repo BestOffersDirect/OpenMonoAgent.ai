@@ -1,5 +1,12 @@
 # Setup & Commands
 
+> [!NOTE]
+> **Linux inference runs on Strata (Qwen3.8-Flash-Next).**
+> Fresh Linux installs use the Strata backend automatically — Strata serves an
+> OpenAI-compatible API at `http://127.0.0.1:8080/v1`. See [STRATA.md](STRATA.md)
+> for requirements, install/start/stop, dual-box relay, and switching back to
+> the legacy llama.cpp path (`OPENMONO_INFERENCE_BACKEND=llama`).
+
 ## Requirements
 
 | | |
@@ -258,6 +265,11 @@ Intel Macs have no Metal GPU and no unified memory, so native inference is unsup
 ## Dual-box setup
 
 Run the model on a dedicated inference box and connect from your laptop over the internet. No port forwarding required — the tunnel is established outbound from the inference box.
+
+> On the same LAN/VPN, or running the agent on a server box? See
+> [DEPLOYMENT-MODES.md](DEPLOYMENT-MODES.md) — it covers single-box mode, the
+> direct-LAN split (no relay account), and the server-ops runbook (pull a repo,
+> deploy, troubleshoot a backend).
 
 ![Dual-box setup diagram](assets/dual-box-server.png)
 

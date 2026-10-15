@@ -125,8 +125,31 @@ _env_set() {
     chmod 0600 "$env_file"
 }
 
+# ── Inference backend selection (Linux) ─────────────────────────────────────
+# Strata (Qwen3.8-Flash-Next, host-native :8080/v1) is the default for fresh
+# installs on this branch; pre-existing installs without the marker keep the
+# legacy llama.cpp Docker path. macOS Apple Silicon always uses NATIVE_INFERENCE.
+_inference_backend() {
+    local b
+    b="$(_env_get INFERENCE_BACKEND)"
+    if [[ "$b" == "strata" || "$b" == "llama" ]]; then
+        printf '%s' "$b"
+    elif [[ -f "$HOME/.openmono/strata.env" ]]; then
+        printf 'strata'
+    else
+        printf 'llama'
+    fi
+}
+
+_strata_port() {
+    local p
+    p="$(_env_get STRATA_PORT)"
+    printf '%s' "${p:-8080}"
+}
+
 # Reuse the existing LLAMA_API_KEY as the gateway's shared bearer; generate one
-# if absent. Sets _LLAMA_KEY_GENERATED so callers can restart llama to apply it.
+# if absent. Sets _LLAMA_KEY_GENERATED so callers can restart the inference
+# backend to apply it.
 _ensure_llama_key() {
     local key; key="$(_env_get LLAMA_API_KEY)"
     if [[ -z "$key" ]]; then
@@ -140,10 +163,16 @@ _ensure_llama_key() {
 
 _apply_llama_key_restart() {
     [[ "${_LLAMA_KEY_GENERATED:-0}" == "1" ]] || return 0
-    info "Restarting llama-server to apply the new API key..."
+    info "Restarting inference backend to apply the new API key..."
     if [[ "$NATIVE_INFERENCE" == "true" ]]; then
         command -v native_cmd_restart &>/dev/null && native_cmd_restart || \
-            warn "Restart llama-server manually: openmono restart"
+            warn "Restart inference backend manually: openmono restart"
+    elif [[ "$(_inference_backend)" == "strata" ]]; then
+        # Gateway picks up Caddy env on restart; Strata itself keeps running.
+        if (cd "$DOCKER_DIR" && docker compose ps --services 2>/dev/null | grep -q '^openmono-gateway$'); then
+            (cd "$DOCKER_DIR" && docker compose up -d caddy) || \
+                warn "Restart gateway manually: openmono restart"
+        fi
     else
         if (cd "$DOCKER_DIR" && docker compose ps --services 2>/dev/null | grep -q '^llama-server$'); then
             (cd "$DOCKER_DIR" && docker compose up -d llama-server) || \
@@ -152,9 +181,22 @@ _apply_llama_key_restart() {
     fi
 }
 
+# docker compose wrapper: on the Strata backend, layer
+# docker-compose.strata.yml so the Caddy gateway fronts the host's Strata
+# (host.docker.internal:8080) instead of the llama-server container.
+_compose() {
+    if [[ "$(_inference_backend)" == "strata" && -f "$DOCKER_DIR/docker-compose.strata.yml" ]]; then
+        docker compose -f docker-compose.yml -f docker-compose.strata.yml "$@"
+    else
+        docker compose "$@"
+    fi
+}
+
 # Bring up the gateway + whichever web services are installed (used by cmd_start
 # and after 'openmono stop', which tears the whole stack down). Caddy is named
-# explicitly so llama-server (also in the server profile) isn't touched here.
+# explicitly so the inference backend container (llama-server, also in the
+# server profile) isn't touched here. On the Strata backend the gateway is
+# layered with docker-compose.strata.yml so it fronts the host's Strata.
 _start_web_services() {
     [[ "$(_env_get GATEWAY_ENABLED)" == "true" ]] || return 0
     _ensure_docker
@@ -162,7 +204,7 @@ _start_web_services() {
     [[ "$(_env_get WEB_SEARCH_ENABLED)" == "true" ]] && { profiles+=(--profile search); names+=(searxng); }
     [[ "$(_env_get WEB_SCRAPE_ENABLED)" == "true" ]] && { profiles+=(--profile scraper); names+=(scrapling); }
     info "Starting gateway (${names[*]})..."
-    (cd "$DOCKER_DIR" && docker compose "${profiles[@]}" up -d "${names[@]}") || \
+    (cd "$DOCKER_DIR" && _compose "${profiles[@]}" up -d "${names[@]}") || \
         warn "Failed to start gateway services. Check: docker compose ps"
 }
 
@@ -174,7 +216,7 @@ _setup_gateway() {
     _ensure_llama_key >/dev/null
     [[ "$NATIVE_INFERENCE" == "true" ]] && _env_set LLAMA_UPSTREAM "host.docker.internal:7474"
     _env_set GATEWAY_ENABLED true
-    (cd "$DOCKER_DIR" && docker compose --profile server up -d caddy) || {
+    (cd "$DOCKER_DIR" && _compose --profile server up -d caddy) || {
         err "Failed to start the gateway. Check: docker compose ps"; return 1
     }
     _apply_llama_key_restart
@@ -239,7 +281,7 @@ cmd_setup_search() {
     _env_set WEB_SEARCH_ENABLED true
 
     info "Starting SearXNG + gateway..."
-    (cd "$DOCKER_DIR" && docker compose --profile search up -d searxng caddy) || {
+    (cd "$DOCKER_DIR" && _compose --profile search up -d searxng caddy) || {
         err "Failed to start SearXNG. Check: docker compose ps"; return 1
     }
     _apply_llama_key_restart
@@ -263,7 +305,7 @@ cmd_setup_scraper() {
         err "Failed to build the Scrapling image."; return 1
     }
     info "Starting Scrapling + gateway..."
-    (cd "$DOCKER_DIR" && docker compose --profile scraper up -d scrapling caddy) || {
+    (cd "$DOCKER_DIR" && _compose --profile scraper up -d scrapling caddy) || {
         err "Failed to start Scrapling. Check: docker compose ps"; return 1
     }
     _apply_llama_key_restart
@@ -336,15 +378,24 @@ cmd_help() {
     printf "  %-14s %s\n" "help"    "Show this help"
     echo ""
     echo "Agent box (run the coding agent):"
-    printf "  %-14s %s\n" "agent"    "Run the coding agent in the current directory"
+    printf "  %-14s %s\n" "agent"    "Run the coding agent in the current directory [--host|--sandbox]"
     printf "  %-14s %s\n" "graph"    "Build the code-review-graph for a project"
     printf "  %-14s %s\n" "graphify" "Build the graphify knowledge graph for a project"
     echo ""
-    echo "Inference box (llama-server lifecycle):"
-    printf "  %-14s %s\n" "start"   "Start llama-server in the background"
-    printf "  %-14s %s\n" "stop"    "Stop llama-server"
-    printf "  %-14s %s\n" "restart" "Restart llama-server"
-    printf "  %-14s %s\n" "logs"    "Tail llama-server logs"
+    echo "Agent modes (pick one per run; default: sandbox):"
+    echo "  --sandbox  Container sandbox: project bind-mounted as /workspace."
+    echo "             Required for the VS Code / Cursor extension (--acp-only)."
+    echo "  --host     Server sub-agent (.NET, bare metal): drives this box's"
+    echo "             in-container agent over ACP and runs host commands"
+    echo "             (pull, build, install, redeploy, troubleshoot)."
+    echo "             Model loop stays in the container; inference is"
+    echo "             llm.endpoint (local or relay)."
+    echo ""
+    echo "Inference box (inference backend lifecycle):"
+    printf "  %-14s %s\n" "start"   "Start inference backend in the background"
+    printf "  %-14s %s\n" "stop"    "Stop inference backend"
+    printf "  %-14s %s\n" "restart" "Restart inference backend"
+    printf "  %-14s %s\n" "logs"    "Tail inference backend logs"
     printf "  %-14s %s\n" "status"  "Show container + GPU + model status"
     echo ""
     echo "Optional web services (inference box, run in Docker):"
@@ -354,7 +405,7 @@ cmd_help() {
     echo ""
     echo "Inference box (frpc tunnel to the relay — dual-box only):"
     printf "  %-14s %s\n" "tunnel setup"      "Install frpc + systemd unit (prompts for relay signup values)"
-    printf "  %-14s %s\n" "tunnel rotate-key" "Rotate LLAMA_API_KEY and restart llama-server"
+    printf "  %-14s %s\n" "tunnel rotate-key" "Rotate LLAMA_API_KEY and restart backend"
     printf "  %-14s %s\n" "tunnel start"      "Start the frpc tunnel"
     printf "  %-14s %s\n" "tunnel stop"       "Stop the frpc tunnel"
     printf "  %-14s %s\n" "tunnel restart"    "Restart the frpc tunnel"
@@ -369,7 +420,7 @@ cmd_help() {
     echo "Examples:"
     echo "  openmono setup                    # First-time single-box setup (auto-detects GPU)"
     echo "  openmono setup --cpu              # Force CPU mode"
-    echo "  openmono start                    # Start llama-server"
+    echo "  openmono start                    # Start inference backend"
     echo "  openmono agent                    # Run agent in current directory"
     echo "  openmono --verbose                # Run agent with LLM debug output"
     echo "  WORKSPACE=/my/repo openmono agent # Run agent against a specific repo"
@@ -405,12 +456,12 @@ cmd_setup() {
                 echo ""
                 echo "Installs one of three roles. Pick based on what the box will do:"
                 echo ""
-                echo "  --full        DEFAULT. Agent + llama-server + model on one machine."
+                echo "  --full        DEFAULT. Agent + inference server + model on one machine."
                 echo "                Use when you have a single workstation."
-                echo "  --inference   llama-server + model only (no agent). Use on the GPU box"
+                echo "  --inference   Inference server + model only (no agent). Use on the GPU box"
                 echo "                in dual-box mode. Pair with 'openmono tunnel setup' to"
                 echo "                expose it through an OpenMono.Relay."
-                echo "  --agent       Agent + code-review-graph only (no model, no llama-server)."
+                echo "  --agent       Agent + code-review-graph only (no model, no inference server)."
                 echo "                Use on the laptop in dual-box mode. Point at a remote"
                 echo "                inference server via 'openmono config set llm.endpoint …'."
                 echo ""
@@ -426,6 +477,12 @@ cmd_setup() {
                 echo ""
                 echo "Other:"
                 echo "  --verbose     Show detailed command output (default: step-level progress)"
+                echo ""
+                echo "Server sub-agent (opt-in add-on, full/agent only — never inference):"
+                echo "  Setup asks once (default No). For non-interactive installs:"
+                echo "    OPENMONO_HOST_BRIDGE=1 openmono setup --agent   # include it"
+                echo "    OPENMONO_HOST_BRIDGE=0 openmono setup --agent   # skip the prompt"
+                echo "  Add it later any time with: bash scripts/install-host-bridge.sh"
                 echo ""
                 echo "A full log is written to ~/.openmono/logs/setup-<timestamp>.log"
                 echo ""
@@ -535,10 +592,14 @@ cmd_setup() {
 EOF
             detail "Created $settings_file for agent-only role (configure endpoint with: openmono config set llm.endpoint <url>)"
         else
-            cat > "$settings_file" <<'EOF'
+            _default_endpoint="http://localhost:7474"
+            if [[ "${OPENMONO_INFERENCE_BACKEND:-}" == "strata" ]]; then
+                _default_endpoint="http://localhost:${STRATA_PORT:-8080}/v1"
+            fi
+            cat > "$settings_file" <<EOF
 {
   "llm": {
-    "endpoint": "http://localhost:7474",
+    "endpoint": "$_default_endpoint",
     "api_key": ""
   }
 }
@@ -558,11 +619,16 @@ EOF
 
     case "$OPENMONO_ROLE" in
         full|inference)
-            echo "  llama-server port : ${LLAMA_PORT}"
-            if [[ "$NATIVE_INFERENCE" == "true" ]]; then
-                echo "  mode              : Metal GPU (native llama.cpp)"
+            if [[ "${OPENMONO_INFERENCE_BACKEND:-}" == "strata" && "$NATIVE_INFERENCE" != "true" ]]; then
+                echo "  strata endpoint : http://localhost:${STRATA_PORT:-8080}/v1"
+                echo "  mode            : Strata (Qwen3.8-Flash-Next, host-native)"
             else
-                echo "  mode              : $([ "${GPU_MODE:-0}" = "1" ] && echo GPU || echo CPU)"
+                echo "  llama-server port : ${LLAMA_PORT}"
+                if [[ "$NATIVE_INFERENCE" == "true" ]]; then
+                    echo "  mode              : Metal GPU (native llama.cpp)"
+                else
+                    echo "  mode              : $([ "${GPU_MODE:-0}" = "1" ] && echo GPU || echo CPU)"
+                fi
             fi
             echo ""
             ;;
@@ -577,7 +643,7 @@ EOF
             echo -e "    2. ${BOLD}openmono agent${NC}                 # Start the agent"
             echo ""
             echo "  Other commands:"
-            echo -e "    ${BOLD}openmono status${NC}              # Show llama-server status"
+            echo -e "    ${BOLD}openmono status${NC}              # Show inference backend status"
             echo -e "    ${BOLD}openmono config${NC}             # Configure settings"
             echo ""
             ;;
@@ -589,7 +655,7 @@ EOF
             echo -e "    2. Use the endpoint + API key from step 1 on your agent box"
             echo ""
             echo "  Other commands:"
-            echo -e "    ${BOLD}openmono start${NC}              # Start llama-server"
+            echo -e "    ${BOLD}openmono start${NC}              # Start inference backend"
             echo -e "    ${BOLD}openmono status${NC}             # Show server status"
             echo -e "    ${BOLD}openmono logs${NC}               # Tail server logs"
             echo ""
@@ -618,6 +684,16 @@ EOF
             ;;
     esac
 
+    if [[ "${OPENMONO_HOST_BRIDGE:-0}" == "1" ]]; then
+        echo "  Bare-metal server sub-agent installed (opt-in add-on)."
+        echo ""
+        echo "  It talks to this box's in-container agent over ACP and runs host"
+        echo "  commands (pull, build, install, redeploy, troubleshoot):"
+        echo ""
+        echo -e "    ${BOLD}cd /srv/my-backend && openmono agent --host${NC}"
+        echo ""
+    fi
+
     echo "  Troubleshooting:"
     echo "    If you exit before the shell reloads, reload it manually:"
     echo -e "      ${BOLD}exec -l \$SHELL${NC}    # Reload login shell (picks up new groups + PATH)"
@@ -631,7 +707,7 @@ EOF
 
     unset OPENMONO_GPU OPENMONO_CPU OPENMONO_ROLE OPENMONO_VERBOSE OPENMONO_LOG_DIR \
           OPENMONO_LOG_FILE OPENMONO_ENV_FILE GPU_MODE AMD_IGPU_MODE AMD_IGPU_REBOOT_PENDING \
-          INSTALL_DIR LLAMA_PORT OPENMONO_VERBOSE
+          INSTALL_DIR LLAMA_PORT OPENMONO_VERBOSE OPENMONO_HOST_BRIDGE
     export PATH="$INSTALL_DIR:$PATH"
     exec -l "$SHELL"
 }
@@ -639,6 +715,15 @@ EOF
 cmd_start() {
     if [[ "$NATIVE_INFERENCE" == "true" ]]; then
         native_cmd_start || return $?
+        _start_web_services || true
+        echo ""
+        echo "  Run the agent: openmono agent"
+        return 0
+    fi
+
+    # Strata backend: host-native server via scripts/strata.sh (no Docker).
+    if [[ "$(_inference_backend)" == "strata" ]]; then
+        bash "$REPO_DIR/scripts/strata.sh" start || return $?
         _start_web_services || true
         echo ""
         echo "  Run the agent: openmono agent"
@@ -694,6 +779,15 @@ cmd_stop() {
         return 0
     fi
 
+    # Strata backend: stop the host server, then any gateway containers.
+    if [[ "$(_inference_backend)" == "strata" ]]; then
+        bash "$REPO_DIR/scripts/strata.sh" stop || true
+        if docker info &>/dev/null 2>&1; then
+            (cd "$DOCKER_DIR" && _compose down 2>/dev/null || true)
+        fi
+        return 0
+    fi
+
     _ensure_docker
     cd "$DOCKER_DIR"
     export LLAMA_PORT
@@ -720,6 +814,14 @@ cmd_restart() {
     if [[ "$NATIVE_INFERENCE" == "true" ]]; then
         native_cmd_restart || return $?
         return 0
+    fi
+
+    # Strata backend: stop + start the host server (start is a no-op if healthy).
+    if [[ "$(_inference_backend)" == "strata" ]]; then
+        info "Restarting Strata..."
+        bash "$REPO_DIR/scripts/strata.sh" stop || true
+        bash "$REPO_DIR/scripts/strata.sh" start
+        return $?
     fi
 
     _ensure_docker
@@ -803,7 +905,122 @@ _clipboard_bridge_stop() {
     CLIPBOARD_BRIDGE_PID=""
 }
 
+# ── Host sub-agent (bare-metal operator via ACP bridge) ────────────────────────
+# `--host` runs the .NET host-bridge on bare metal. The bridge drives this box's
+# in-container agent over ACP — the same HTTP/SSE API the VS Code extension and
+# the smoke test use — and executes host commands itself (shell, git, files,
+# installs). The model loop stays in the container: nothing here runs inference
+# or duplicates the agent. VS Code / extension use (--acp-only) stays
+# sandbox-only and is rejected with --host.
+
+cmd_agent_host_bin() {
+    if [[ -n "${OPENMONO_HOST_BRIDGE_BIN:-}" && -x "$OPENMONO_HOST_BRIDGE_BIN" ]]; then
+        printf '%s' "$OPENMONO_HOST_BRIDGE_BIN"
+        return 0
+    fi
+    if [[ -x "$HOME/.openmono/bin/host-bridge/host-bridge" ]]; then
+        printf '%s' "$HOME/.openmono/bin/host-bridge/host-bridge"
+        return 0
+    fi
+    return 1
+}
+
+cmd_agent_host_project() {
+    local proj="$REPO_DIR/src/OpenMono.HostBridge/OpenMono.HostBridge.csproj"
+    [[ -f "$proj" ]] || return 1
+    command -v dotnet &>/dev/null || return 1
+    printf '%s' "$proj"
+    return 0
+}
+
+cmd_agent_host() {
+    # VS Code / extension integration is sandbox-only by design.
+    local a
+    for a in ${1+"$@"}; do
+        if [[ "$a" == "--acp-only" ]]; then
+            err "--acp-only (VS Code / Cursor extension mode) is only supported in sandbox mode."
+            err "Run without --host: openmono agent --acp-only --acp-port 7475"
+            exit 1
+        fi
+    done
+
+    # Fail fast when no inference is configured (local or relay).
+    local settings="$HOME/.openmono/settings.json"
+    local cfg_endpoint=""
+    if [[ -f "$settings" ]] && command -v jq &>/dev/null; then
+        cfg_endpoint=$(jq -r '.llm.endpoint // empty' "$settings")
+    fi
+    if [[ -z "$cfg_endpoint" ]]; then
+        err "No LLM endpoint configured in ~/.openmono/settings.json"
+        err "Point at local inference or your relay:"
+        err "  openmono config set llm.endpoint http://localhost:8080/v1  # Strata (Linux)"
+        err "  openmono config set llm.endpoint http://localhost:7474      # legacy llama.cpp"
+        err "  openmono config set llm.endpoint http://<relay-host>:<remotePort>"
+        err "  openmono config set llm.api_key <token>"
+        exit 1
+    fi
+
+    # Local inference still starts the familiar way; remote (relay/direct) needs nothing.
+    local is_local=false
+    case "$cfg_endpoint" in
+        http://localhost:*|http://127.0.0.1:*)
+            is_local=true
+            ;;
+    esac
+    if [[ "$is_local" == "true" ]] && ! curl -sf --max-time 3 "${cfg_endpoint%/}/health" &>/dev/null; then
+        if command -v docker &>/dev/null && docker info &>/dev/null 2>&1; then
+            info "Local inference is not responding — starting it now..."
+            cmd_start || exit 1
+        elif [[ "$NATIVE_INFERENCE" == "true" ]]; then
+            info "Local inference is not responding — starting it now..."
+            cmd_start || exit 1
+        else
+            err "Local inference endpoint $cfg_endpoint is not responding and Docker is unavailable."
+            err "Start inference with: openmono start"
+            err "Or point at your relay: openmono config set llm.endpoint http://<relay-host>:<remotePort>"
+            exit 1
+        fi
+    fi
+
+    export OPENMONO_REPO_DIR="$REPO_DIR"
+    local bin proj
+    if bin="$(cmd_agent_host_bin)"; then
+        info "Running host sub-agent: $bin"
+        exec "$bin" --workdir "$(pwd)" "$@"
+    elif proj="$(cmd_agent_host_project)"; then
+        info "Host sub-agent not published — running from source (publish with: bash scripts/install-host-bridge.sh)"
+        exec dotnet run --project "$proj" -- --workdir "$(pwd)" "$@"
+    else
+        err "Host sub-agent is not installed."
+        err "Install it with: bash $REPO_DIR/scripts/install-host-bridge.sh  (installs .NET 10 via the existing prereqs when missing)"
+        err "Or use the sandbox instead: openmono agent --sandbox"
+        exit 1
+    fi
+}
+
 cmd_agent() {
+    local mode="${OPENMONO_AGENT_MODE:-sandbox}"
+    local fwd=()
+    local a
+    for a in ${1+"$@"}; do
+        case "$a" in
+            --host) mode=host ;;
+            --sandbox) mode=sandbox ;;
+            *) fwd+=("$a") ;;
+        esac
+    done
+    set -- "${fwd[@]+"${fwd[@]}"}"
+    case "$mode" in
+        host) cmd_agent_host "$@" ;;
+        sandbox) cmd_agent_sandbox "$@" ;;
+        *)
+            err "Unknown agent mode: $mode (use --host, --sandbox, or OPENMONO_AGENT_MODE=host|sandbox)"
+            exit 1
+            ;;
+    esac
+}
+
+cmd_agent_sandbox() {
     _ensure_docker
     WORKSPACE="${WORKSPACE:-$(pwd)}"
     export WORKSPACE
@@ -834,6 +1051,10 @@ cmd_agent() {
         [[ -n "${cfg_web_scrape:-}" ]] && export OPENMONO_WEB_SCRAPE="$cfg_web_scrape"
     fi
 
+    # An explicit OPENMONO_ENDPOINT wins over settings.json — the same precedence
+    # the CLI's ConfigLoader uses — so it can be overridden per invocation.
+    cfg_endpoint="${OPENMONO_ENDPOINT:-${cfg_endpoint:-}}"
+
     if [[ -z "$cfg_endpoint" ]]; then
         err "No LLM endpoint configured in ~/.openmono/settings.json"
         err "Configure your inference server:"
@@ -853,6 +1074,10 @@ cmd_agent() {
             source "$REPO_DIR/scripts/macos/inference.sh" 2>/dev/null || true
             native_load_config || exit 1
             native_ensure_running || exit 1
+        elif [[ "$(_inference_backend)" == "strata" ]]; then
+            # Strata backend: the first auto-start block above (via cmd_start →
+            # scripts/strata.sh) already handled this. Nothing llama to do here.
+            true
         else
             if ! curl -sf "http://localhost:7474/health" &>/dev/null; then
                 info "llama-server not running — starting it now..."
@@ -872,7 +1097,26 @@ cmd_agent() {
     fi
 
      if [[ "$is_local" == "true" && "$NATIVE_INFERENCE" != "true" ]]; then
-        export OPENMONO_ENDPOINT="http://llama-server:7474"
+        # The configured endpoint points at loopback / the host gateway, which
+        # the agent container cannot reach by that name. Rewrite the HOST only,
+        # preserving the port and any base path from the config, so a custom
+        # STRATA_PORT/LLAMA_PORT or an endpoint like ...:8081/v1 keeps working:
+        #   - Strata serves host-native → reach it via the host gateway.
+        #   - llama.cpp runs in its own container → reach it by service name.
+        local _ep _host_port _port _path
+        _ep="${cfg_endpoint#*://}"          # host[:port][/path]
+        _host_port="${_ep%%/*}"
+        _path=""
+        [[ "$_ep" == */* ]] && _path="/${_ep#*/}"
+        _port="${_host_port##*:}"
+        [[ "$_port" == "$_host_port" ]] && _port=""   # no explicit port
+        if [[ "$(_inference_backend)" == "strata" ]]; then
+            _port="${_port:-$(_strata_port)}"
+            export OPENMONO_ENDPOINT="http://host.docker.internal:${_port}${_path}"
+        else
+            _port="${_port:-7474}"
+            export OPENMONO_ENDPOINT="http://llama-server:${_port}${_path}"
+        fi
     else
         export OPENMONO_ENDPOINT="$cfg_endpoint"
     fi
@@ -899,6 +1143,15 @@ cmd_agent() {
     fi
 
 
+    # Docker socket: lets the agent run `docker` / `docker compose` against the
+    # host daemon (deploy + troubleshoot containerized backends on a server box).
+    # Mounted only when the socket exists — mirrors docker/openmono-wrapper.sh.
+    # Opt out with OPENMONO_NO_DOCKER_SOCK=1.
+    local docker_sock_args=()
+    if [[ "${OPENMONO_NO_DOCKER_SOCK:-0}" != "1" && -S /var/run/docker.sock ]]; then
+        docker_sock_args+=(-v /var/run/docker.sock:/var/run/docker.sock)
+    fi
+
     local extra_env=()
     local _upd; _upd="$(_update_notice 2>/dev/null || true)"
     [[ -n "$_upd" ]] && extra_env+=(-e "OPENMONO_UPDATE_NOTICE=$_upd")
@@ -912,6 +1165,7 @@ cmd_agent() {
         -e HOME=/home/agent \
         -e WORKSPACE="$WORKSPACE" \
         "${git_args[@]+"${git_args[@]}"}" \
+        "${docker_sock_args[@]+"${docker_sock_args[@]}"}" \
         "${extra_env[@]+"${extra_env[@]}"}" \
         agent "$@" || _agent_rc=$?
 
@@ -924,6 +1178,8 @@ cmd_logs() {
     if [[ "$NATIVE_INFERENCE" == "true" ]]; then
 
         native_cmd_logs || return $?
+    elif [[ "$(_inference_backend)" == "strata" ]]; then
+        bash "$REPO_DIR/scripts/strata.sh" logs "$@"
     else
         _ensure_docker
         cd "$DOCKER_DIR"
@@ -937,6 +1193,47 @@ cmd_status() {
 
     if [[ "$NATIVE_INFERENCE" == "true" ]]; then
         native_cmd_status
+    elif [[ "$(_inference_backend)" == "strata" ]]; then
+        # Strata backend: host-native server + optional gateway containers.
+        bash "$REPO_DIR/scripts/strata.sh" status || true
+
+        if docker info &>/dev/null 2>&1; then
+            echo ""
+            echo -e "${BLUE}── Gateway containers ───────────────────────────────${NC}"
+            docker ps \
+                --filter "name=openmono-gateway" \
+                --filter "name=openmono-agent" \
+                --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" 2>/dev/null || true
+        fi
+
+        echo ""
+        echo -e "${BLUE}── GPU ──────────────────────────────────────────────${NC}"
+        if command -v nvidia-smi &>/dev/null && nvidia-smi &>/dev/null 2>&1; then
+            nvidia-smi \
+                --query-gpu=name,memory.used,memory.total,utilization.gpu \
+                --format=csv,noheader,nounits \
+                | awk -F', ' '{printf "  %s  VRAM: %s/%s MiB  GPU: %s%%\n", $1, $2, $3, $4}'
+        else
+            echo "  No NVIDIA GPU detected (Strata also supports AMD — see docs/STRATA.md)"
+        fi
+
+        echo ""
+        echo -e "${BLUE}── Model ────────────────────────────────────────────${NC}"
+        _STRATA_PORT="$(_strata_port)"
+        LOADED=$(curl -sf --max-time 3 "http://localhost:${_STRATA_PORT}/v1/models" \
+            | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+models = d.get('data', [])
+print(models[0].get('id', '').strip() if models else '')
+" 2>/dev/null || true)
+        if [ -n "$LOADED" ]; then
+            ok "Model loaded: $LOADED"
+        else
+            warn "Model not reachable — start Strata with: openmono start"
+        fi
+        echo ""
+        return 0
     else
         _ensure_docker
         if ! docker info &>/dev/null 2>&1; then
@@ -1340,7 +1637,18 @@ cmd_tunnel() {
                 mv "$tmp" "$env_file"
                 chmod 0600 "$env_file"
                 ok "LLAMA_API_KEY rotated in docker/.env"
-                if command -v docker &>/dev/null && docker compose version &>/dev/null 2>&1; then
+                if [[ "$(_inference_backend)" == "strata" ]]; then
+                    # Strata backend: the rotated key guards the Caddy gateway.
+                    # Restart it when present; Strata itself keeps its own key.
+                    if (cd "$REPO_DIR/docker" && _compose ps --services 2>/dev/null | grep -q '^caddy$'); then
+                        info "Restarting Caddy gateway with new API key..."
+                        (cd "$REPO_DIR/docker" && _compose up -d caddy) || \
+                            warn "Restart failed — run manually: openmono restart"
+                        ok "Gateway restarted"
+                    else
+                        warn "Gateway is not running — start it with: openmono setup gateway"
+                    fi
+                elif command -v docker &>/dev/null && docker compose version &>/dev/null 2>&1; then
                     if (cd "$REPO_DIR/docker" && docker compose ps --services 2>/dev/null | grep -q '^llama-server$'); then
                         info "Restarting llama-server with new API key..."
                         (cd "$REPO_DIR/docker" && docker compose restart llama-server) || \
