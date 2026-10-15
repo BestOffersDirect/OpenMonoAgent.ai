@@ -25,9 +25,17 @@ else
     LABEL="llama-server"
 fi
 
+# curl against the backend, adding the shared API key when one is set. Strata
+# gates /props and /v1/models behind it (llama uses the same LLAMA_API_KEY).
+hc_curl() {
+    local key
+    key="$(grep '^LLAMA_API_KEY=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]' || true)"
+    if [[ -n "$key" ]]; then curl -H "Authorization: Bearer $key" "$@"; else curl "$@"; fi
+}
+
 # Check inference backend
 echo -n "$LABEL (localhost:$PORT): "
-if curl -sf "http://localhost:$PORT/health" &>/dev/null; then
+if hc_curl -sf "http://localhost:$PORT/health" &>/dev/null; then
     echo -e "${GREEN}HEALTHY${NC}"
 else
     echo -e "${RED}UNREACHABLE${NC}"
@@ -42,7 +50,7 @@ docker compose -f "$(dirname "$0")/../docker/docker-compose.yml" ps 2>/dev/null 
 echo ""
 echo -n "Model loaded: "
 if [[ "$BACKEND" == "llama" ]]; then
-    PROPS=$(curl -sf "http://localhost:$PORT/props" 2>/dev/null)
+    PROPS=$(hc_curl -sf "http://localhost:$PORT/props" 2>/dev/null)
     if [ -n "$PROPS" ]; then
         # Prefer model_alias (set by --alias flag), fall back to model_path basename
         MODEL_NAME=$(echo "$PROPS" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('model_alias') or d.get('model_path','').split('/')[-1].replace('.gguf','') or '')" 2>/dev/null)
@@ -57,7 +65,7 @@ if [[ "$BACKEND" == "llama" ]]; then
 fi
 if [[ "$BACKEND" == "strata" ]] || [[ -z "${MODEL_NAME:-}" && -z "${PROPS:-}" ]]; then
     # OpenAI-compatible /v1/models endpoint (both backends serve it)
-    MODELS=$(curl -sf "http://localhost:$PORT/v1/models" 2>/dev/null || true)
+    MODELS=$(hc_curl -sf "http://localhost:$PORT/v1/models" 2>/dev/null || true)
     if [ -n "$MODELS" ]; then
         MODEL_NAME=$(echo "$MODELS" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['data'][0]['id'] if d.get('data') else '')" 2>/dev/null)
         if [ -n "$MODEL_NAME" ]; then

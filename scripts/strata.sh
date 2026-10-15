@@ -35,6 +35,8 @@ set -euo pipefail
 #   STRATA_CONTEXT context tokens                (default: setup picks for the VRAM)
 #   STRATA_VISION  yes|no|cpu                    (default no)
 #   STRATA_DATA_DIR model-file dir               (default <STRATA_DIR>-data next to Strata)
+#   STRATA_HOST    bind address                  (default 0.0.0.0 so the agent container can reach it)
+#   STRATA_API_KEY key Strata requires           (default: LLAMA_API_KEY from docker/.env)
 # ──────────────────────────────────────────────────────────────────────────────
 
 STRATA_REPO="https://github.com/Niko1221/Strata.git"
@@ -49,6 +51,16 @@ OPENMONO_STATE_DIR="${OPENMONO_STATE_DIR:-$HOME/.openmono}"
 STRATA_ENV_FILE="$OPENMONO_STATE_DIR/strata.env"
 STRATA_PID_FILE="$OPENMONO_STATE_DIR/strata.pid"
 STRATA_LOG="$OPENMONO_STATE_DIR/strata-server.log"
+
+# Bind address + shared API key — mirror the llama.cpp backend, which starts
+# with `--host 0.0.0.0 --api-key $LLAMA_API_KEY`. Strata defaults to 127.0.0.1,
+# which the agent CONTAINER cannot reach on Linux (its host.docker.internal is
+# the docker bridge, not loopback), so the agent got "Connection refused".
+STRATA_HOST="${STRATA_HOST:-0.0.0.0}"
+STRATA_API_KEY="${STRATA_API_KEY:-}"    # empty: fall back to docker/.env, else no auth
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+DOCKER_ENV_FILE="$REPO_DIR/docker/.env"
 
 # Strata's engine is built with CUDA 13.0 and refuses to compile against
 # anything older (setup.py: need_cuda = (13, 0)).
@@ -95,6 +107,52 @@ load_env() {
 }
 
 strata_base_url() { echo "http://127.0.0.1:${STRATA_PORT}"; }
+
+# The API key Strata should require: STRATA_API_KEY, else the LLAMA_API_KEY the
+# llama.cpp backend uses (read from docker/.env) — the same value the agent
+# sends as a bearer token. Empty means Strata accepts any key.
+strata_api_key() {
+    if [[ -n "$STRATA_API_KEY" ]]; then printf '%s' "$STRATA_API_KEY"; return 0; fi
+    [[ -f "$DOCKER_ENV_FILE" ]] && sed -n 's/^LLAMA_API_KEY=//p' "$DOCKER_ENV_FILE" | head -1 || true
+}
+
+# curl against Strata, adding the shared key when one is set. Strata gates
+# /v1/models, /props, /slots and /status behind it (NOT /health).
+strata_curl() {
+    local key; key="$(strata_api_key)"
+    if [[ -n "$key" ]]; then
+        curl -H "Authorization: Bearer $key" "$@"
+    else
+        curl "$@"
+    fi
+}
+
+# Point the model's run config at a container-reachable bind + the shared API
+# key (mirrors the llama.cpp backend). Passed to Strata's setup on install; this
+# also repairs installs made before that and any manual edits. Idempotent.
+ensure_server_config() {
+    local run_script="$1" cfg_path key
+    cfg_path="$(sed -n 's/.*--config[[:space:]]*"\([^"]*\)".*/\1/p' "$run_script" 2>/dev/null | head -1)"
+    [[ -n "$cfg_path" && -f "$cfg_path" ]] || return 0
+    command -v python3 >/dev/null 2>&1 || return 0
+    key="$(strata_api_key)"
+    python3 - "$cfg_path" "$STRATA_HOST" "$key" <<'PY' || true
+import json, sys
+path, host, key = sys.argv[1], sys.argv[2], (sys.argv[3] if len(sys.argv) > 3 else "")
+try:
+    cfg = json.load(open(path))
+except Exception:
+    sys.exit(0)
+changed = []
+if host and cfg.get("host") != host:
+    cfg["host"] = host; changed.append("host=" + host)
+if key and cfg.get("api_key") != key:
+    cfg["api_key"] = key; changed.append("shared api key")
+if changed:
+    json.dump(cfg, open(path, "w"), indent=1)
+    print("[strata] run config updated (" + ", ".join(changed) + "): " + path)
+PY
+}
 
 ensure_clone() {
     if [[ -f "$STRATA_DIR/setup.sh" ]]; then
@@ -441,6 +499,11 @@ cmd_install() {
     [[ -n "$STRATA_VISION" ]] && setup_args+=(--vision "$STRATA_VISION")
     [[ "$STRATA_PORT" != "8080" ]] && setup_args+=(--port "$STRATA_PORT")
     [[ -n "$STRATA_DATA_DIR" ]] && setup_args+=(--data-dir "$STRATA_DATA_DIR")
+    # Bind a container-reachable address and share the agent's API key, exactly
+    # like the llama.cpp backend (--host 0.0.0.0 --api-key $LLAMA_API_KEY).
+    setup_args+=(--host "$STRATA_HOST")
+    local _strata_key; _strata_key="$(strata_api_key)"
+    [[ -n "$_strata_key" ]] && setup_args+=(--api-key "$_strata_key")
     setup_args+=(--no-start)
     info "CUDA toolchain (Strata needs >= ${CUDA_MIN} to compile the engine on Linux):"
     print_cuda_status
@@ -526,6 +589,9 @@ cmd_start() {
         err "No run-*.sh found in $STRATA_DIR — install first: scripts/strata.sh install"
         exit 1
     fi
+    # Make sure the run config binds a container-reachable address and carries
+    # the shared API key (repairs installs made before setup got --host/--api-key).
+    ensure_server_config "$run_script"
     info "Starting Strata ($run_script) detached ..."
     mkdir -p "$OPENMONO_STATE_DIR"
     # Strata's run script is foreground-oriented; detach so the shell returns.
@@ -579,7 +645,7 @@ cmd_status() {
         echo -e "${RED}UNREACHABLE${NC}"
     fi
     echo -n "OpenAI endpoint ($url/v1): "
-    models="$(curl -sf "$url/v1/models" 2>/dev/null || true)"
+    models="$(strata_curl -sf "$url/v1/models" 2>/dev/null || true)"
     if [[ -n "$models" ]]; then
         echo "$models" | python3 -c "import sys,json; d=json.load(sys.stdin); print(', '.join(m.get('id','?') for m in d.get('data',[])) or 'reachable (no models listed)')" 2>/dev/null \
             || echo "reachable"
