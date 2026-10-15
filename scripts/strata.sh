@@ -217,7 +217,11 @@ cmd_check() {
 # from `apt-cache` itself — nothing is hardcoded — so whatever NVIDIA ships
 # in the active repos (13-0, 13-3, 13-4, 13-5, ...) is discovered live.
 _cuda_available_pkgs() {
-    apt-cache show "cuda-toolkit-13" 2>/dev/null | awk '/^Package: /{print $2}' \
+    # `apt-cache pkgnames <prefix>` lists EVERY package name APT knows that
+    # starts with the prefix — so this yields cuda-toolkit-13, -13-0, -13-3,
+    # -13-4, ... . (`apt-cache show cuda-toolkit-13` would only ever print
+    # the one "cuda-toolkit-13" meta-package, not its versioned siblings.)
+    apt-cache pkgnames cuda-toolkit-13 2>/dev/null \
         | grep -E '^cuda-toolkit-13(-[0-9]+)?$' \
         | sort -uV
 }
@@ -278,7 +282,14 @@ install_cuda_toolkit() {
         err "  https://developer.nvidia.com/cuda-downloads   (needs CUDA 13.x)"
         return 1
     fi
-    arch="$(dpkg --print-architecture 2>/dev/null || echo x86_64)"
+    # NVIDIA's repo dirs use their own arch names — x86_64, NOT dpkg's
+    # "amd64"; sbsa, NOT "arm64". Passing dpkg's value straight through
+    # 404s every URL (this is what broke on Ubuntu 26.04).
+    case "$(dpkg --print-architecture 2>/dev/null || uname -m)" in
+        amd64|x86_64)  arch="x86_64" ;;
+        arm64|aarch64) arch="sbsa" ;;
+        *)             arch="$(uname -m)" ;;
+    esac
     # NVIDIA's repo dirs are named by release number (ubuntu2404), not by
     # lsb-release codename (noble) — the codename path 404s even on the
     # distros where the repo exists.
@@ -322,9 +333,10 @@ install_cuda_toolkit() {
     # the rolling 13-3/13-4 — fine, Strata only needs nvcc >= 13.0).
     local pkg=""
     pkg="$(_cuda_pick_package)"
-    if [[ -z "$pkg" && "$repo_dir" != "ubuntu${cn_num}" ]]; then
-        # Native repo was used because the distro's dir is missing — the
-        # fallbacks may still carry the pinned package.
+    if [[ -z "$pkg" ]]; then
+        # The active repo exposes no CUDA 13.x package (newer distro dirs
+        # prune older minors, or the dir only carries the keyring). Try the
+        # other release dirs before giving up.
         for url in "${fallbacks[@]}"; do
             [[ "$url" == "$repo_url" ]] && continue
             local d

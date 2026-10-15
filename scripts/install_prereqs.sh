@@ -392,7 +392,14 @@ else
     fi
 
     if [ "$_cuda_ok" = false ]; then
-        _cuda_arch="$(dpkg --print-architecture 2>/dev/null || echo x86_64)"
+        # NVIDIA's repo dirs use their own arch names — x86_64, NOT dpkg's
+        # "amd64"; sbsa, NOT "arm64". Using dpkg's value verbatim 404s every
+        # URL (this is what broke on Ubuntu 26.04).
+        case "$(dpkg --print-architecture 2>/dev/null || uname -m)" in
+            amd64|x86_64)  _cuda_arch="x86_64" ;;
+            arm64|aarch64) _cuda_arch="sbsa" ;;
+            *)             _cuda_arch="$(uname -m)" ;;
+        esac
         # NVIDIA names its CUDA repo dirs by release number (ubuntu2404), not
         # by lsb-release codename (noble) — the codename path 404s even on the
         # distros where the repo exists.
