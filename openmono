@@ -1041,6 +1041,10 @@ cmd_agent_sandbox() {
         [[ -n "${cfg_web_scrape:-}" ]] && export OPENMONO_WEB_SCRAPE="$cfg_web_scrape"
     fi
 
+    # An explicit OPENMONO_ENDPOINT wins over settings.json — the same precedence
+    # the CLI's ConfigLoader uses — so it can be overridden per invocation.
+    cfg_endpoint="${OPENMONO_ENDPOINT:-${cfg_endpoint:-}}"
+
     if [[ -z "$cfg_endpoint" ]]; then
         err "No LLM endpoint configured in ~/.openmono/settings.json"
         err "Configure your inference server:"
@@ -1083,13 +1087,25 @@ cmd_agent_sandbox() {
     fi
 
      if [[ "$is_local" == "true" && "$NATIVE_INFERENCE" != "true" ]]; then
+        # The configured endpoint points at loopback / the host gateway, which
+        # the agent container cannot reach by that name. Rewrite the HOST only,
+        # preserving the port and any base path from the config, so a custom
+        # STRATA_PORT/LLAMA_PORT or an endpoint like ...:8081/v1 keeps working:
+        #   - Strata serves host-native → reach it via the host gateway.
+        #   - llama.cpp runs in its own container → reach it by service name.
+        local _ep _host_port _port _path
+        _ep="${cfg_endpoint#*://}"          # host[:port][/path]
+        _host_port="${_ep%%/*}"
+        _path=""
+        [[ "$_ep" == */* ]] && _path="/${_ep#*/}"
+        _port="${_host_port##*:}"
+        [[ "$_port" == "$_host_port" ]] && _port=""   # no explicit port
         if [[ "$(_inference_backend)" == "strata" ]]; then
-            # Strata serves host-native — there is no llama-server container to
-            # reach. The agent container talks to it via the host gateway at the
-            # Strata port (root; the client appends /v1 itself).
-            export OPENMONO_ENDPOINT="http://host.docker.internal:$(_strata_port)"
+            _port="${_port:-$(_strata_port)}"
+            export OPENMONO_ENDPOINT="http://host.docker.internal:${_port}${_path}"
         else
-            export OPENMONO_ENDPOINT="http://llama-server:7474"
+            _port="${_port:-7474}"
+            export OPENMONO_ENDPOINT="http://llama-server:${_port}${_path}"
         fi
     else
         export OPENMONO_ENDPOINT="$cfg_endpoint"
