@@ -329,7 +329,7 @@ cmd_help() {
     echo "an agent box and an inference box."
     echo ""
     echo "Any box:"
-    printf "  %-14s %s\n" "setup"   "Install (--full|--inference|--agent) [--gpu|--cpu]"
+    printf "  %-14s %s\n" "setup"   "Install (--full|--inference|--agent) [--gpu|--cpu] [--model=bonsai-pq2|bonsai-ptq1|qwen]"
     printf "  %-14s %s\n" "upgrade" "Update to the latest version + rebuild the agent (--check to preview)"
     printf "  %-14s %s\n" "config"  "Read/write ~/.openmono/settings.json (e.g. llm.endpoint, llm.api_key)"
     printf "  %-14s %s\n" "version" "Print the CLI version"
@@ -395,9 +395,13 @@ cmd_setup() {
             --inference)    export OPENMONO_ROLE=inference ;;
             --agent)        export OPENMONO_ROLE=agent ;;
             --full)         export OPENMONO_ROLE=full ;;
+            --model=*)      export OPENMONO_MODEL="${arg#--model=}" ;;
+            --bonsai)       export OPENMONO_MODEL=bonsai-pq2 ;;
+            --bonsai-ptq1)  export OPENMONO_MODEL=bonsai-ptq1 ;;
+            --qwen)         export OPENMONO_MODEL=qwen ;;
             --verbose|-v)   export OPENMONO_VERBOSE=1 ;;
             --help|-h)
-                echo "Usage: openmono setup [--full|--inference|--agent] [--gpu|--cpu] [--verbose]"
+                echo "Usage: openmono setup [--full|--inference|--agent] [--gpu|--cpu] [--model=NAME] [--verbose]"
                 echo ""
                 echo "Installs one of three roles. Pick based on what the box will do:"
                 echo ""
@@ -409,6 +413,12 @@ cmd_setup() {
                 echo "  --agent       Agent + code-review-graph only (no model, no llama-server)."
                 echo "                Use on the laptop in dual-box mode. Point at a remote"
                 echo "                inference server via 'openmono config set llm.endpoint …'."
+                echo ""
+                echo "Model family (Bonsai: NVIDIA CUDA, 7940HS Vulkan, or Apple Silicon 16GB+ experimental):"
+                echo "  --model=bonsai-pq2   Ternary-Bonsai-2-27B PQ2_0 (~7.2GB)"
+                echo "  --model=bonsai-ptq1  Ternary-Bonsai-2-27B PTQ1_0 (~5.9GB, small cards)"
+                echo "  --model=qwen         Stock Qwen (no Prism image needed)"
+                echo "  --bonsai / --bonsai-ptq1 / --qwen   shorthands for the above"
                 echo ""
                 echo "GPU mode (applies to --full and --inference):"
                 echo "  --gpu         Force GPU mode (requires NVIDIA + nvidia-container-toolkit)"

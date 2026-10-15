@@ -17,6 +17,12 @@ set -euo pipefail
 #   OPENMONO_CPU=1        Force CPU mode (removes any GPU override)
 #   OPENMONO_VERBOSE=1    Show detailed command output
 #   LLAMA_PORT=7474       llama-server host port (default 7474)
+#   OPENMONO_MODEL        Model family: auto (default), bonsai-pq2, bonsai-ptq1, qwen
+#                         auto = prompt on TTY (GPU→Bonsai PQ2_0, CPU→Qwen), else auto-detect
+#   OPENMONO_PRISM_IMAGE_CUDA   Prism CUDA image ref (default startuphakk/prism-llama.cpp_cuda:latest)
+#   OPENMONO_PRISM_IMAGE_VULKAN Prism Vulkan image ref (default startuphakk/prism-llama.cpp_vulkan:latest)
+#   OPENMONO_PRISM_IMAGE        Legacy single-ref override (wins over both when set)
+#   OPENMONO_PRISM_FORCE_PULL=1 Re-pull the Prism image even if already present
 #
 # Dev/testing only (not user-facing):
 #   OPENMONO_MODEL_MIRROR=http://192.168.x.x:8080
@@ -29,6 +35,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_DIR="$(dirname "$SCRIPT_DIR")"  # repo root (parent of scripts/)
 # shellcheck source=lib/log.sh
 source "$SCRIPT_DIR/lib/log.sh"
+# shellcheck source=lib/prism.sh
+source "$SCRIPT_DIR/lib/prism.sh"
 
 # ── Context size presets (tokens) — edit here to change globally ─────────────
 CTX_24G=196608       # GPU 24GB+  q8_0 KV  (~8GB KV + 15GB weights ≈ 23GB)
@@ -67,6 +75,69 @@ select_model() {
             _MODEL_LABEL="Qwen3.6-35B-A3B (~17.6GB) [CPU]" ;;
     esac
     MODEL_ALIAS="${MODEL_NAME%.gguf}"
+}
+
+# (Bonsai model selection lives in scripts/lib/prism.sh as
+# select_bonsai_model(), shared with the macOS installer.)
+
+# Interactive model-family picker. Respects OPENMONO_MODEL when set
+# (auto/bonsai-pq2/bonsai-ptq1/qwen/bonsai). On a TTY with AUTO, asks the user;
+# otherwise defaults: GPU→Bonsai PQ2_0, CPU→Qwen (stock kernels).
+# Requires GPU_MODE or AMD_IGPU_MODE to be set by the caller. Sets IS_BONSAI=1
+# when a Bonsai quant is chosen (caller must then use the Prism image for
+# the matching backend: CUDA on NVIDIA, Vulkan on the 7940HS iGPU).
+prompt_model_family() {
+    IS_BONSAI=0
+    local choice="${OPENMONO_MODEL:-auto}"
+    case "$choice" in
+        bonsai-pq2|bonsai|pq2) select_bonsai_model pq2; return 0 ;;
+        bonsai-ptq1|ptq1)      select_bonsai_model ptq1; return 0 ;;
+        qwen) return 0 ;;  # keep select_model() result
+    esac
+    # choice == auto from here
+    if [ "${GPU_MODE:-0}" != "1" ] && [ "${AMD_IGPU_MODE:-0}" != "1" ]; then
+        # CPU-only box: stock Qwen MoE only. There is no Prism CPU image,
+        # so the picker never fires here and nobody is offered
+        # a model they can't run. An explicit --model=bonsai-* selection is
+        # left in place so Step 2 can fail with a clear message instead of
+        # silently installing the wrong model.
+        return 0
+    fi
+    # GPU/iGPU box from here on — the only place the picker fires.
+    if [ -t 0 ] && [[ -z "${OPENMONO_MODEL:-}" ]]; then
+        flush_stdin
+        echo ""
+        echo "  Which model for this GPU? (VRAM tier: ${_GPU_TIER:-?}GB)"
+        echo ""
+        echo "  1) Ternary-Bonsai-2-27B PQ2_0 (~7.2GB) [recommended 12GB+]"
+        echo "  2) Ternary-Bonsai-2-27B PTQ1_0 (~5.9GB) [8GB cards / tightest VRAM]"
+        echo "  3) Qwen stock (ghcr.io image, no Prism dependency)"
+        echo ""
+        if [ "${_GPU_TIER:-0}" -le 8 ]; then
+            printf "  Enter 1, 2 or 3 [default: 2]: "
+            read -r -n 1 _mf_choice; echo ""
+            case "${_mf_choice:-2}" in
+                1) select_bonsai_model pq2 ;;
+                3) : ;;
+                *) select_bonsai_model ptq1 ;;
+            esac
+        else
+            printf "  Enter 1, 2 or 3 [default: 1]: "
+            read -r -n 1 _mf_choice; echo ""
+            case "${_mf_choice:-1}" in
+                2) select_bonsai_model ptq1 ;;
+                3) : ;;
+                *) select_bonsai_model pq2 ;;
+            esac
+        fi
+        return 0
+    fi
+    # Non-interactive default: Bonsai PQ2_0 on 12GB+, PTQ1_0 on 8GB, Qwen on CPU.
+    if [ "${_GPU_TIER:-0}" -ge 12 ]; then
+        select_bonsai_model pq2
+    elif [ "${_GPU_TIER:-0}" -ge 8 ]; then
+        select_bonsai_model ptq1
+    fi
 }
 
 # ── Auto-recover from fresh `usermod -aG docker` ──────────────────────────────
@@ -251,6 +322,7 @@ MODEL_ACCURACY=""
 MODEL_ALIAS=""
 MODEL_MMPROJ=""
 MODEL_MMPROJ_URL=""
+IS_BONSAI=0
 if [ "$OPENMONO_ROLE" != "agent" ]; then
     if [ "${GPU_MODE:-0}" = "1" ]; then
         if command -v nvidia-smi &>/dev/null; then
@@ -259,8 +331,9 @@ if [ "$OPENMONO_ROLE" != "agent" ]; then
             if   [ "$_VRAM_MB" -ge 24000 ]; then _GPU_TIER=24; ok "GPU VRAM: $(( (_VRAM_MB + 512) / 1024 ))GB — full accuracy tier (24GB+)"
             elif [ "$_VRAM_MB" -ge 16000 ]; then _GPU_TIER=16; warn "GPU VRAM: $(( (_VRAM_MB + 512) / 1024 ))GB — lower accuracy tier (16GB). For best results use 24GB+ VRAM."
             elif [ "$_VRAM_MB" -ge 12000 ]; then _GPU_TIER=12; warn "GPU VRAM: $(( (_VRAM_MB + 512) / 1024 ))GB — lower accuracy tier (12GB). For best results use 24GB+ VRAM."
+            elif [ "$_VRAM_MB" -ge 8000 ]; then _GPU_TIER=8; warn "GPU VRAM: $(( (_VRAM_MB + 512) / 1024 ))GB — 8GB tier (Bonsai PTQ1_0 only, small context). For best results use 24GB+ VRAM."
             else
-                warn "GPU mode selected but only $(( (_VRAM_MB + 512) / 1024 ))GB VRAM — minimum is 12GB. Falling back to CPU mode."
+                warn "GPU mode selected but only $(( (_VRAM_MB + 512) / 1024 ))GB VRAM — minimum is 8GB. Falling back to CPU mode."
                 GPU_MODE=0
             fi
         else
@@ -278,6 +351,47 @@ if [ "$OPENMONO_ROLE" != "agent" ]; then
         fi
     fi
     select_model "$_GPU_TIER"
+    # Model picker fires here — AFTER hardware detection — and only prompts
+    # on NVIDIA GPU boxes (see prompt_model_family). Everywhere else the
+    # stock Qwen selection above stands, so nobody can select a model their
+    # box can't run. An explicit --model=bonsai-* flag is honored anywhere
+    # and validated by the gate below.
+    prompt_model_family
+    # Bonsai gate: needs an accelerated backend (NVIDIA/CUDA or 7940HS/Vulkan).
+    # Fail BEFORE the multi-GB model download, not after it.
+    if [ "${IS_BONSAI:-0}" = "1" ] && [ "${GPU_MODE:-0}" != "1" ] && [ "${AMD_IGPU_MODE:-0}" != "1" ]; then
+        die "Bonsai requires a GPU — CUDA: $(prism_image_cuda) / Vulkan: $(prism_image_vulkan). No CPU image exists. Re-run with --model=qwen for this box."
+    fi
+    # Early Docker Hub pull: verify the Prism image BEFORE the model download.
+    # Explicit --model=bonsai-* + unreachable registry = hard fail (user asked
+    # for it). Auto/prompt-selected Bonsai + unreachable registry = fall back
+    # to stock Qwen so setup still yields a working box.
+    # On the AMD iGPU path without an explicit bonsai flag, stay on stock
+    # Qwen (Vulkan Bonsai support is new) — only use the Vulkan Prism image
+    # when Bonsai was explicitly requested or already selected on NVIDIA.
+    if [ "${IS_BONSAI:-0}" = "1" ]; then
+        _PRISM_BACKEND="$(prism_backend)"
+        if ! pull_prism_image "$_PRISM_BACKEND"; then
+            case "${OPENMONO_MODEL:-auto}" in
+                bonsai-pq2|bonsai|pq2|bonsai-ptq1|ptq1)
+                    die "Prism image pull failed and --model=${OPENMONO_MODEL} was explicitly requested. Check network/Docker Hub, or re-run with --model=qwen." ;;
+                *)
+                    warn "Prism image unreachable — falling back to stock Qwen (no Prism image needed)"
+                    IS_BONSAI=0
+                    _FALLBACK_TIER="$_GPU_TIER"
+                    [ "${_FALLBACK_TIER:-0}" -lt 12 ] && _FALLBACK_TIER=12
+                    select_model "$_FALLBACK_TIER" ;;
+            esac
+        fi
+    fi
+    # 8GB VRAM: vision projector stays resident (~0.63GB + burst) — that plus
+    # 5.95GB weights leaves no headroom. Disable it; text inference only.
+    if [ "${IS_BONSAI:-0}" = "1" ] && [ "${_GPU_TIER:-0}" -le 8 ]; then
+        MODEL_MMPROJ=""
+        MODEL_MMPROJ_URL=""
+        warn "8GB VRAM: vision (mmproj) disabled to protect VRAM headroom."
+        warn "Re-enable later with an 8GB+ headroom check: download $PRISM_MMPROJ_NAME into models/ and set MODEL_MMPROJ in docker/.env"
+    fi
     ok "Model selected: $MODEL_NAME"
     if [ -n "${MODEL_MMPROJ:-}" ]; then
         detail "Vision projector: $MODEL_MMPROJ"
@@ -474,8 +588,29 @@ if [ "$OPENMONO_ROLE" != "agent" ]; then
     OVERRIDE_FILE="$INSTALL_DIR/docker/docker-compose.override.yml"
     
     if [ "${GPU_MODE:-0}" = "1" ]; then
-        # 24GB tier: q8 kv cache (high quality); 16GB/12GB tiers: q4 kv cache (saves VRAM)
-        if [ "$_GPU_TIER" -ge 24 ]; then
+        # Bonsai path: prebuilt Prism CUDA image from Docker Hub (stock llama.cpp rejects PQ2_0/PTQ1_0).
+        _LLAMA_IMAGE="ghcr.io/ggml-org/llama.cpp:server-cuda"
+        if [ "${IS_BONSAI:-0}" = "1" ]; then
+            pull_prism_image cuda || die "Prism image pull failed — cannot run Bonsai without it"
+            _LLAMA_IMAGE="$(prism_image_ref cuda)"
+            # Bonsai VRAM budget: weights (7.2/5.9GB) + KV. Keep ctx conservative;
+            # hybrid-attention backbone keeps long ctx practical, but KV is what OOMs.
+            if [ "${_GPU_TIER:-0}" -ge 24 ]; then
+                _KV_K="q8_0"; _KV_V="q8_0"
+                _CTX=$CTX_BONSAI_24G
+            elif [ "${_GPU_TIER:-0}" -ge 16 ]; then
+                _KV_K="q4_0"; _KV_V="q4_0"
+                _CTX=$CTX_BONSAI_16G
+            elif [ "${_GPU_TIER:-0}" -ge 12 ]; then
+                _KV_K="q4_0"; _KV_V="q4_0"
+                _CTX=$CTX_BONSAI_12G
+            else
+                _KV_K="q4_0"; _KV_V="q4_0"
+                _CTX=$CTX_BONSAI_8G
+                warn "8GB VRAM: Bonsai PTQ1_0 with ctx $_CTX — tight fit, keep prompts modest"
+            fi
+        elif [ "$_GPU_TIER" -ge 24 ]; then
+            # 24GB tier: q8 kv cache (high quality); 16GB/12GB tiers: q4 kv cache (saves VRAM)
             _KV_K="q8_0"; _KV_V="q8_0"
             _CTX=$CTX_24G
         elif [ "$_GPU_TIER" -ge 16 ]; then
@@ -486,41 +621,49 @@ if [ "$OPENMONO_ROLE" != "agent" ]; then
             _CTX=$CTX_12G
         fi
         # mmproj loads ~1–2 GB into VRAM — pull context back to stay within budget.
+        # Skipped when the base preset already fits vision (e.g. 12G @ 96k ≈ 9.6GB).
         if [ -n "${MODEL_MMPROJ:-}" ]; then
             _CTX_ORIG=$_CTX
             if [ "$_GPU_TIER" -ge 24 ]; then
                 _CTX=$CTX_VISION
-            else
+            elif [ "$_CTX" -gt "$CTX_VISION_16G" ]; then
                 _CTX=$CTX_VISION_16G
             fi
-            detail "Vision enabled: context reduced from $(( _CTX_ORIG / 1024 ))k → $(( _CTX / 1024 ))k to fit mmproj in VRAM"
+            if [ "$_CTX" -ne "$_CTX_ORIG" ]; then
+                detail "Vision enabled: context reduced from $(( _CTX_ORIG / 1024 ))k → $(( _CTX / 1024 ))k to fit mmproj in VRAM"
+            else
+                detail "Vision enabled: context kept at $(( _CTX / 1024 ))k (fits alongside mmproj)"
+            fi
         fi
         [ "$MODEL_ACCURACY" = "lower" ] && info "Lower accuracy model selected — q4 kv cache enabled to fit $(( (_VRAM_MB + 512) / 1024 ))GB VRAM"
         # Append mmproj flag inline with --metrics; empty string when no projector configured.
         MMPROJ_OPT="${MODEL_MMPROJ:+--mmproj /models/${MODEL_MMPROJ} --image-min-tokens 1024 --image-max-tokens 1280}"
         info "Writing GPU override: $OVERRIDE_FILE"
         cat > "$OVERRIDE_FILE" <<EOF
-# GPU configuration (auto-generated by install.sh — ${MODEL_ACCURACY:-full} accuracy)
+# GPU/Bonsai configuration (auto-generated by install.sh — ${MODEL_ACCURACY:-full} accuracy)
+# Runtime knobs resolve from docker/.env (installer defaults after each :-)
+# so tuning never needs a re-run: edit docker/.env, then
+# `docker compose up -d llama-server`.
 services:
   llama-server:
-    image: ghcr.io/ggml-org/llama.cpp:server-cuda
+    image: \${LLAMA_IMAGE:-$_LLAMA_IMAGE}
     command: >
       --model /models/\${MODEL_NAME}
       --alias \${MODEL_ALIAS:-model}
       --host 0.0.0.0
       --port 7474
-      --ctx-size $_CTX
-      --threads 14
-      --n-gpu-layers 99
-      --flash-attn on
-      --cache-type-k $_KV_K
-      --cache-type-v $_KV_V
-      --batch-size 2048
-      --ubatch-size 1024
-      --parallel 1
+      --ctx-size \${CTX_SIZE:-$_CTX}
+      --threads \${LLAMA_THREADS:-14}
+      --n-gpu-layers \${N_GPU_LAYERS:-99}
+      --flash-attn \${LLAMA_FLASH_ATTN:-on}
+      --cache-type-k \${KV_CACHE_K:-$_KV_K}
+      --cache-type-v \${KV_CACHE_V:-$_KV_V}
+      --batch-size \${LLAMA_BATCH:-2048}
+      --ubatch-size \${LLAMA_UBATCH:-1024}
+      --parallel \${LLAMA_PARALLEL:-1}
       --jinja
       --reasoning off
-      --metrics ${MMPROJ_OPT}
+      --metrics \${MODEL_MMPROJ:+--mmproj /models/\${MODEL_MMPROJ} --image-min-tokens 1024 --image-max-tokens 1280}
       \${LLAMA_API_KEY:+--api-key \${LLAMA_API_KEY}}
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
@@ -537,12 +680,12 @@ EOF
     printf "     ${DIM}model: $MODEL_NAME  ·  ctx: $(( _CTX / 1024 ))k  ·  kv: ${_KV_K}  ·  layers: 99  ·  accuracy: ${MODEL_ACCURACY:-full}  ·  vision: ${MODEL_MMPROJ:-disabled}${NC}\n"
     printf "     ${DIM}config: $OVERRIDE_FILE  (restart: docker compose up -d llama-server)${NC}\n"
 
-    printf "\n  ${BOLD}${CYAN}Tuning knobs${NC}\n"
-    printf "     ${DIM}--ctx-size N      halve to free ~half the KV-cache VRAM${NC}\n"
-    printf "     ${DIM}                  presets: 32k=32768  64k=65536  128k=131072  192k=196608${NC}\n"
-    printf "     ${DIM}--cache-type-k/v  f16 (best) → q8_0 → q5_1 → q4_1 → q4_0 (least VRAM)${NC}\n"
-    printf "     ${DIM}--n-gpu-layers    99=all on GPU; lower to spill layers to CPU RAM${NC}\n"
-    printf "     ${DIM}--parallel N      N concurrent slots, each costs ctx-size of KV cache${NC}\n"
+    printf "\n  ${BOLD}${CYAN}Tuning knobs (docker/.env, then: docker compose up -d llama-server)${NC}\n"
+    printf "     ${DIM}CTX_SIZE=N        halve to free ~half the KV-cache VRAM${NC}\n"
+    printf "     ${DIM}                  presets: 32k=32768  64k=65536  96k=98304  128k=131072  192k=196608${NC}\n"
+    printf "     ${DIM}KV_CACHE_K/V      f16 (best) → q8_0 → q5_1 → q4_1 → q4_0 (least VRAM)${NC}\n"
+    printf "     ${DIM}N_GPU_LAYERS      99=all on GPU; lower to spill layers to CPU RAM${NC}\n"
+    printf "     ${DIM}LLAMA_PARALLEL=N  N concurrent slots, each costs ctx-size of KV cache${NC}\n"
     if [ -n "${MODEL_MMPROJ:-}" ]; then
     printf "\n  ${BOLD}${CYAN}Vision (enabled by default)${NC}\n"
     printf "     ${DIM}Vision encoder (mmproj) is loaded alongside the model${NC}\n"
@@ -572,6 +715,14 @@ EOF
 elif [ "${AMD_IGPU_MODE:-0}" = "1" ]; then
     info "Writing AMD iGPU (Vulkan) override: $OVERRIDE_FILE"
 
+    # Bonsai on the 7940HS path uses the Prism Vulkan image from Docker Hub;
+    # stock Qwen keeps the upstream Vulkan image.
+    _VULKAN_IMAGE="ghcr.io/ggml-org/llama.cpp:server-vulkan-b9070"
+    if [ "${IS_BONSAI:-0}" = "1" ]; then
+        pull_prism_image vulkan || die "Prism Vulkan image pull failed — cannot run Bonsai without it"
+        _VULKAN_IMAGE="$(prism_image_ref vulkan)"
+    fi
+
     # Context size reduction for mmproj (same as CPU branch)
     _CTX_ORIG=196608
     _CTX=196608
@@ -583,18 +734,18 @@ elif [ "${AMD_IGPU_MODE:-0}" = "1" ]; then
 
     cat > "$OVERRIDE_FILE" <<EOF
 # AMD Radeon 780M iGPU / Vulkan configuration (auto-generated by install.sh)
+# Runtime knobs resolve from docker/.env (installer defaults after each :-)
+# so tuning never needs a re-run: edit docker/.env, then
+# `docker compose up -d llama-server`.
+# NOTE: models volume + host port mapping come from the base compose file.
 services:
   llama-server:
-    image: ghcr.io/ggml-org/llama.cpp:server-vulkan-b9070
+    image: \${LLAMA_IMAGE:-$_VULKAN_IMAGE}
     devices:
       - /dev/dri:/dev/dri
     group_add:
       - "44"
       - "109"
-    volumes:
-      - ~/openmono.ai/models:/models
-    ports:
-      - "\${LLAMA_PORT:-7474}:\${LLAMA_PORT:-7474}"
     shm_size: "4gb"
     environment:
       - GGML_VULKAN_DEVICE=0
@@ -604,30 +755,30 @@ services:
       --alias \${MODEL_ALIAS:-model}
       --host 0.0.0.0
       --port 7474
-      --ctx-size $_CTX
+      --ctx-size \${CTX_SIZE:-$_CTX}
       --no-mmap
-      --threads 8
-      --threads-batch 8
-      --batch-size 512
-      --ubatch-size 256
-      -ngl 99
-      --n-gpu-layers 99
-      --flash-attn on
-      --cache-type-k q8_0
-      --cache-type-v q8_0
-      --parallel 1
+      --threads \${LLAMA_THREADS:-8}
+      --threads-batch \${LLAMA_THREADS:-8}
+      --batch-size \${LLAMA_BATCH:-512}
+      --ubatch-size \${LLAMA_UBATCH:-256}
+      -ngl \${N_GPU_LAYERS:-99}
+      --n-gpu-layers \${N_GPU_LAYERS:-99}
+      --flash-attn \${LLAMA_FLASH_ATTN:-on}
+      --cache-type-k \${KV_CACHE_K:-q8_0}
+      --cache-type-v \${KV_CACHE_V:-q8_0}
+      --parallel \${LLAMA_PARALLEL:-1}
       --jinja
       --reasoning off
-      --metrics ${MMPROJ_OPT}
+      --metrics \${MODEL_MMPROJ:+--mmproj /models/\${MODEL_MMPROJ} --image-min-tokens 1024 --image-max-tokens 1280}
       \${LLAMA_API_KEY:+--api-key \${LLAMA_API_KEY}}
 EOF
     ok "AMD iGPU override written"
     printf "     ${DIM}model: $MODEL_NAME  ·  ctx: $(( _CTX / 1024 ))k  ·  kv: q8_0  ·  gpu-layers: 99  ·  vision: ${MODEL_MMPROJ:-disabled}${NC}\n"
     printf "     ${DIM}config: $OVERRIDE_FILE  (restart: docker compose up -d llama-server)${NC}\n"
 
-    printf "\n  ${BOLD}${CYAN}Tuning knobs${NC}\n"
-    printf "     ${DIM}--ctx-size N      up to 196608 (GTT limits: ~28GB system RAM as VRAM)${NC}\n"
-    printf "     ${DIM}--cache-type-k/v  f16 (best) → q8_0 → q5_1 → q4_1 → q4_0 (least RAM)${NC}\n"
+    printf "\n  ${BOLD}${CYAN}Tuning knobs (docker/.env, then: docker compose up -d llama-server)${NC}\n"
+    printf "     ${DIM}CTX_SIZE=N        up to 196608 (GTT limits: ~28GB system RAM as VRAM)${NC}\n"
+    printf "     ${DIM}KV_CACHE_K/V      f16 (best) → q8_0 → q5_1 → q4_1 → q4_0 (least RAM)${NC}\n"
     printf "     ${DIM}--no-mmap         prevents kernel double-mapping with GTT allocation${NC}\n"
 
     printf "\n  ${BOLD}${CYAN}Swapping models${NC}\n"
@@ -654,39 +805,49 @@ else
         detail "Vision enabled: context reduced from $(( _CTX_ORIG / 1024 ))k → $(( CTX_VISION / 1024 ))k to fit mmproj in RAM"
     fi
     MMPROJ_OPT="${MODEL_MMPROJ:+--mmproj /models/${MODEL_MMPROJ} --image-min-tokens 1024 --image-max-tokens 1280}"
+    # Bonsai is gated to CUDA/Vulkan in Step 2 — reaching here means a manual
+    # override slipped through. Fail loudly: the stock image can't run it.
+    if [ "${IS_BONSAI:-0}" = "1" ]; then
+        die "Bonsai on CPU is unsupported — no Prism CPU image exists (CUDA: $(prism_image_cuda), Vulkan: $(prism_image_vulkan)). Re-run with --model=qwen."
+    fi
+    _CPU_IMAGE="ghcr.io/ggml-org/llama.cpp:server"
+    _CPU_COMMENT="# CPU-only configuration (auto-generated by install.sh)"
     cat > "$OVERRIDE_FILE" <<EOF
-# CPU-only configuration (auto-generated by install.sh)
+$_CPU_COMMENT
+# Runtime knobs resolve from docker/.env (installer defaults after each :-)
+# so tuning never needs a re-run: edit docker/.env, then
+# `docker compose up -d llama-server`.
 services:
   llama-server:
-    image: ghcr.io/ggml-org/llama.cpp:server
+    image: \${LLAMA_IMAGE:-$_CPU_IMAGE}
     command: >
       --model /models/\${MODEL_NAME}
       --alias \${MODEL_ALIAS:-model}
       --host 0.0.0.0
       --port 7474
-      --ctx-size $_CTX
-      --threads $CPU_THREADS
-      --threads-batch $CPU_THREADS
-      --batch-size 2048
-      --ubatch-size 1024
-      --flash-attn on
-      --cache-type-k q8_0
-      --cache-type-v q8_0
-      --parallel 1
+      --ctx-size \${CTX_SIZE:-$_CTX}
+      --threads \${LLAMA_THREADS:-$CPU_THREADS}
+      --threads-batch \${LLAMA_THREADS:-$CPU_THREADS}
+      --batch-size \${LLAMA_BATCH:-2048}
+      --ubatch-size \${LLAMA_UBATCH:-1024}
+      --flash-attn \${LLAMA_FLASH_ATTN:-on}
+      --cache-type-k \${KV_CACHE_K:-q8_0}
+      --cache-type-v \${KV_CACHE_V:-q8_0}
+      --parallel \${LLAMA_PARALLEL:-1}
       --jinja
       --reasoning off
-      --metrics ${MMPROJ_OPT}
+      --metrics \${MODEL_MMPROJ:+--mmproj /models/\${MODEL_MMPROJ} --image-min-tokens 1024 --image-max-tokens 1280}
       \${LLAMA_API_KEY:+--api-key \${LLAMA_API_KEY}}
 EOF
     ok "CPU override written"
     printf "     ${DIM}model: $MODEL_NAME  ·  ctx: $(( _CTX / 1024 ))k  ·  kv: q8_0  ·  threads: $CPU_THREADS (physical cores)  ·  vision: ${MODEL_MMPROJ:-disabled}${NC}\n"
     printf "     ${DIM}config: $OVERRIDE_FILE  (restart: docker compose up -d llama-server)${NC}\n"
 
-    printf "\n  ${BOLD}${CYAN}Tuning knobs${NC}\n"
-    printf "     ${DIM}--ctx-size N      halve to free ~half the KV-cache RAM, speeds up prompt processing${NC}\n"
-    printf "     ${DIM}                  presets: 32k=32768  64k=65536  128k=131072  192k=196608${NC}\n"
-    printf "     ${DIM}--cache-type-k/v  f16 (best) → q8_0 → q5_1 → q4_1 → q4_0 (least RAM)${NC}\n"
-    printf "     ${DIM}--threads N       physical cores optimal ($CPU_THREADS); SMT/HT hurts llama.cpp throughput${NC}\n"
+    printf "\n  ${BOLD}${CYAN}Tuning knobs (docker/.env, then: docker compose up -d llama-server)${NC}\n"
+    printf "     ${DIM}CTX_SIZE=N        halve to free ~half the KV-cache RAM, speeds up prompt processing${NC}\n"
+    printf "     ${DIM}                  presets: 32k=32768  64k=65536  96k=98304  128k=131072  192k=196608${NC}\n"
+    printf "     ${DIM}KV_CACHE_K/V      f16 (best) → q8_0 → q5_1 → q4_1 → q4_0 (least RAM)${NC}\n"
+    printf "     ${DIM}LLAMA_THREADS=N   physical cores optimal ($CPU_THREADS); SMT/HT hurts llama.cpp throughput${NC}\n"
     if [ -n "${MODEL_MMPROJ:-}" ]; then
     printf "\n  ${BOLD}${CYAN}Vision (enabled by default)${NC}\n"
     printf "     ${DIM}Vision encoder (mmproj) is loaded alongside the model${NC}\n"
@@ -767,6 +928,12 @@ run docker compose down || true
 
 # Only build the images this role actually needs.
 if [ "$OPENMONO_ROLE" != "agent" ]; then
+    if [ "${IS_BONSAI:-0}" = "1" ]; then
+        _PRISM_BACKEND="$(prism_backend)"
+        info "Bonsai selected — using prebuilt Prism image from Docker Hub (no llama-server build)"
+        detail "Image: $(prism_image_ref "$_PRISM_BACKEND")"
+        prism_image_available "$_PRISM_BACKEND" || die "Prism image '$(prism_image_ref "$_PRISM_BACKEND")' missing — pull failed earlier"
+    else
     info "Building llama-server image..."
     if [ "${GPU_MODE:-0}" = "1" ]; then
         if ! run docker compose build --no-cache llama-server; then
@@ -776,6 +943,7 @@ if [ "$OPENMONO_ROLE" != "agent" ]; then
         if ! run docker compose build llama-server; then
             die "llama-server build failed"
         fi
+    fi
     fi
 fi
 
