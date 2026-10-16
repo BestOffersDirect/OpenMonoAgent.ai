@@ -111,12 +111,21 @@ services:
     volumes:
       - ${WORKSPACE:-.}:/workspace
       - ${HOME}/.openmono:/home/agent/.openmono
+      # Host-bridge authority stays host-side: the pair secret is read-only
+      # inside the sandbox (manual /host on can read it; the sandbox can never
+      # flip sudo_policy or edit the deny-list), and the daemon's command-audit
+      # dir is shadowed by tmpfs so the sandbox cannot see or tamper it.
+      - ${HOME}/.openmono/host-bridge.json:/home/agent/.openmono/host-bridge.json:ro
+      - type: tmpfs
+        target: /home/agent/.openmono/host-bridge/logs
+      - type: tmpfs
+        target: /home/agent/.openmono/logs
       - ${HOME}/.code-review-graph:/home/agent/.code-review-graph
       - ../ref:/ref:ro
-      # Server ops (optional): to let the agent run `docker` / `docker compose`
-      # against the host daemon (deploy + troubleshoot containerized backends),
-      # `openmono agent` bind-mounts /var/run/docker.sock automatically when it
-      # exists. If you invoke compose directly, add it yourself:
+      # Server ops (opt-in): the docker.sock is NOT mounted by default. The
+      # launcher mounts it only with OPENMONO_DOCKER_SOCK=1 (it grants the
+      # sandbox host-root-equivalent power — enable deliberately). If you
+      # invoke compose directly, add it yourself:
       #   - /var/run/docker.sock:/var/run/docker.sock
     environment:
       - HOME=/home/agent

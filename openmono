@@ -1354,6 +1354,11 @@ cmd_agent_sandbox() {
     export WORKSPACE
 
     mkdir -p "${HOME}/.openmono"
+    # The compose file bind-mounts host-bridge.json read-only into the sandbox.
+    # A missing bind source makes Docker create a DIRECTORY at that host path,
+    # which then blocks the daemon from writing its config there. Ensure the
+    # file exists (empty = daemon generates defaults on first host-mode run).
+    [[ -e "${HOME}/.openmono/host-bridge.json" ]] || : > "${HOME}/.openmono/host-bridge.json"
 
     cd "$DOCKER_DIR"
 
