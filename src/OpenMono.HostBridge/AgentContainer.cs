@@ -105,6 +105,7 @@ public sealed class AgentContainer
         if (!string.IsNullOrWhiteSpace(settings.Scrape))
             args.Append($"-e OPENMONO_WEB_SCRAPE={settings.Scrape} ");
         args.Append($"-e HOST_ACP_PORT={hostPort} ");
+        args.Append($"-e OPENMONO_HOST_OS={(OperatingSystem.IsMacOS() ? "Darwin" : "Linux")} ");
         args.Append("-e GIT_TERMINAL_PROMPT=0 ");
         args.Append("agent --acp-only --acp-port 7475");
 

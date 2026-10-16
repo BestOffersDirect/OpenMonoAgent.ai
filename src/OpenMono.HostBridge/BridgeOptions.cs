@@ -168,9 +168,10 @@ public sealed class BridgeOptions
         Console.WriteLine("                      (env: OPENMONO_HOST_RUN_AS, OPENMONO_HOST_PASSWORD_FILE)");
         Console.WriteLine("  --daemon            Run as the bare-metal host DAEMON (sandbox sessions pair in)");
         Console.WriteLine("                      instead of driving a container as an operator. Listens on");
-        Console.WriteLine("                      127.0.0.1:<--daemon-port> (default 7476) plus, on Linux, the");
-        Console.WriteLine("                      docker bridge gateway (docker0/br-*) so containers can reach");
-        Console.WriteLine("                      it via host.docker.internal. Never binds 0.0.0.0. Pairing");
+        Console.WriteLine("                      127.0.0.1:<--daemon-port> (default 7476) plus the docker");
+        Console.WriteLine("                      bridge gateway (docker0/br-* on Linux; the vmnet bridge1xx");
+        Console.WriteLine("                      on macOS for Colima/Lima) so containers can reach it via");
+        Console.WriteLine("                      host.docker.internal. Never binds 0.0.0.0. Pairing");
         Console.WriteLine("                      needs pair_secret (config / OPENMONO_HOST_PAIR_SECRET).");
         Console.WriteLine("                      Sudo needs allow_sudo=allow (no human at the daemon).");
         Console.WriteLine("  --daemon-port <n>   Loopback port for --daemon (default 7476)");

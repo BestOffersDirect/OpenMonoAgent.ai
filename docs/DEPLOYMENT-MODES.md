@@ -103,6 +103,10 @@ Project layout (`src/OpenMono.HostBridge/`, .NET 10, references the CLI project 
   standing orders (`/host off` revokes it mid-session). From inside the
   container the daemon is reached via `host.docker.internal`; the pair
   secret is read from the bind-mounted `~/.openmono/host-bridge.json`.
+  On macOS the daemon binds loopback plus the vmnet bridge (`bridge1xx` —
+  Colima/Lima's gateway), and the sandbox is told the host OS via
+  `OPENMONO_HOST_OS` so it dials the right route on either Docker Desktop
+  (vpnkit) or Colima (vmnet).
 - **Build mode by default.** Fresh and attached host sessions are explicitly set
   to `build` via the stock `{"mode": …}` turn - new ACP sessions default to plan
   (read-only), which cannot operate a server. `--plan` opts back into read-only.

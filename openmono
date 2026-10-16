@@ -1369,6 +1369,12 @@ cmd_agent_host() {
     local settings="$HOME/.openmono/settings.json"
     local cfg_endpoint=""
     if [[ -f "$settings" ]] && command -v jq &>/dev/null; then
+        if ! jq -e . "$settings" >/dev/null 2>&1; then
+            err "~/.openmono/settings.json is corrupt — cannot read llm.endpoint."
+            err "Check for stray text after the closing brace (a stray character breaks the whole file),"
+            err "or restore settings.json.bak, then re-run 'openmono config set llm.endpoint <url>'."
+            exit 1
+        fi
         cfg_endpoint=$(jq -r '.llm.endpoint // empty' "$settings")
     fi
     if [[ -z "$cfg_endpoint" ]]; then
@@ -1431,6 +1437,10 @@ cmd_agent_host() {
         | jq -r '.invite // empty' 2>/dev/null)"
     export OPENMONO_HOST_MODE=1
     export OPENMONO_HOST_DAEMON_URL="http://host.docker.internal:${HOST_DAEMON_PORT}"
+    # The sandbox needs the HOST's OS, not the container's: the daemon-URL
+    # rewrite (host.docker.internal -> bridge IPv4) is a Linux-host behavior,
+    # and macOS routing (Docker Desktop vpnkit vs Colima vmnet) differs.
+    export OPENMONO_HOST_OS="$(uname -s)"
     if [[ -n "$invite" ]]; then
         export OPENMONO_HOST_INVITE="$invite"
     else
@@ -1484,6 +1494,12 @@ cmd_agent_sandbox() {
     local settings="$HOME/.openmono/settings.json"
     local cfg_endpoint cfg_key cfg_web_gateway cfg_web_search cfg_web_scrape
     if [[ -f "$settings" ]] && command -v jq &>/dev/null; then
+        if ! jq -e . "$settings" >/dev/null 2>&1; then
+            err "~/.openmono/settings.json is corrupt — cannot read llm.endpoint."
+            err "Check for stray text after the closing brace (a stray character breaks the whole file),"
+            err "or restore settings.json.bak, then re-run 'openmono config set llm.endpoint <url>'."
+            exit 1
+        fi
         cfg_endpoint=$(jq -r '.llm.endpoint // empty' "$settings")
         cfg_key=$(jq -r '.llm.api_key // empty' "$settings")
         [[ -n "$cfg_key" ]] && export OPENMONO_API_KEY="$cfg_key"
@@ -1615,6 +1631,7 @@ cmd_agent_sandbox() {
         extra_env+=(
             -e "OPENMONO_HOST_MODE=1"
             -e "OPENMONO_HOST_DAEMON_URL=${OPENMONO_HOST_DAEMON_URL:-}"
+            -e "OPENMONO_HOST_OS=${OPENMONO_HOST_OS:-}"
             -e "OPENMONO_HOST_WORKSPACE=${OPENMONO_HOST_WORKSPACE:-$WORKSPACE}")
         # The invite (one-shot) is preferred; the pair secret never enters the
         # sandbox when the daemon supports /admin/invite.

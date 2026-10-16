@@ -22,6 +22,7 @@ public static class HostGatewayBootstrap
     public const string SecretEnv = "OPENMONO_HOST_PAIR_SECRET";
     public const string InviteEnv = "OPENMONO_HOST_INVITE";
     public const string WorkDirEnv = "OPENMONO_HOST_WORKSPACE";
+    public const string HostOsEnv = "OPENMONO_HOST_OS";
     public const string DefaultPort = "7476";
 
     private static readonly SemaphoreSlim Gate = new(1, 1);
@@ -40,17 +41,29 @@ public static class HostGatewayBootstrap
         var host = parsed?.Host is { Length: > 0 } h ? h : (File.Exists("/.dockerenv") ? "host.docker.internal" : "127.0.0.1");
         var port = parsed is not null && parsed.Port > 0 ? parsed.Port : int.Parse(DefaultPort);
 
-        // On Linux the daemon binds the docker bridge gateway IPs (docker0 /
-        // br-*), and managed HttpListener matches the Host: header against
-        // bound prefixes — so dialing the literal name host.docker.internal
-        // 404s even when routing works. Dial its resolved IPv4 instead; the
-        // Host header then matches the bridge the daemon bound. Only that
-        // well-known name is rewritten: any other explicit URL is used
-        // exactly as configured (an operator pointing at a dead URL must
-        // get the error they configured for, not a silent fallback).
-        // macOS (Docker Desktop) forwards host.docker.internal to host
-        // loopback with a matching Host header — leave it alone.
-        if (OperatingSystem.IsLinux() && File.Exists("/.dockerenv") && host == "host.docker.internal")
+        // On Linux hosts the daemon binds the docker bridge gateway IPs
+        // (docker0 / br-*), and managed HttpListener matches the Host: header
+        // against bound prefixes — so dialing the literal name
+        // host.docker.internal 404s even when routing works. Dial its resolved
+        // IPv4 instead; the Host header then matches the bridge the daemon
+        // bound. Only that well-known name is rewritten: any other explicit
+        // URL is used exactly as configured (an operator pointing at a dead
+        // URL must get the error they configured for, not a silent fallback).
+        //
+        // Gate on the HOST's OS, not the container's — the container is always
+        // Linux, so OperatingSystem.IsLinux() here is true on macOS hosts too
+        // and the rewrite silently misroutes them: Colima/Lima resolve
+        // host.docker.internal to the vmnet gateway (192.168.5.2), which
+        // dials a host address the loopback-bound daemon never accepts. On
+        // macOS leave the literal name alone: Docker Desktop's vpnkit and
+        // Lima's vmnet both route it to the host, and the client's
+        // Host-header override (HostDaemonClient) matches a bound prefix on
+        // either path.
+        var hostOs = (Environment.GetEnvironmentVariable(HostOsEnv) ?? "").Trim();
+        var hostIsLinux = hostOs.Length > 0
+            ? hostOs.Equals("Linux", StringComparison.OrdinalIgnoreCase)
+            : OperatingSystem.IsLinux(); // pre-OPENMONO_HOST_OS launcher: best guess
+        if (hostIsLinux && File.Exists("/.dockerenv") && host == "host.docker.internal")
         {
             try
             {

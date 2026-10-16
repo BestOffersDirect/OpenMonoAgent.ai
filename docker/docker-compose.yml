@@ -154,6 +154,7 @@ services:
       # still pair manually against a reachable daemon.
       - OPENMONO_HOST_MODE=${OPENMONO_HOST_MODE:-}
       - OPENMONO_HOST_DAEMON_URL=${OPENMONO_HOST_DAEMON_URL:-}
+      - OPENMONO_HOST_OS=${OPENMONO_HOST_OS:-}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     stdin_open: true

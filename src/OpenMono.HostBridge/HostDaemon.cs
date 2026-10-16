@@ -114,25 +114,32 @@ public sealed class HostDaemon : IAsyncDisposable
     }
 
     /// <summary>
-    /// Docker bridge gateway IPs on this box (docker0 / br-*) that a sandbox
-    /// container reaches as <c>host.docker.internal</c> when Docker resolves
-    /// <c>host-gateway</c>. Empty on macOS (Docker Desktop's VM forwards the
-    /// host loopback) and when Docker has no bridge yet. Loopback-only
-    /// listeners are NOT reachable this way on Linux — that is why the daemon
-    /// binds these too. Only ever local bridge subnets, never a LAN address.
-    /// Down bridges are included: an idle docker0 (carrier=0) still owns its
-    /// IP and still accepts connections routed in from other bridge networks
-    /// — which is exactly how host-gateway resolves on multi-network hosts.
+    /// Bridge gateway IPs on this box that a sandbox container reaches as
+    /// <c>host.docker.internal</c>. Linux: the docker bridge networks
+    /// (docker0 / br-*). macOS: the vmnet shared bridges (bridge1xx — Lima /
+    /// Colima's 192.168.5.x gateway and Docker Desktop's equivalent), so a
+    /// Colima sandbox can dial the VM gateway and land on a bound prefix
+    /// (Docker Desktop still routes through vpnkit to loopback, but binding
+    /// bridge100 is harmless and covers both runtimes). bridge0 is excluded —
+    /// it is Thunderbolt/AirDrop networking, not a container bridge. Empty
+    /// when no such bridge exists. Loopback-only listeners are NOT reachable
+    /// this way — that is why the daemon binds these too. Only ever local
+    /// bridge subnets, never a LAN address. Down bridges are included: an
+    /// idle docker0 (carrier=0) still owns its IP and still accepts
+    /// connections routed in from other bridge networks — which is exactly
+    /// how host-gateway resolves on multi-network hosts.
     /// </summary>
     public static string[] DetectDockerBridgeAddresses()
     {
-        if (!OperatingSystem.IsLinux()) return [];
         try
         {
+            var vmBridgePrefix = OperatingSystem.IsMacOS() ? "bridge1" : null;
             return System.Net.NetworkInformation.NetworkInterface.GetAllNetworkInterfaces()
                 .Where(ni => ni.NetworkInterfaceType != System.Net.NetworkInformation.NetworkInterfaceType.Loopback &&
                              (ni.Name.StartsWith("docker", StringComparison.Ordinal) ||
-                              ni.Name.StartsWith("br-", StringComparison.Ordinal)))
+                              ni.Name.StartsWith("br-", StringComparison.Ordinal) ||
+                              (vmBridgePrefix is not null &&
+                               ni.Name.StartsWith(vmBridgePrefix, StringComparison.Ordinal))))
                 .SelectMany(ni => ni.GetIPProperties().UnicastAddresses)
                 .Where(ua => ua.Address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
                 .Select(ua => ua.Address.ToString())

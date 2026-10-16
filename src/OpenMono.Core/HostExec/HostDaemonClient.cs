@@ -106,12 +106,15 @@ public sealed class HostDaemonClient : IDisposable
     }
 
     /// <summary>
-    /// The daemon binds loopback-only (http://127.0.0.1:&lt;port&gt;/) so whole-machine
-    /// exec is never exposed to the LAN. Requests from inside a container reach
-    /// that socket through Docker's host.docker.internal gateway, but the
-    /// Host: header then names the gateway, which HttpListener 404s before the
-    /// request ever reaches the daemon. Rewrite the header to the loopback
-    /// form the daemon's prefix actually matches — TCP path unchanged.
+    /// The daemon always binds loopback (http://127.0.0.1:&lt;port&gt;/) plus any
+    /// detected VM bridge IPs, so whole-machine exec is never exposed to the
+    /// LAN. Requests from inside a container reach it through Docker's
+    /// host.docker.internal gateway, but the Host: header then names the
+    /// gateway, which HttpListener 404s before the request ever reaches the
+    /// daemon — on every route: Docker Desktop's vpnkit forwards to host
+    /// loopback, and Colima/Lima dial a vmnet bridge IP. Rewrite the header
+    /// to the loopback form — 127.0.0.1 is a bound prefix on both runtimes,
+    /// so the request is accepted however it was routed. TCP path unchanged.
     /// </summary>
     internal static string? ResolveHostHeaderOverride(string baseUrl)
     {
