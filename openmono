@@ -474,7 +474,7 @@ cmd_setup() {
                 echo "  --model=qwen         Stock Qwen on standard llama.cpp  [DEFAULT]"
                 echo "  --model=bonsai-pq2   Ternary-Bonsai-2-27B PQ2_0 (~7.2GB) [NVIDIA CUDA / 7940HS Vulkan / Apple Silicon 16GB+ experimental]"
                 echo "  --model=bonsai-ptq1  Ternary-Bonsai-2-27B PTQ1_0 (~5.9GB, small cards)"
-                echo "  --model=flash-next   Qwen3.8-Flash-Next via Strata (~70GB, Linux + NVIDIA / CUDA 13, 64GB RAM+)"
+                echo "  --model=flash-next   Qwen3.8-Flash-Next via Strata (~70GB, Linux + NVIDIA / CUDA 13, 48GB-class RAM+)"
                 echo "  --bonsai / --bonsai-ptq1 / --qwen / --flash-next   shorthands for the above"
                 echo ""
                 echo "GPU mode (applies to --full and --inference):"

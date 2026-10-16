@@ -5,7 +5,10 @@ set -euo pipefail
 # OpenMono.ai — Prerequisite Installer for Ubuntu (and Ubuntu derivatives)
 #
 # Installs: Docker, git, cmake, curl, jq, .NET 10, ripgrep, build-essential,
-#           (and CUDA + nvidia-container-toolkit if an NVIDIA GPU is detected).
+#           driver + nvidia-container-toolkit if an NVIDIA GPU is detected.
+#           The CUDA 13.x toolkit is Strata-only: it is installed up front only
+#           when Strata was explicitly requested (--model=flash-next);
+#           otherwise scripts/strata.sh installs it on demand.
 #
 # Ubuntu derivatives (Linux Mint, Pop!_OS, Zorin, elementary, KDE neon, …) are
 # supported: their VERSION_CODENAME (e.g. Linux Mint "zara") is mapped to the
@@ -351,6 +354,22 @@ else
         NVIDIA_REBOOT_PENDING=true
     fi
 
+    # CUDA 13.x toolkit: Strata-only. The llama.cpp and Bonsai Docker backends
+    # need only the driver + nvidia-container-toolkit; a CUDA 13.x toolkit
+    # (~4GB) is required solely by the Strata engine (nvcc >= 13.0). Boxes that
+    # never opted into Strata must not pay for it — scripts/strata.sh installs
+    # it automatically (same NVIDIA-repo flow, same release-dir fallbacks) the
+    # first time Strata is actually installed, and 'bash scripts/strata.sh
+    # update-cuda' applies it any time later. Prereqs installs it up front only
+    # when Strata was explicitly requested (flag or env).
+    _strata_wanted=0
+    if [ "${OPENMONO_MODEL:-}" = "flash-next" ] || [ "${OPENMONO_INFERENCE_BACKEND:-}" = "strata" ]; then
+        _strata_wanted=1
+    fi
+    if [ "$_strata_wanted" != 1 ]; then
+        detail "CUDA 13.x toolkit not installed — only Strata needs it; scripts/strata.sh installs it on demand."
+    else
+
     # CUDA 13.x toolkit from NVIDIA's official apt repo.
     #
     # The old approach (`apt install nvidia-cuda-toolkit`) pulled Ubuntu's
@@ -403,7 +422,9 @@ else
         # NVIDIA names its CUDA repo dirs by release number (ubuntu2404), not
         # by lsb-release codename (noble) — the codename path 404s even on the
         # distros where the repo exists.
-        _cuda_release="$(sed -n 's/^VERSION_ID=//p' /etc/os-release 2>/dev/null | tr -d '.')"
+        # VERSION_ID is quoted in /etc/os-release (VERSION_ID="26.04") — strip
+        # the quotes AND the dot, or the repo dir becomes ubuntu"2604" and 404s.
+        _cuda_release="$(sed -n 's/^VERSION_ID=//p' /etc/os-release 2>/dev/null | tr -d '".')"
         if [ -z "$_cuda_release" ]; then
             _cuda_release="$(ubuntu_codename)"
         fi
@@ -446,7 +467,7 @@ else
             for _try in 2404 2204 2004; do
                 _cuda_fb_13="$(_cuda_pkgs "ubuntu${_try}" | _cuda_newest_13 || true)"
                 if [ -n "$_cuda_fb_13" ]; then
-                    warn "Using the ubuntu${_try} CUDA repo — it offers ${_cuda_fb_13} (the ubuntu${_cuda_release} repo has no CUDA 13.x toolkit)"
+                    warn "Using the ubuntu${_try} CUDA repo — it offers ${_cuda_fb_13} (ubuntu${_cuda_release} publishes no CUDA 13.x toolkit)"
                     _cuda_repo_dir="ubuntu${_try}"
                     _cuda_repo_url="https://developer.download.nvidia.com/compute/cuda/repos/ubuntu${_try}/${_cuda_arch}"
                     _cuda_native_13="$_cuda_fb_13"
@@ -504,6 +525,8 @@ else
             fi
         fi
     fi
+
+    fi # end CUDA-13 toolkit block (Strata opt-in only)
 
     # nvidia-container-toolkit (required for Docker GPU passthrough)
     if dpkg -s nvidia-container-toolkit &>/dev/null 2>&1; then
