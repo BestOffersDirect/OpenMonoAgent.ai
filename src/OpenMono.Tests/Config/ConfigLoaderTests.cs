@@ -8,10 +8,39 @@ public class ConfigLoaderTests : IDisposable
 {
     private readonly string _tempDir;
 
+    // The loader reads these process-wide env vars (ApplyEnvironmentOverrides and the
+    // AppConfig working-directory default). The agent runtime exports several of them
+    // (OPENMONO_ENDPOINT/WORKSPACE/DATA_DIR/...), so scrub them for the duration of each
+    // test to keep assertions deterministic, then restore the real values afterwards.
+    private static readonly string[] LoaderEnvVars =
+    [
+        "OPENMONO_ENDPOINT", "OPENMONO_MODEL", "OPENMONO_API_KEY", "OPENMONO_WEB_GATEWAY",
+        "OPENMONO_WEB_SEARCH", "OPENMONO_WEB_SCRAPE", "OPENMONO_WORKSPACE", "OPENMONO_HOST_WORKSPACE",
+        "OPENMONO_DATA_DIR", "OPENMONO_CONTEXT_SIZE", "OPENMONO_MAX_OUTPUT_TOKENS", "OPENMONO_TOP_P",
+        "OPENMONO_TOP_K", "OPENMONO_PRESENCE_PENALTY", "OPENMONO_MIN_P", "OPENMONO_REPETITION_PENALTY",
+        "OPENMONO_MODEL_PRESET", "OPENMONO_PROVIDER", "OPENMONO_VISION_ENABLED",
+    ];
+
+    private readonly Dictionary<string, string?> _savedEnv = [];
+    private readonly string _emptyDataDir = "";
+
     public ConfigLoaderTests()
     {
         _tempDir = Path.Combine(Path.GetTempPath(), $"openmono-test-{Guid.NewGuid():N}");
         Directory.CreateDirectory(_tempDir);
+
+        foreach (var name in LoaderEnvVars)
+        {
+            _savedEnv[name] = Environment.GetEnvironmentVariable(name);
+            Environment.SetEnvironmentVariable(name, null);
+        }
+
+        // Point the loader's DataDirectory at an empty isolated dir so it never merges a
+        // machine-global ~/.openmono/settings.json (which may carry ctx_size / malformed
+        // values). Tests that want a user settings file set OPENMONO_DATA_DIR themselves.
+        _emptyDataDir = Path.Combine(_tempDir, "isolated-data");
+        Directory.CreateDirectory(_emptyDataDir);
+        Environment.SetEnvironmentVariable("OPENMONO_DATA_DIR", _emptyDataDir);
     }
 
     [Fact]
@@ -158,7 +187,9 @@ public class ConfigLoaderTests : IDisposable
         var config = ConfigLoader.Load(_tempDir, warn: w => warnings.Add(w));
 
         config.Should().NotBeNull();
-        warnings.Should().ContainSingle(w => w.Contains("Malformed"));
+        // Scope to this test's project file: a machine-global ~/.openmono/settings.json
+        // is also read (and may itself warn), so don't assume it is the only warning.
+        warnings.Should().ContainSingle(w => w.Contains("Malformed") && w.Contains(projectDir));
     }
 
     [Fact]
@@ -184,6 +215,9 @@ public class ConfigLoaderTests : IDisposable
 
     public void Dispose()
     {
+        foreach (var (name, value) in _savedEnv)
+            Environment.SetEnvironmentVariable(name, value);
+
         if (Directory.Exists(_tempDir))
             Directory.Delete(_tempDir, recursive: true);
     }

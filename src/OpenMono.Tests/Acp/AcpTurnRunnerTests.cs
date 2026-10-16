@@ -177,13 +177,27 @@ public sealed class AcpTurnRunnerTests
     [Fact]
     public void New_acp_session_defaults_to_plan_mode()
     {
-        var s = new AcpSession
+        // The plan-mode default is applied where real sessions are created —
+        // AcpSessionStore.Create — so exercise that path rather than a bare AcpSession.
+        var tempDir = Path.Combine(Path.GetTempPath(), "openmono-planmode-" + Guid.NewGuid().ToString("N")[..8]);
+        Directory.CreateDirectory(tempDir);
+        try
         {
-            State = new SessionState { Id = "s", StartedAt = DateTime.UtcNow, Model = "m" }
-        };
-        s.PlanMode.Should().BeTrue(
-            "the extension UI defaults to plan mode and only sends the mode on an explicit toggle, " +
-            "so the server must default to plan mode or writes would run while the UI shows 'plan'");
+            var cfg = new AppConfig { DataDirectory = tempDir };
+            cfg.Llm.Model = "test-model";
+            var settings = new AcpServerSettings { SessionTtlHours = 24 };
+            using var store = new AcpSessionStore(cfg, settings, startReaper: false);
+
+            var s = store.Create(model: "m", cfg);
+
+            s.PlanMode.Should().BeTrue(
+                "the extension UI defaults to plan mode and only sends the mode on an explicit toggle, " +
+                "so the server must default to plan mode or writes would run while the UI shows 'plan'");
+        }
+        finally
+        {
+            try { Directory.Delete(tempDir, recursive: true); } catch { }
+        }
     }
 
     [Fact]
