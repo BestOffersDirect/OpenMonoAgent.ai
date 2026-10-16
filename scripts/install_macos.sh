@@ -710,8 +710,8 @@ if [ "$OPENMONO_ROLE" != "inference" ]; then
                         info "Sudo: ask — each escalation is confirmed [y/N]; non-interactive sessions fail closed to No." ;;
                 esac
                 info "First run of 'openmono agent --host' confirms the run-as user."
-                info "Change later with: openmono config host.sudo_policy ask|allow|deny"
-                info "Host settings: openmono config host.exec_default / host.run_as / host.timeout_ms"
+                info "Change later with: openmono config set host.sudo_policy ask|allow|deny"
+                info "Host settings: openmono config set host.exec_default|host.run_as|host.timeout_ms <value>"
             else
                 warn "Host sub-agent install failed — container agent still works; retry: bash scripts/install-host-bridge.sh"
                 export OPENMONO_HOST_BRIDGE=0
@@ -798,6 +798,7 @@ if [[ -n "${OPENMONO_ENV_FILE:-}" ]]; then
 export INSTALL_DIR="$INSTALL_DIR"
 export LLAMA_PORT="${LLAMA_PORT:-7474}"
 export OPENMONO_ROLE="$OPENMONO_ROLE"
+export OPENMONO_HOST_BRIDGE="${OPENMONO_HOST_BRIDGE:-0}"
 export MODEL_NAME="${MODEL_NAME:-}"
 export MODEL_ACCURACY="${MODEL_ACCURACY:-standard}"
 ENVEOF

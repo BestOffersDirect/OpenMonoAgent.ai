@@ -114,7 +114,7 @@ Project layout (`src/OpenMono.HostBridge/`, .NET 10, references the CLI project 
 | Turn error 400 "must contain either 'content' or 'tool_calls'" | A turn that produced no text and no calls stored an empty assistant message, rejected on the next request | Empty assistant messages are never stored (warn-logged); the per-request sanitizer drops any already in history, so old sessions heal |
 | Agent stays in Plan, proposes but never acts | New ACP sessions default to plan | Bridge sets `build` explicitly unless `--plan` |
 | Host commands fail as the wrong user | Bridge run as root (or another user) while `run_as` is the login user | Fail-fast startup check; run the bridge as the login user |
-| `as_root` refused | Sudo policy is `deny` | Expected: change with `openmono config host.sudo_policy ask` (or `allow`), or keep off and do root steps by hand |
+| `as_root` refused | Sudo policy is `deny` | Expected: change with `openmono config set host.sudo_policy ask` (or `allow`), or keep off and do root steps by hand |
 | Sudo password prompt mid-turn | Timestamp expired and no password in memory, or wrong password typed | Masked in-TUI prompt (never echoed/logged), up to 3 tries with the bad secret wiped from memory each time; or pre-seed `--password-file` / `OPENMONO_HOST_PASSWORD_FILE` |
 | Turn error "Name or service not known (llama-server:7474)" on macOS | Container aimed at the Linux compose-network name, but macOS inference runs natively on the host | Fixed: loopback endpoints map to `host.docker.internal` (native port preserved) on macOS, `llama-server:7474` on Linux |
 | VS Code driving the host | Extension integration is sandbox-only by design | `openmono agent --host --acp-only …` is refused; run without `--host` for the extension |
@@ -137,7 +137,7 @@ Project layout (`src/OpenMono.HostBridge/`, .NET 10, references the CLI project 
   backslash-escaped, or quoted forms such as `/usr/bin/sudo` or `\sudo`) prompts
   the operator with y/N, and a **yes is in-memory only for that one command** -
   it is never persisted. The config stays `ask` until the operator explicitly
-  runs `openmono config host.sudo_policy <ask|allow|deny>` or re-runs an
+  runs `openmono config set host.sudo_policy <ask|allow|deny>` or re-runs an
   interactive `host-bridge --init`. Non-interactive runs (piped stdin, no TTY)
   can never be asked, so an `ask` escalation is **denied** there (fail closed).
   `allow` escalates without prompting; `deny` refuses every escalation with how
@@ -226,7 +226,7 @@ stderr to the setup log. The sudo policy is chosen at install time
 (`OPENMONO_HOST_SUDO`, prompted by `scripts/install.sh`) and defaults to `ask`
 when unset; the run-as user defaults to whoever runs the bridge. Either can be
 changed by hand any time with `host-bridge --init` (interactive) or
-`openmono config host.*` - see
+`openmono config set host.*` - see
 [Configuration](CONFIG.md#host-bridge-host-sub-agent)).
 
 ## Mode A - single-box (inference + agent on one machine)

@@ -378,12 +378,12 @@ The bare-metal host sub-agent has its **own** config file: `~/.openmono/host-bri
 routes `host.*` keys to that file; every other key still goes to `settings.json`.
 
 ```bash
-openmono config host.sudo_policy allow      # escalation policy
-openmono config host.exec_default ask       # default policy for host commands
-openmono config host.run_as dimnd           # account host commands run as
-openmono config host.allow_list "git *,docker *,systemctl status *"
-openmono config host.deny_list "rm *,dd *,mkfs *"
-openmono config host.timeout_ms 600000      # foreground command timeout
+openmono config set host.sudo_policy allow      # escalation policy
+openmono config set host.exec_default ask       # default policy for host commands
+openmono config set host.run_as dimnd           # account host commands run as
+openmono config set host.allow_list "git *,docker *,systemctl status *"
+openmono config set host.deny_list "rm *,dd *,mkfs *"
+openmono config set host.timeout_ms 600000      # foreground command timeout
 openmono config get host.sudo_policy
 openmono config unset host.run_as
 ```

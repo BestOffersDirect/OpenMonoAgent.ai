@@ -111,7 +111,7 @@ case "${OPENMONO_HOST_SUDO:-}" in
         ;;
 esac
 
-echo "[host-bridge] OK — run it with: openmono agent --host (first run confirms the run-as user if left blank; change later with: openmono config host.run_as / host.sudo_policy)"
+echo "[host-bridge] OK — run it with: openmono agent --host (first run confirms the run-as user if left blank; change later with: openmono config set host.run_as <user> / host.sudo_policy ask|allow|deny)"
 
 # Apply the host-exec default. Fresh configs get a default (ask unless
 # OPENMONO_HOST_EXEC_DEFAULT=allow). Existing configs are preserved as-is

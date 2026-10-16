@@ -693,12 +693,19 @@ EOF
     esac
 
     if [[ "${OPENMONO_HOST_BRIDGE:-0}" == "1" ]]; then
-        echo "  Bare-metal server sub-agent installed (opt-in add-on)."
+        echo "  Bare-metal host access installed (opt-in add-on)."
         echo ""
-        echo "  It talks to this box's in-container agent over ACP and runs host"
-        echo "  commands (pull, build, install, redeploy, troubleshoot):"
+        echo "  The agent stays sandboxed; a host-bridge daemon on this box runs"
+        echo "  host commands (pull, build, install, redeploy, troubleshoot)"
+        echo "  behind a HOST EXECUTION card, audited and policy-gated:"
         echo ""
-        echo -e "    ${BOLD}cd /srv/my-backend && openmono agent --host${NC}"
+        echo -e "    ${BOLD}cd your-project/ && openmono agent --host${NC}   # run the agent with host access (daemon auto-starts)"
+        echo -e "    ${BOLD}openmono host status${NC}                       # check the daemon (start: openmono host daemon)"
+        echo -e "    ${BOLD}openmono host stop${NC}                         # stop the daemon"
+        echo ""
+        echo "  Host policy (change any time, stored in ~/.openmono/host-bridge.json):"
+        echo -e "    ${BOLD}openmono config set host.sudo_policy ask|allow|deny${NC}"
+        echo -e "    ${BOLD}openmono config set host.exec_default ask|allow${NC}"
         echo ""
     fi
 
