@@ -31,9 +31,20 @@ Wherever an agent runs below, it runs in one of two modes. Inference
 
 ```bash
 openmono agent --sandbox   # container (default when no flag is given)
-openmono agent --host      # server sub-agent: container loop + bare-metal executor
-OPENMONO_AGENT_MODE=host openmono agent   # same thing via env
+openmono host daemon       # start the bare-metal executor (preferred: it stays up
+                           # after the agent exits; stop with: openmono host stop)
+openmono agent             # sandbox agent; pair on demand with /host on
+openmono agent --host      # one-shot: starts the daemon for you, pairs it, stops it on exit
+OPENMONO_AGENT_MODE=host openmono agent   # same one-shot via env
 ```
+
+Both routes end at the same place — a sandboxed agent paired to the host-bridge
+daemon (HOST:ON chip). `openmono host daemon` + `/host on` is the smoother daily
+workflow: the daemon outlives agent sessions, so pairing is instant on every
+launch, and `openmono host status` shows it (and the paired-session count)
+any time. `--host` is the convenience wrapper: same daemon, but auto-started
+and auto-stopped with the agent (a daemon you started yourself with
+`openmono host daemon` is never touched by the auto-stop).
 
 ### How the bridge talks ACP (no protocol changes)
 
@@ -85,6 +96,13 @@ Project layout (`src/OpenMono.HostBridge/`, .NET 10, references the CLI project 
   line interface; piped/non-interactive runs stay line-oriented. Slash commands
   (`/mode`, `/build`, `/plan`, `/compact`, `/think`, `/playbook`) run on the
   server; only `/quit`, `/exit`, `/clear` are local.
+- **Pairing on demand (`/host on`).** Even a plain `openmono agent` (no
+  `--host`) can gain host access at any point in a session: run
+  `openmono host daemon` on the machine, then `/host on` inside the agent —
+  it pairs with the running daemon over the same secret and injects the
+  standing orders (`/host off` revokes it mid-session). From inside the
+  container the daemon is reached via `host.docker.internal`; the pair
+  secret is read from the bind-mounted `~/.openmono/host-bridge.json`.
 - **Build mode by default.** Fresh and attached host sessions are explicitly set
   to `build` via the stock `{"mode": …}` turn - new ACP sessions default to plan
   (read-only), which cannot operate a server. `--plan` opts back into read-only.
@@ -275,8 +293,9 @@ as before this change. Set one only if you also expose the server (see Mode B).
 
 ```bash
 cd /srv/my-backend        # or wherever the repo lives
-openmono agent --host     # sub-agent: container loop + bare-metal host commands
-openmono agent            # sandbox: acts on the bind-mounted /workspace only
+openmono host daemon      # bare-metal executor (stays up; stop: openmono host stop)
+openmono agent            # sandbox agent; pair on demand: /host on
+openmono agent --host     # one-shot alternative: daemon auto-starts + auto-stops
 ```
 
 Server work uses the existing `Bash` tool inside the container plus `HOST_EXEC`
@@ -409,8 +428,9 @@ Then work as in Mode A (either agent mode):
 
 ```bash
 cd /srv/my-backend
-openmono agent --host   # sub-agent: container loop, bare-metal host commands
-openmono agent          # or sandboxed
+openmono host daemon      # executor on this box; pair the sandbox agent with /host on
+openmono agent --host     # one-shot alternative: container loop, bare-metal host commands
+openmono agent            # or sandboxed (no host access)
 ```
 
 **SSH tunnel alternative** (encrypted, no open firewall ports): from the agent

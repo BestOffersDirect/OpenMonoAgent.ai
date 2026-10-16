@@ -377,6 +377,24 @@ The bare-metal host sub-agent has its **own** config file: `~/.openmono/host-bri
 (0600, never holds secrets). It is *not* part of `settings.json`. `openmono config`
 routes `host.*` keys to that file; every other key still goes to `settings.json`.
 
+### Running the daemon
+
+The host-bridge daemon is the bare-metal executor. Run it directly, or let
+`openmono agent --host` start/stop it around an agent session:
+
+```bash
+openmono host daemon     # start the daemon (preferred; it stays up after the agent exits)
+openmono host status     # is it running? shows version + paired-session count
+openmono host stop       # stop it
+```
+
+Then pair any sandbox agent to it with `/host on` inside the agent (`/host off`
+revokes it mid-session). The daemon listens on `127.0.0.1:7476`; from inside the
+agent container it is reached via `host.docker.internal`, and the pair secret is
+read from the bind-mounted `~/.openmono/host-bridge.json`.
+
+### Policy keys
+
 ```bash
 openmono config set host.sudo_policy allow      # escalation policy
 openmono config set host.exec_default ask       # default policy for host commands
