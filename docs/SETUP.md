@@ -381,7 +381,30 @@ openmono tunnel logs     # tail frpc logs
 
 ## Vision
 
-Vision is enabled by default when the mmproj is present. Set `OPENMONO_VISION_ENABLED=1` (or add `"vision_enabled": true` to `settings.json`) so the agent accepts and processes images.
+Vision is **asked during install on inference boxes** — the llama.cpp and
+Strata installers prompt whether to download the projector, because on those
+boxes the choice controls a real ~900 MB download. On an **agent box** nothing
+is asked: whether the remote endpoint actually serves images is detected at
+startup from the server's own `/props` capabilities (`modalities.vision`), so
+there is no install-time guess to go stale. The install choice is persisted to
+`~/.openmono/settings.json` under `"inference": { "vision_enabled": true }`,
+which is the single source of truth for every launch path (extension,
+host-bridge, and compose all mount `~/.openmono` into the agent container).
+An explicit value there also overrides the agent-side auto-detection — to
+change it later:
+
+```bash
+openmono config set inference.vision_enabled true    # allow image input
+openmono config set inference.vision_enabled false   # text only
+```
+
+The `OPENMONO_VISION_ENABLED=1` environment variable still works as a one-off
+override when the setting is unset. Non-interactive installs fail closed to
+vision **off** on Strata (it needs ~1–2 GB extra headroom) and follow the
+catalog default on llama.cpp (on when the model ships a projector). To toggle
+the projector weights themselves, re-run `openmono setup` — or on an existing
+Strata install: `STRATA_VISION=yes bash scripts/strata.sh install` (reconfigures
+without re-downloading the base model).
 
 ### Attaching images in chat
 

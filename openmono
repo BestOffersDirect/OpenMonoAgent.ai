@@ -449,13 +449,14 @@ cmd_setup() {
             --agent)        export OPENMONO_ROLE=agent ;;
             --full)         export OPENMONO_ROLE=full ;;
             --model=*)      export OPENMONO_MODEL="${arg#--model=}" ;;
+            --vision=*)     export OPENMONO_VISION="${arg#--vision=}" ;;
             --bonsai)       export OPENMONO_MODEL=bonsai-pq2 ;;
             --bonsai-ptq1)  export OPENMONO_MODEL=bonsai-ptq1 ;;
             --qwen)         export OPENMONO_MODEL=qwen ;;
             --flash-next)   export OPENMONO_MODEL=flash-next ;;
             --verbose|-v)   export OPENMONO_VERBOSE=1 ;;
             --help|-h)
-                echo "Usage: openmono setup [--full|--inference|--agent] [--gpu|--cpu] [--model=NAME] [--verbose]"
+                echo "Usage: openmono setup [--full|--inference|--agent] [--gpu|--cpu] [--model=NAME] [--vision=on|off] [--verbose]"
                 echo ""
                 echo "Installs one of three roles. Pick based on what the box will do:"
                 echo ""
@@ -1819,6 +1820,7 @@ cmd_config() {
         echo ""
         echo "Examples:"
         echo "  openmono config set llm.endpoint http://10.0.0.5:17474"
+        echo "  openmono config set inference.vision_enabled true   # allow image input"
         echo "  openmono config get llm.endpoint"
         echo "  openmono config set host.sudo_policy allow"
         echo "  openmono config set host.exec_default ask"

@@ -1,3 +1,4 @@
+using System.Text.Json;
 using System.Text.Json.Serialization;
 using OpenMono.Acp;
 using OpenMono.Utils;
@@ -21,8 +22,26 @@ public sealed class AppConfig
     public bool AutoDetectCodeGraph { get; set; } = true;
     public bool Verbose { get; set; } = false;
     public bool ShowDetail { get; set; } = false;
-    public bool VisionEnabled { get; set; } =
-        Environment.GetEnvironmentVariable("OPENMONO_VISION_ENABLED") == "1";
+    [JsonIgnore] // derived by ResolveVision(); the real key is inference.vision_enabled
+    public bool VisionEnabled { get; set; }
+    // Resolution order: settings.json inference.vision_enabled (explicit) →
+    // OPENMONO_VISION_ENABLED env (set by the container launcher) → false.
+    public void ResolveVision()
+        => VisionEnabled = Inference.VisionEnabled
+            ?? Environment.GetEnvironmentVariable("OPENMONO_VISION_ENABLED") == "1";
+    // Parse the "modalities.vision" capability llama.cpp reports in /props.
+    // Returns null when the server doesn't advertise it (unknown — don't guess).
+    public static bool? ParsePropsVision(JsonElement root)
+    {
+        if (root.TryGetProperty("modalities", out var modalities)
+            && modalities.ValueKind == JsonValueKind.Object
+            && modalities.TryGetProperty("vision", out var visionEl))
+        {
+            if (visionEl.ValueKind == JsonValueKind.True) return true;
+            if (visionEl.ValueKind == JsonValueKind.False) return false;
+        }
+        return null;
+    }
     // Use OPENMONO_WORKSPACE if running in Docker container, otherwise use current directory
     public string WorkingDirectory { get; set; } = GetWorkingDirectory();
 
@@ -180,8 +199,14 @@ public sealed class InferenceConfig
 {
     public int CtxSize { get; set; }
 
+    // Explicit vision/image-input choice (settings.json: inference.vision_enabled).
+    // Null = not set here: the OPENMONO_VISION_ENABLED env var wins (container
+    // launches pass it through). Set = authoritative across every launcher.
+    public bool? VisionEnabled { get; set; }
+
     public void MergeFrom(InferenceConfig source)
     {
         if (source.CtxSize > 0) CtxSize = source.CtxSize;
+        if (source.VisionEnabled.HasValue) VisionEnabled = source.VisionEnabled;
     }
 }

@@ -1019,6 +1019,27 @@ static async Task TryDetectActualModelAsync(AppConfig config)
         };
         Log.Debug($"Detected reasoning from /props: format={reasoningFormat ?? "n/a"} in_content={reasoningInContent} template_thinking={config.Llm.ServerReasoning.HasThinkingTemplate}");
 
+        // Vision is auto-detected from what the server actually loaded, via the
+        // "modalities.vision" capability llama.cpp reports in /props — no
+        // install-time guess to go stale. An explicit inference.vision_enabled
+        // in settings.json overrides the probe (e.g. to force-disable).
+        var reportedVision = OpenMono.Config.AppConfig.ParsePropsVision(root);
+        if (reportedVision.HasValue && !config.Inference.VisionEnabled.HasValue)
+        {
+            if (reportedVision.Value && !config.VisionEnabled)
+            {
+                config.VisionEnabled = true;
+                Log.Info("Vision enabled: the inference server reports image input support.");
+            }
+            else if (!reportedVision.Value && config.VisionEnabled)
+            {
+                // The server explicitly says it cannot take images — trust
+                // that over any env/default guess.
+                config.VisionEnabled = false;
+                Log.Debug("Vision disabled: the inference server reports no image input support.");
+            }
+        }
+
         var userConfiguredCtx = config.Llm.ContextSize;
         if (serverCtx is null or <= 0)
         {

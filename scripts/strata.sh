@@ -33,7 +33,7 @@ set -euo pipefail
 #   STRATA_FAMILY  qwen|swift|coder|unsloth      (default qwen)
 #   STRATA_MODEL   Q2_0|IQ2_XS|IQ3_XXS|IQ3_S|... (default: setup picks for the RAM)
 #   STRATA_CONTEXT context tokens                (default: setup picks for the VRAM)
-#   STRATA_VISION  yes|no|cpu                    (default no)
+#   STRATA_VISION  yes|no|cpu                    (interactive prompt; "no" when non-interactive)
 #   STRATA_DATA_DIR model-file dir               (default <STRATA_DIR>-data next to Strata)
 #   STRATA_HOST    bind address                  (default 0.0.0.0 so the agent container can reach it)
 #   STRATA_API_KEY key Strata requires           (default: LLAMA_API_KEY from docker/.env)
@@ -45,7 +45,9 @@ STRATA_PORT="${STRATA_PORT:-8080}"
 STRATA_FAMILY="${STRATA_FAMILY:-qwen}"
 STRATA_MODEL="${STRATA_MODEL:-}"
 STRATA_CONTEXT="${STRATA_CONTEXT:-}"
-STRATA_VISION="${STRATA_VISION:-no}"
+# STRATA_VISION empty = not chosen yet: cmd_install asks interactively (or
+# defaults to "no" when non-interactive). Preset it to skip the prompt.
+STRATA_VISION="${STRATA_VISION:-}"
 STRATA_DATA_DIR="${STRATA_DATA_DIR:-}"
 OPENMONO_STATE_DIR="${OPENMONO_STATE_DIR:-$HOME/.openmono}"
 STRATA_ENV_FILE="$OPENMONO_STATE_DIR/strata.env"
@@ -494,11 +496,47 @@ cmd_update_cuda() {
     install_cuda_toolkit
 }
 
+# Ask whether to enable vision (image input). Sets STRATA_VISION to
+# yes|cpu|no. Non-interactive: "no" (fail closed — vision costs ~1-2 GB
+# headroom and downloads ~900 MB of projector weights).
+_prompt_vision() {
+    if [[ "${STRATA_YES:-0}" == "1" || "${OPENMONO_ASSUME_YES:-0}" == "1" || ! -t 0 ]]; then
+        STRATA_VISION="no"
+        info "Vision (image input): disabled (non-interactive). Enable later: STRATA_VISION=yes bash scripts/strata.sh install"
+        return 0
+    fi
+    echo ""
+    echo "  Enable vision (image input)? The projector adds ~900 MB of"
+    echo "  weights and ~1-2 GB of VRAM/RAM headroom use; it lets the agent"
+    echo "  read screenshots and image files (@image.png in chat)."
+    echo ""
+    echo "    1) yes — vision on the GPU (recommended on NVIDIA)"
+    echo "    2) cpu — vision encoded on the CPU (saves VRAM, slower)"
+    echo "    3) no  — text only"
+    echo ""
+    printf "  Vision? [default: 1 (yes)]: "
+    local ans; read -r ans || ans=""
+    case "${ans:-1}" in
+        1|y|Y|yes|YES) STRATA_VISION="yes" ;;
+        2|c|C|cpu)     STRATA_VISION="cpu" ;;
+        3|n|N|no|NO)   STRATA_VISION="no" ;;
+        *)             STRATA_VISION="yes" ;;
+    esac
+    info "Vision: $STRATA_VISION"
+}
+
 cmd_install() {
     # `--yes` is consumed here (added to setup args); everything else after
     # `install` is forwarded to Strata's setup.sh verbatim,
     # e.g.: strata.sh install --yes --family coder
     ensure_clone
+    # Vision (image input) is a user choice, not a silent default. Prompt unless
+    # STRATA_VISION was preset (env) or --vision was passed through to setup.sh.
+    local _vision_passed=0
+    for arg in "$@"; do [[ "$arg" == "--vision" || "$arg" == --vision=* ]] && _vision_passed=1; done
+    if [[ -z "$STRATA_VISION" && "$_vision_passed" == "0" ]]; then
+        _prompt_vision
+    fi
     local extra=()
     local setup_args=()
     local arg

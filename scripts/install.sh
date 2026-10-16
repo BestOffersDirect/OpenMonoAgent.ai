@@ -49,6 +49,8 @@ source "$SCRIPT_DIR/lib/log.sh"
 source "$SCRIPT_DIR/lib/prism.sh"
 # shellcheck source=/dev/null
 source "$SCRIPT_DIR/lib/model-catalog.sh"
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR/lib/vision.sh"
 
 # ── Context size presets (tokens) — edit here to change globally ─────────────
 CTX_24G=196608       # GPU 24GB+  q8_0 KV  (~8GB KV + 15GB weights ≈ 23GB)
@@ -440,6 +442,33 @@ if [ "$OPENMONO_ROLE" != "agent" ]; then
         warn "8GB VRAM: vision (mmproj) disabled to protect VRAM headroom."
         warn "Re-enable later with an 8GB+ headroom check: download $PRISM_MMPROJ_NAME into models/ and set MODEL_MMPROJ in docker/.env"
     fi
+    # Vision is a user choice (when the hardware+model allow it): ask instead
+    # of silently enabling/disabling. OPENMONO_VISION=yes|no presets it
+    # non-interactively; the catalog's mmproj availability still gates whether
+    # the question is even possible.
+    if [ -n "${MODEL_MMPROJ:-}" ]; then
+        _vision_choice="${OPENMONO_VISION:-}"
+        if [ -z "$_vision_choice" ] && [ -t 0 ]; then
+            flush_stdin
+            echo ""
+            echo "  Enable vision (image input)? The projector adds ~900 MB of"
+            echo "  weights and ~1-2 GB of VRAM/RAM headroom; it lets the agent"
+            echo "  read screenshots and image files (@image.png in chat)."
+            printf "  Enable vision? [Y/n]: "
+            read -r _vision_answer || _vision_answer=""
+            case "${_vision_answer:-Y}" in
+                [Nn]*) _vision_choice="no" ;;
+                *)     _vision_choice="yes" ;;
+            esac
+        elif [ -z "$_vision_choice" ]; then
+            _vision_choice="yes"   # non-interactive: catalog default (on when available)
+        fi
+        if [ "$_vision_choice" = "no" ] || [ "$_vision_choice" = "off" ]; then
+            MODEL_MMPROJ=""
+            MODEL_MMPROJ_URL=""
+            info "Vision disabled by choice — full context restored (no mmproj)."
+        fi
+    fi
     ok "Model selected: $MODEL_NAME"
     if [ -n "${MODEL_MMPROJ:-}" ]; then
         detail "Vision projector: $MODEL_MMPROJ"
@@ -657,10 +686,23 @@ if [ "$OPENMONO_ROLE" != "agent" ] && [ "$INFERENCE_BACKEND" = "strata" ]; then
     # Record the backend + port so openmono, healthcheck, and the tunnel script
     # route to Strata instead of llama.
     if [ -f "$DOCKER_ENV_FILE" ]; then
-        grep -v -E "^INFERENCE_BACKEND=|^STRATA_PORT=" "$DOCKER_ENV_FILE" > "${DOCKER_ENV_FILE}.tmp" || true
+        grep -v -E "^INFERENCE_BACKEND=|^STRATA_PORT=|^OPENMONO_VISION_ENABLED=" "$DOCKER_ENV_FILE" > "${DOCKER_ENV_FILE}.tmp" || true
         mv "${DOCKER_ENV_FILE}.tmp" "$DOCKER_ENV_FILE"
     fi
     printf "INFERENCE_BACKEND=strata\nSTRATA_PORT=%s\n" "${STRATA_PORT:-8080}" >> "$DOCKER_ENV_FILE"
+    # Vision was chosen during Strata setup (yes|cpu|no), recorded by strata.sh
+    # in ~/.openmono/strata.env; mirror it into settings.json so the agent
+    # accepts images through this backend.
+    _strata_vision="no"
+    [[ -f "$HOME/.openmono/strata.env" ]] && _strata_vision="$(bash -c 'source "$HOME/.openmono/strata.env" 2>/dev/null; printf "%s" "${STRATA_VISION:-no}"')"
+    if [ "$_strata_vision" != "no" ]; then
+        om_persist_vision true
+        printf "OPENMONO_VISION_ENABLED=1\n" >> "$DOCKER_ENV_FILE"
+    else
+        om_persist_vision false
+        printf "OPENMONO_VISION_ENABLED=0\n" >> "$DOCKER_ENV_FILE"
+    fi
+    detail "Vision: $_strata_vision (mirrored to inference.vision_enabled)"
     detail "Persisted INFERENCE_BACKEND=strata STRATA_PORT=${STRATA_PORT:-8080} to $DOCKER_ENV_FILE"
     detail "Strata endpoint: http://127.0.0.1:${STRATA_PORT:-8080}/v1 (host-native, OpenAI-compatible)"
     detail "Caddy gateway (optional) can front it via docker/docker-compose.strata.yml"
@@ -1005,9 +1047,11 @@ fi
 printf "INFERENCE_BACKEND=llama\nMODEL_NAME=%s\nMODEL_ALIAS=%s\nMODEL_MMPROJ=%s\nCTX_SIZE=%s\n" "$MODEL_NAME" "$MODEL_ALIAS" "${MODEL_MMPROJ:-}" "${_CTX:-$CTX_CPU}" >> "$DOCKER_ENV_FILE"
 if [ -n "${MODEL_MMPROJ:-}" ]; then
     printf "OPENMONO_VISION_ENABLED=1\n" >> "$DOCKER_ENV_FILE"
+    om_persist_vision true
     detail "Persisted MODEL_NAME=$MODEL_NAME MODEL_MMPROJ=$MODEL_MMPROJ (vision enabled) to $DOCKER_ENV_FILE"
 else
     printf "OPENMONO_VISION_ENABLED=0\n" >> "$DOCKER_ENV_FILE"
+    om_persist_vision false
     detail "Persisted MODEL_NAME=$MODEL_NAME (vision disabled — no mmproj) to $DOCKER_ENV_FILE"
 fi
 
@@ -1238,6 +1282,11 @@ if [ "$OPENMONO_ROLE" != "agent" ] && [ "$INFERENCE_BACKEND" != "strata" ]; then
         fi
     fi
 fi  # End of Step 8 (skipped on agent role)
+
+# Vision on an agent box is NOT asked at install time — whether the remote
+# endpoint actually serves images is detected at startup from the server's
+# /props capabilities (modalities.vision), so there is no guess to go stale.
+# Optional manual override: openmono config set inference.vision_enabled true|false
 
 # ── Shell integration ─────────────────────────────────────────────────────────
 # Put the openmono CLI on PATH so `openmono <cmd>` resolves to the repo script.

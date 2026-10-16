@@ -22,6 +22,8 @@ source "$SCRIPT_DIR/lib/log.sh"
 source "$SCRIPT_DIR/lib/prism.sh"
 # shellcheck source=lib/model-catalog.sh
 source "$SCRIPT_DIR/lib/model-catalog.sh"
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR/lib/vision.sh"
 
 # ── Context size presets (tokens) — edit here to change globally ──────────────
 CTX_48G=196608       # >=48 GB Metal  q8_0 KV
@@ -259,6 +261,33 @@ Upgrade to a Mac with at least 16GB, or use the 'agent' role and connect to a se
     # Qwen is the default everywhere; Bonsai is opt-in via prompt choice or
     # an explicit --model=bonsai-* flag (PQ2_0 needs ≥24GB, PTQ1_0 ≥16GB).
     prompt_bonsai_macos
+
+    # Vision is a user choice (when the model offers a projector): ask before
+    # deciding context size — declining restores the full context. OPENMONO_VISION=
+    # yes|no presets it non-interactively.
+    if [ -n "${MODEL_MMPROJ:-}" ]; then
+        _vision_choice="${OPENMONO_VISION:-}"
+        if [ -z "$_vision_choice" ] && [ -t 0 ]; then
+            flush_stdin
+            echo ""
+            echo "  Enable vision (image input)? The projector adds ~900 MB of"
+            echo "  weights and ~1-2 GB of unified-memory headroom; it lets the"
+            echo "  agent read screenshots and image files (@image.png in chat)."
+            printf "  Enable vision? [Y/n]: "
+            read -r _vision_answer || _vision_answer=""
+            case "${_vision_answer:-Y}" in
+                [Nn]*) _vision_choice="no" ;;
+                *)     _vision_choice="yes" ;;
+            esac
+        elif [ -z "$_vision_choice" ]; then
+            _vision_choice="yes"   # non-interactive: catalog default (on when available)
+        fi
+        if [ "$_vision_choice" = "no" ] || [ "$_vision_choice" = "off" ]; then
+            MODEL_MMPROJ=""
+            MODEL_MMPROJ_URL=""
+            info "Vision disabled by choice — full context kept (no mmproj)."
+        fi
+    fi
 
     # Reduce context when mmproj is active (encoder needs ~1-2 GB burst).
     # Qwen presets only — Bonsai ctx is already sized conservatively above.
@@ -540,8 +569,10 @@ PYEOF
     printf "MODEL_MMPROJ=%s\n" "${MODEL_MMPROJ:-}" >> "$ENV_FILE"
     if [ -n "${MODEL_MMPROJ:-}" ]; then
         printf "OPENMONO_VISION_ENABLED=1\n" >> "$ENV_FILE"
+        om_persist_vision true
     else
         printf "OPENMONO_VISION_ENABLED=0\n" >> "$ENV_FILE"
+        om_persist_vision false
     fi
 fi
 
@@ -750,6 +781,12 @@ if [ "${OPENMONO_ROLE}" != "agent" ] && [ -n "${MODEL_MMPROJ:-}" ]; then
     printf "     rm ~/openmono.ai/models/${MODEL_MMPROJ}${NC}\n"
     echo ""
 fi
+
+# ── Vision note (agent role) ────────────────────────────────────────────
+# Whether the remote endpoint actually serves images is detected at startup
+# from the server's /props capabilities (modalities.vision) — no install-time
+# guess to go stale. Optional manual override:
+#   openmono config set inference.vision_enabled true|false
 
 # ── Done ──────────────────────────────────────────────────────────────────────
 # The shell restart and docker group activation is handled by openmono cmd_setup

@@ -154,7 +154,7 @@ public sealed class ConversationLoop : IDisposable
         });
         if (imageParts is { Count: > 0 } && !_config.VisionEnabled)
         {
-            _output.WriteWarning("Image attached but vision is not enabled — re-run 'openmono setup'.");
+            _output.WriteWarning("Image attached but vision is not enabled — enable it with: openmono config set inference.vision_enabled true (the inference server must serve a vision-capable model). Re-run 'openmono setup' on the inference box to install the projector.");
             return;
         }
         _session.TurnCount++;

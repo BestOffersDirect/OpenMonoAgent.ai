@@ -418,7 +418,6 @@ Install-time presets (non-interactive): `OPENMONO_HOST_BRIDGE`, `OPENMONO_HOST_E
 | `auto_detect_code_graph` | bool | `true` | Auto-register MCP graph servers if found |
 | `verbose` | bool | `false` | Log full LLM stream and tool pipeline |
 | `show_detail` | bool | `false` | Show extra detail in TUI panels |
-| `vision_enabled` | bool | `false` | Accept image attachments and pass them to the model (`OPENMONO_VISION_ENABLED=1`) |
 | `data_directory` | string | `~/.openmono` | Where sessions, memory, and checkpoints are stored |
 | `working_directory` | string | cwd | Override the workspace root |
 | `host_working_directory` | string | — | Host path when running inside Docker (used for bind-mount mapping) |
@@ -448,6 +447,6 @@ server-reported `n_ctx` (at least 1024) takes precedence at startup.
 | `OPENMONO_DATA_DIR` | `data_directory` |
 | `OPENMONO_MODEL_PRESET` | Activate a preset by name |
 | `OPENMONO_PROVIDER` | Activate a provider by name |
-| `OPENMONO_VISION_ENABLED` | `vision_enabled` — set to `1` to enable image input |
+| `OPENMONO_VISION_ENABLED` | `inference.vision_enabled` — set to `1` to enable image input (the settings file wins when explicitly set) |
 | `OPENMONO_WEB_SEARCH` | `web.search` — set to `1` to force-enable SearXNG routing |
 | `OPENMONO_WEB_SCRAPE` | `web.scrape` — set to `1` to force-enable Scrapling routing |

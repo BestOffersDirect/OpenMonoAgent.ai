@@ -74,9 +74,19 @@ verbatim, e.g. `bash scripts/strata.sh install --yes --family coder`. Model,
 context, vision, port, and data dir can also be preset:
 
 ```bash
-STRATA_FAMILY=qwen STRATA_MODEL=IQ2_XS STRATA_VISION=no STRATA_PORT=8080 \
+STRATA_FAMILY=qwen STRATA_MODEL=IQ2_XS STRATA_VISION=yes STRATA_PORT=8080 \
   bash scripts/strata.sh install
 ```
+
+> **Vision (image input).** Unless `STRATA_VISION` is preset (or `--vision` is
+> passed through), the installer **prompts** for it: `yes` (GPU projector),
+> `cpu` (CPU-encoded, saves VRAM), or `no`. Non-interactive runs default to
+> `no`. Whatever you choose is recorded in `~/.openmono/strata.env` and mirrored
+> to `inference.vision_enabled` in `~/.openmono/settings.json`, so the agent
+> knows to accept image parts. Change it later with
+> `STRATA_VISION=yes bash scripts/strata.sh install` (the ~70 GB base weights are
+> already cached — only the ~900 MB projector is fetched), or flip just the
+> agent-side gate with `openmono config set inference.vision_enabled true`.
 
 ## Agent configuration
 

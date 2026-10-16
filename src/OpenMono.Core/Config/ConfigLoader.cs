@@ -44,6 +44,7 @@ public static class ConfigLoader
             MergeFromFile(config, configPath, warn);
 
         ApplyEnvironmentOverrides(config);
+        config.ResolveVision();
 
         if (!config.Llm.ContextSizeExplicit &&
             config.Llm.ContextSize != defaultContextSize)

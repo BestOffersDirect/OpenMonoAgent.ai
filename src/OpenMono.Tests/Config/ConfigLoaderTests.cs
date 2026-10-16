@@ -275,4 +275,71 @@ public class ConfigLoaderTests : IDisposable
             Environment.SetEnvironmentVariable("OPENMONO_CONTEXT_SIZE", null);
         }
     }
+
+    [Fact]
+    public void Load_VisionSettingsKeyEnablesImageInput()
+    {
+        WriteProjectSettings("""{ "inference": { "vision_enabled": true } }""");
+
+        var config = ConfigLoader.Load(_tempDir);
+
+        config.VisionEnabled.Should().BeTrue();
+    }
+
+    [Fact]
+    public void Load_VisionEnvAppliesWhenSettingUnset()
+    {
+        Environment.SetEnvironmentVariable("OPENMONO_VISION_ENABLED", "1");
+        try
+        {
+            var config = ConfigLoader.Load(_tempDir);
+
+            config.VisionEnabled.Should().BeTrue();
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("OPENMONO_VISION_ENABLED", null);
+        }
+    }
+
+    [Fact]
+    public void Load_VisionSettingFalseBeatsEnv()
+    {
+        WriteProjectSettings("""{ "inference": { "vision_enabled": false } }""");
+        Environment.SetEnvironmentVariable("OPENMONO_VISION_ENABLED", "1");
+        try
+        {
+            var config = ConfigLoader.Load(_tempDir);
+
+            config.VisionEnabled.Should().BeFalse();
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("OPENMONO_VISION_ENABLED", null);
+        }
+    }
+
+    [Fact]
+    public void ParsePropsVision_TrueWhenServerReportsVision()
+    {
+        using var doc = JsonDocument.Parse("""{ "modalities": { "vision": true } }""");
+
+        AppConfig.ParsePropsVision(doc.RootElement).Should().BeTrue();
+    }
+
+    [Fact]
+    public void ParsePropsVision_FalseWhenServerReportsNoVision()
+    {
+        using var doc = JsonDocument.Parse("""{ "modalities": { "vision": false, "audio": true } }""");
+
+        AppConfig.ParsePropsVision(doc.RootElement).Should().BeFalse();
+    }
+
+    [Fact]
+    public void ParsePropsVision_NullWhenServerDoesNotAdvertiseIt()
+    {
+        using var doc = JsonDocument.Parse("""{ "model_alias": "gpt-ish" }""");
+
+        AppConfig.ParsePropsVision(doc.RootElement).Should().BeNull();
+    }
 }
