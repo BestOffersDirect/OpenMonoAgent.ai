@@ -399,6 +399,7 @@ echo ""
 printf "  ${BOLD}Will remove:${NC}\n"
 [ -n "$INSTALL_DIR" ] && printf "    • OpenMono Docker containers (llama, agent, gateway, searxng, scrapling), images, and override file\n"
 printf "    • /usr/local/bin/openmono symlink (if writable)\n"
+printf "    • host-bridge daemon — stopped if running (config/bin removed with ~/.openmono)\n"
 printf "    • frp tunnel — frpc service, binary/package, and config (from 'openmono tunnel setup')\n"
 printf "    • \$HOME/.openmono/ (prefs, graph-db, logs, env)\n"
 printf "    • Running Strata server is stopped (its ~/strata clone + model data stay — remove manually)\n"
@@ -439,7 +440,7 @@ if [ -n "$INSTALL_DIR" ] && [ -d "$INSTALL_DIR/docker" ] && command -v docker &>
         ok "Compose stack torn down"
 
         # Belt-and-suspenders: containers named explicitly in the compose file.
-        for c in llama-server openmono-agent openmono-gateway openmono-searxng openmono-scrapling; do
+        for c in llama-server openmono-agent openmono-gateway openmono-searxng openmono-scrapling openmono-host-bridge; do
             if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "$c"; then
                 info "Force-removing leftover container: $c"
                 do_run docker rm -f "$c"
@@ -521,7 +522,39 @@ else
     detail "/usr/local/bin/openmono not present — skipping"
 fi
 
-# ── Step 6: Stop and remove the frp tunnel (frpc) ────────────────────────────
+# ── Step 6: Stop host daemons: host-bridge + frp tunnel (frpc) ───────────────
+# The host-bridge daemon runs OUTSIDE Docker (bare-metal executor for host
+# mode), so compose teardown above never touches it. A stale daemon keeps
+# holding its port with old code across uninstall+reinstall — stop it by
+# pidfile first, then by pattern, so a fresh install starts a fresh daemon.
+# (The daemon's binary under ~/.openmono/bin/host-bridge is removed with
+# ~/.openmono in the next step; the pair secret + config live there too.)
+
+next_step "Stopping the host-bridge daemon"
+
+if [ -f "$HOME/.openmono/host-daemon.pid" ]; then
+    _hb_pid="$(cat "$HOME/.openmono/host-daemon.pid" 2>/dev/null || true)"
+    if [ -n "$_hb_pid" ] && kill -0 "$_hb_pid" 2>/dev/null; then
+        info "Stopping host-bridge daemon (pid $_hb_pid)..."
+        do_run kill "$_hb_pid"
+        sleep 1
+        kill -0 "$_hb_pid" 2>/dev/null && do_run kill -9 "$_hb_pid"
+        ok "Host-bridge daemon stopped"
+    fi
+    rm_path "$HOME/.openmono/host-daemon.pid" "host-daemon pidfile"
+fi
+# Belt-and-suspenders: a daemon started without the pidfile (or a crashed
+# pidfile match) — same pattern `openmono status` reports on.
+if pgrep -f 'host-bridge' &>/dev/null; then
+    info "Stopping leftover host-bridge process(es)..."
+    do_run pkill -TERM -f 'host-bridge'
+    sleep 1
+    pgrep -f 'host-bridge' &>/dev/null && do_run pkill -KILL -f 'host-bridge'
+    ok "Host-bridge process(es) stopped"
+else
+    detail "No host-bridge daemon running — skipping"
+fi
+
 # Reverses `openmono tunnel setup` (scripts/setup-tunnel-inference.sh):
 #   Linux : systemd unit + /usr/local/bin/frpc + /etc/frp — all root-owned, so
 #           every removal here elevates via $SUDO (or prints manual steps when
