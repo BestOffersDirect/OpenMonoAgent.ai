@@ -14,19 +14,21 @@ set -euo pipefail
 #                         inference = GPU box only: model + inference server, no agent tooling
 #                         agent     = laptop only: agent + code-review-graph, no model
 #   OPENMONO_INFERENCE_BACKEND
-#                         Inference engine on Linux: strata (default) or llama.
+#                         Inference engine on Linux: llama (default) or strata.
+#                         llama  = standard bundled llama.cpp Docker path
+#                                  (Qwen stock; Bonsai adds the Prism image).
 #                         strata = Strata (Qwen3.8-Flash-Next, OpenAI-compatible
 #                                  :8080/v1) via scripts/strata.sh — no vendoring,
-#                                  see docs/STRATA.md. llama.cpp images stay
-#                                  available via OPENMONO_INFERENCE_BACKEND=llama.
-#                         llama  = legacy bundled llama.cpp Docker path.
+#                                  needs Linux + NVIDIA + CUDA 13 (auto-installed),
+#                                  see docs/STRATA.md. Opt in with --model=flash-next.
 #                         (macOS Apple Silicon always uses its native path.)
 #   OPENMONO_GPU=1        Force GPU mode (writes GPU docker-compose override)
 #   OPENMONO_CPU=1        Force CPU mode (removes any GPU override)
 #   OPENMONO_VERBOSE=1    Show detailed command output
 #   LLAMA_PORT=7474       llama-server host port (default 7474)
-#   OPENMONO_MODEL        Model family: auto (default), bonsai-pq2, bonsai-ptq1, qwen
-#                         auto = prompt on TTY (GPU→Bonsai PQ2_0, CPU→Qwen), else auto-detect
+#   OPENMONO_MODEL        Model engine: auto (default), qwen, bonsai-pq2, bonsai-ptq1, flash-next
+#                         auto = analyze hardware, then pick (default Qwen on llama.cpp;
+#                                Bonsai/Strata offered only when the box can run them)
 #   OPENMONO_PRISM_IMAGE_CUDA   Prism CUDA image ref (default startuphakk/prism-llama.cpp_cuda:latest)
 #   OPENMONO_PRISM_IMAGE_VULKAN Prism Vulkan image ref (default startuphakk/prism-llama.cpp_vulkan:latest)
 #   OPENMONO_PRISM_IMAGE        Legacy single-ref override (wins over both when set)
@@ -88,64 +90,74 @@ select_model() {
 # (Bonsai model selection lives in scripts/lib/prism.sh as
 # select_bonsai_model(), shared with the macOS installer.)
 
-# Interactive model-family picker. Respects OPENMONO_MODEL when set
-# (auto/bonsai-pq2/bonsai-ptq1/qwen/bonsai). On a TTY with AUTO, asks the user;
-# otherwise defaults: GPU→Bonsai PQ2_0, CPU→Qwen (stock kernels).
-# Requires GPU_MODE or AMD_IGPU_MODE to be set by the caller. Sets IS_BONSAI=1
-# when a Bonsai quant is chosen (caller must then use the Prism image for
-# the matching backend: CUDA on NVIDIA, Vulkan on the 7940HS iGPU).
-prompt_model_family() {
+# Unified model + engine picker. ALWAYS defaults to Qwen on stock llama.cpp —
+# the same default as main. Bonsai (Prism CUDA/Vulkan) and Qwen3.8-Flash-Next
+# (Strata, NVIDIA/CUDA 13) are offered ONLY when the caller's CAN_BONSAI /
+# CAN_STRATA capability flags say this box can run them. Honors OPENMONO_MODEL
+# (auto|qwen|bonsai-pq2|bonsai-ptq1|flash-next) and an explicit
+# OPENMONO_INFERENCE_BACKEND=strata. Sets INFERENCE_BACKEND; for llama choices
+# also MODEL_* / IS_BONSAI (via select_bonsai_model). Requires _GPU_TIER,
+# GPU_MODE/AMD_IGPU_MODE and CAN_BONSAI/CAN_STRATA set by the caller.
+prompt_model_choice() {
     IS_BONSAI=0
     local choice="${OPENMONO_MODEL:-auto}"
-    case "$choice" in
-        bonsai-pq2|bonsai|pq2) select_bonsai_model pq2; return 0 ;;
-        bonsai-ptq1|ptq1)      select_bonsai_model ptq1; return 0 ;;
-        qwen) return 0 ;;  # keep select_model() result
-    esac
-    # choice == auto from here
-    if [ "${GPU_MODE:-0}" != "1" ] && [ "${AMD_IGPU_MODE:-0}" != "1" ]; then
-        # CPU-only box: stock Qwen MoE only. There is no Prism CPU image,
-        # so the picker never fires here and nobody is offered
-        # a model they can't run. An explicit --model=bonsai-* selection is
-        # left in place so Step 2 can fail with a clear message instead of
-        # silently installing the wrong model.
-        return 0
-    fi
-    # GPU/iGPU box from here on — the only place the picker fires.
-    if [ -t 0 ] && [[ -z "${OPENMONO_MODEL:-}" ]]; then
-        flush_stdin
-        echo ""
-        echo "  Which model for this GPU? (VRAM tier: ${_GPU_TIER:-?}GB)"
-        echo ""
-        echo "  1) Ternary-Bonsai-2-27B PQ2_0 (~7.2GB) [recommended 12GB+]"
-        echo "  2) Ternary-Bonsai-2-27B PTQ1_0 (~5.9GB) [8GB cards / tightest VRAM]"
-        echo "  3) Qwen stock (ghcr.io image, no Prism dependency)"
-        echo ""
-        if [ "${_GPU_TIER:-0}" -le 8 ]; then
-            printf "  Enter 1, 2 or 3 [default: 2]: "
-            read -r -n 1 _mf_choice; echo ""
-            case "${_mf_choice:-2}" in
-                1) select_bonsai_model pq2 ;;
-                3) : ;;
-                *) select_bonsai_model ptq1 ;;
-            esac
-        else
-            printf "  Enter 1, 2 or 3 [default: 1]: "
-            read -r -n 1 _mf_choice; echo ""
-            case "${_mf_choice:-1}" in
-                2) select_bonsai_model ptq1 ;;
-                3) : ;;
-                *) select_bonsai_model pq2 ;;
-            esac
+    local explicit_backend="${OPENMONO_INFERENCE_BACKEND:-}"
+
+    # Explicit Strata opt-in (by model name or backend) — validated up front so
+    # nobody is offered a ~70GB install their box can't run.
+    if [ "$choice" = "flash-next" ] || [ "$explicit_backend" = "strata" ]; then
+        if [ "${CAN_STRATA:-0}" != "1" ]; then
+            die "Qwen3.8-Flash-Next (Strata) needs Linux + an NVIDIA GPU (CUDA 13, auto-installed by scripts/strata.sh). Not available on this box — re-run with --model=qwen."
         fi
+        INFERENCE_BACKEND=strata
         return 0
     fi
-    # Non-interactive default: Bonsai PQ2_0 on 12GB+, PTQ1_0 on 8GB, Qwen on CPU.
-    if [ "${_GPU_TIER:-0}" -ge 12 ]; then
-        select_bonsai_model pq2
-    elif [ "${_GPU_TIER:-0}" -ge 8 ]; then
-        select_bonsai_model ptq1
+
+    # Explicit llama-family selection: honor it (Bonsai hardware re-checked later).
+    case "$choice" in
+        bonsai-pq2|bonsai|pq2) select_bonsai_model pq2; INFERENCE_BACKEND=llama; return 0 ;;
+        bonsai-ptq1|ptq1)      select_bonsai_model ptq1; INFERENCE_BACKEND=llama; return 0 ;;
+        qwen)                  INFERENCE_BACKEND=llama; return 0 ;;
+    esac
+
+    # choice == auto. Non-interactive: safe default = Qwen on stock llama.cpp.
+    if [ ! -t 0 ]; then
+        INFERENCE_BACKEND=llama
+        info "Model: Qwen on stock llama.cpp (default). For another engine: --model=flash-next (Strata, NVIDIA) or --model=bonsai-pq2|bonsai-ptq1."
+        return 0
     fi
+
+    # Interactive: show only options this box can run; default = Qwen (1).
+    flush_stdin
+    echo ""
+    echo "  Which model + engine for this box? (GPU tier: ${_GPU_TIER:-CPU})"
+    echo ""
+    echo "  1) Qwen on llama.cpp  [default — standard, most compatible]"
+    local bonsai_pq2=0 bonsai_ptq1=0 strata_n=0 n=1
+    if [ "${CAN_BONSAI:-0}" = "1" ]; then
+        bonsai_pq2=$(( n + 1 )); echo "  $bonsai_pq2) Ternary-Bonsai-2-27B PQ2_0 (~7.2GB) [Prism CUDA/Vulkan]"
+        bonsai_ptq1=$(( n + 2 )); echo "  $bonsai_ptq1) Ternary-Bonsai-2-27B PTQ1_0 (~5.9GB) [tightest VRAM]"
+        n=$(( n + 2 ))
+    fi
+    if [ "${CAN_STRATA:-0}" = "1" ]; then
+        strata_n=$(( n + 1 )); echo "  $strata_n) Qwen3.8-Flash-Next via Strata (~70GB, NVIDIA / CUDA 13)"
+    fi
+    echo ""
+    printf "  Enter choice [default: 1]: "
+    read -r _mc; echo ""
+    _mc="${_mc:-1}"
+    if [ "$strata_n" != "0" ] && [ "$_mc" = "$strata_n" ]; then
+        INFERENCE_BACKEND=strata
+        return 0
+    fi
+    if [ "$bonsai_pq2" != "0" ] && [ "$_mc" = "$bonsai_pq2" ]; then
+        select_bonsai_model pq2; INFERENCE_BACKEND=llama; return 0
+    fi
+    if [ "$bonsai_ptq1" != "0" ] && [ "$_mc" = "$bonsai_ptq1" ]; then
+        select_bonsai_model ptq1; INFERENCE_BACKEND=llama; return 0
+    fi
+    # anything else (incl. bare Enter) → default Qwen on stock llama.cpp
+    INFERENCE_BACKEND=llama
 }
 
 # ── Auto-recover from fresh `usermod -aG docker` ──────────────────────────────
@@ -208,11 +220,13 @@ case "$OPENMONO_ROLE" in
 esac
 
 # ── Inference backend (Linux only; macOS uses its native path) ───────────────
-# strata = Strata/Qwen3.8-Flash-Next via scripts/strata.sh (default on Linux).
-# llama  = legacy bundled llama.cpp Docker path (still supported).
+# The backend is FINALIZED by the unified picker further below (analyze the
+# box → present only runnable options → default Qwen on stock llama.cpp). The
+# default here is llama to match main; only an explicit
+# OPENMONO_INFERENCE_BACKEND=strata short-circuits ahead of the picker.
 # Agent role needs no local engine, so the backend is informational there.
 if [ "$OPENMONO_ROLE" != "agent" ]; then
-    INFERENCE_BACKEND="${OPENMONO_INFERENCE_BACKEND:-strata}"
+    INFERENCE_BACKEND="${OPENMONO_INFERENCE_BACKEND:-llama}"
 else
     INFERENCE_BACKEND="${OPENMONO_INFERENCE_BACKEND:-none}"
 fi
@@ -220,11 +234,9 @@ case "$INFERENCE_BACKEND" in
     strata|llama|none) ;;
     *) echo "ERROR: Invalid OPENMONO_INFERENCE_BACKEND='$INFERENCE_BACKEND' (expected: strata, llama)" >&2; exit 1 ;;
 esac
-if [ "$INFERENCE_BACKEND" = "strata" ]; then
-    info "Inference backend: Strata (Qwen3.8-Flash-Next, OpenAI-compatible :8080/v1)"
+if [ "${OPENMONO_INFERENCE_BACKEND:-}" = "strata" ]; then
+    info "Inference backend: Strata (Qwen3.8-Flash-Next) — explicitly selected via OPENMONO_INFERENCE_BACKEND"
     info "Docs: docs/STRATA.md — Strata is MIT-licensed upstream (github.com/Niko1221/Strata)"
-else
-    info "Inference backend: llama.cpp (legacy Docker path)"
 fi
 
 # Step counts vary by role. We keep numbering stable per-role rather than
@@ -351,7 +363,13 @@ MODEL_ALIAS=""
 MODEL_MMPROJ=""
 MODEL_MMPROJ_URL=""
 IS_BONSAI=0
-if [ "$OPENMONO_ROLE" != "agent" ] && [ "$INFERENCE_BACKEND" != "strata" ]; then
+CAN_BONSAI=0
+CAN_STRATA=0
+# Analyze the box, keep only the options it can actually run, then pick
+# (default Qwen on stock llama.cpp). Sets INFERENCE_BACKEND + MODEL_* that every
+# downstream step (download, docker env, start) reads. Runs for EVERY
+# inference-capable role, regardless of backend.
+if [ "$OPENMONO_ROLE" != "agent" ]; then
     if [ "${GPU_MODE:-0}" = "1" ]; then
         if command -v nvidia-smi &>/dev/null; then
             _VRAM_MB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | awk 'NR==1{print $1}')
@@ -379,12 +397,27 @@ if [ "$OPENMONO_ROLE" != "agent" ] && [ "$INFERENCE_BACKEND" != "strata" ]; then
         fi
     fi
     select_model "$_GPU_TIER"
-    # Model picker fires here — AFTER hardware detection — and only prompts
-    # on NVIDIA GPU boxes (see prompt_model_family). Everywhere else the
-    # stock Qwen selection above stands, so nobody can select a model their
-    # box can't run. An explicit --model=bonsai-* flag is honored anywhere
-    # and validated by the gate below.
-    prompt_model_family
+    # Which options can THIS box run? Bonsai needs an accelerated llama.cpp
+    # (Prism CUDA or Vulkan) — there is no CPU image. Strata (Qwen3.8-Flash-Next)
+    # is Linux-only, NVIDIA + CUDA 13; scripts/strata.sh auto-installs the
+    # toolkit, so the presence of an NVIDIA GPU is enough to OFFER it (the
+    # install step verifies CUDA). CPU-only and AMD/Vulkan-only boxes never see
+    # a model or engine they cannot actually run.
+    if [ "${GPU_MODE:-0}" = "1" ] || [ "${AMD_IGPU_MODE:-0}" = "1" ]; then
+        CAN_BONSAI=1
+    fi
+    _has_nvidia_hw=false
+    if command -v lspci &>/dev/null && lspci 2>/dev/null | grep -qi 'nvidia'; then _has_nvidia_hw=true; fi
+    if [ -e /proc/driver/nvidia ] || command -v nvidia-smi &>/dev/null; then _has_nvidia_hw=true; fi
+    if [ "$(uname -s)" = "Linux" ] && [ "$_has_nvidia_hw" = true ] && [ "${AMD_IGPU_MODE:-0}" != "1" ]; then
+        CAN_STRATA=1
+    fi
+    # Unified picker: defaults to Qwen on stock llama.cpp; Bonsai / Strata are
+    # offered only when this box supports them. Sets INFERENCE_BACKEND.
+    prompt_model_choice
+    # Bonsai / Prism model plumbing below applies only to the llama.cpp backend;
+    # Strata owns its own weights and engine, so skip it entirely for strata.
+    if [ "$INFERENCE_BACKEND" != "strata" ]; then
     # Bonsai gate: needs an accelerated backend (NVIDIA/CUDA or 7940HS/Vulkan).
     # Fail BEFORE the multi-GB model download, not after it.
     if [ "${IS_BONSAI:-0}" = "1" ] && [ "${GPU_MODE:-0}" != "1" ] && [ "${AMD_IGPU_MODE:-0}" != "1" ]; then
@@ -423,6 +456,7 @@ if [ "$OPENMONO_ROLE" != "agent" ] && [ "$INFERENCE_BACKEND" != "strata" ]; then
     ok "Model selected: $MODEL_NAME"
     if [ -n "${MODEL_MMPROJ:-}" ]; then
         detail "Vision projector: $MODEL_MMPROJ"
+    fi
     fi
 fi
 
@@ -973,12 +1007,15 @@ EOF
 fi
 
 # DOCKER_ENV_FILE is defined before Step 6's branch. This block only runs for
-# the non-Strata (llama) backend, so it just records the model selection.
+# the non-Strata (llama) backend, so it records the model selection AND pins the
+# backend marker to llama. Clearing any stale INFERENCE_BACKEND=strata here is
+# what lets a box that previously ran Strata switch back to --model=qwen without
+# the launcher (which reads this file) still trying to route to a Strata server.
 if [ -f "$DOCKER_ENV_FILE" ]; then
-    grep -v -E "^MODEL_NAME=|^MODEL_ALIAS=|^MODEL_MMPROJ=|^OPENMONO_VISION_ENABLED=|^CTX_SIZE=" "$DOCKER_ENV_FILE" > "${DOCKER_ENV_FILE}.tmp" || true
+    grep -v -E "^MODEL_NAME=|^MODEL_ALIAS=|^MODEL_MMPROJ=|^OPENMONO_VISION_ENABLED=|^CTX_SIZE=|^INFERENCE_BACKEND=" "$DOCKER_ENV_FILE" > "${DOCKER_ENV_FILE}.tmp" || true
     mv "${DOCKER_ENV_FILE}.tmp" "$DOCKER_ENV_FILE"
 fi
-printf "MODEL_NAME=%s\nMODEL_ALIAS=%s\nMODEL_MMPROJ=%s\nCTX_SIZE=%s\n" "$MODEL_NAME" "$MODEL_ALIAS" "${MODEL_MMPROJ:-}" "${_CTX:-$CTX_CPU}" >> "$DOCKER_ENV_FILE"
+printf "INFERENCE_BACKEND=llama\nMODEL_NAME=%s\nMODEL_ALIAS=%s\nMODEL_MMPROJ=%s\nCTX_SIZE=%s\n" "$MODEL_NAME" "$MODEL_ALIAS" "${MODEL_MMPROJ:-}" "${_CTX:-$CTX_CPU}" >> "$DOCKER_ENV_FILE"
 if [ -n "${MODEL_MMPROJ:-}" ]; then
     printf "OPENMONO_VISION_ENABLED=1\n" >> "$DOCKER_ENV_FILE"
     detail "Persisted MODEL_NAME=$MODEL_NAME MODEL_MMPROJ=$MODEL_MMPROJ (vision enabled) to $DOCKER_ENV_FILE"
@@ -1243,7 +1280,7 @@ export INSTALL_DIR="$INSTALL_DIR"
 export LLAMA_PORT="${LLAMA_PORT:-7474}"
 export GPU_MODE="${GPU_MODE:-0}"
 export OPENMONO_ROLE="$OPENMONO_ROLE"
-export OPENMONO_INFERENCE_BACKEND="${INFERENCE_BACKEND:-strata}"
+export OPENMONO_INFERENCE_BACKEND="${INFERENCE_BACKEND:-llama}"
 export STRATA_PORT="${STRATA_PORT:-8080}"
 export OPENMONO_HOST_BRIDGE="${OPENMONO_HOST_BRIDGE:-0}"
 export MODEL_NAME="${MODEL_NAME:-}"

@@ -450,6 +450,7 @@ cmd_setup() {
             --bonsai)       export OPENMONO_MODEL=bonsai-pq2 ;;
             --bonsai-ptq1)  export OPENMONO_MODEL=bonsai-ptq1 ;;
             --qwen)         export OPENMONO_MODEL=qwen ;;
+            --flash-next)   export OPENMONO_MODEL=flash-next ;;
             --verbose|-v)   export OPENMONO_VERBOSE=1 ;;
             --help|-h)
                 echo "Usage: openmono setup [--full|--inference|--agent] [--gpu|--cpu] [--model=NAME] [--verbose]"
@@ -465,11 +466,12 @@ cmd_setup() {
                 echo "                Use on the laptop in dual-box mode. Point at a remote"
                 echo "                inference server via 'openmono config set llm.endpoint …'."
                 echo ""
-                echo "Model family (Bonsai: NVIDIA CUDA, 7940HS Vulkan, or Apple Silicon 16GB+ experimental):"
-                echo "  --model=bonsai-pq2   Ternary-Bonsai-2-27B PQ2_0 (~7.2GB)"
+                echo "Model engine (setup analyzes your hardware and only offers what this box can run; default = Qwen on llama.cpp):"
+                echo "  --model=qwen         Stock Qwen on standard llama.cpp  [DEFAULT]"
+                echo "  --model=bonsai-pq2   Ternary-Bonsai-2-27B PQ2_0 (~7.2GB) [NVIDIA CUDA / 7940HS Vulkan / Apple Silicon 16GB+ experimental]"
                 echo "  --model=bonsai-ptq1  Ternary-Bonsai-2-27B PTQ1_0 (~5.9GB, small cards)"
-                echo "  --model=qwen         Stock Qwen (no Prism image needed)"
-                echo "  --bonsai / --bonsai-ptq1 / --qwen   shorthands for the above"
+                echo "  --model=flash-next   Qwen3.8-Flash-Next via Strata (~70GB, Linux + NVIDIA / CUDA 13)"
+                echo "  --bonsai / --bonsai-ptq1 / --qwen / --flash-next   shorthands for the above"
                 echo ""
                 echo "GPU mode (applies to --full and --inference):"
                 echo "  --gpu         Force GPU mode (requires NVIDIA + nvidia-container-toolkit)"
