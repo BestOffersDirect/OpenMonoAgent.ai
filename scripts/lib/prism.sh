@@ -207,13 +207,16 @@ build_prism_macos() {
 
     info "Building llama-server + llama-cli (Metal default, $(sysctl -n hw.ncpu 2>/dev/null || echo 4) jobs)..."
     info "This takes ~5–10 min on Apple Silicon — same phase as the model download."
-    if ! run_live cmake -S "$src" -B "$src/build"; then
+    if ! run cmake -S "$src" -B "$src/build"; then
         err "cmake configure failed for the Prism fork"
+        show_log_tail 20
         return 1
     fi
-    if ! run_live cmake --build "$src/build" -j --target llama-server llama-cli; then
+    if ! run_progress cmake --build "$src/build" -j --target llama-server llama-cli; then
         err "Prism fork build failed"
-        err "Retry with OPENMONO_VERBOSE=1, or force a clean rebuild: OPENMONO_PRISM_FORCE_BUILD=1 openmono setup"
+        show_log_tail 20
+        err "Force a clean rebuild: OPENMONO_PRISM_FORCE_BUILD=1 openmono setup"
+        err "Full build log: $OPENMONO_LOG_FILE"
         return 1
     fi
 
