@@ -269,8 +269,10 @@ public sealed class HostExecutor
 
     private string RunBackgroundDirect(string command)
     {
-        Directory.CreateDirectory(_logDir);
-        var logPath = NewBgLogPath();
+        var dir = ResolveBgLogDir();
+        if (dir is null)
+            return "ERROR: no writable log directory for background commands (host-bridge/logs, ~/.openmono/logs and temp are all unwritable).";
+        var logPath = NewBgLogPath(dir);
         var wrapped = $"exec >>'{logPath}' 2>&1; {command}";
         return SpawnDetached(wrapped, stdinPassword: false, command, logPath);
     }
@@ -279,8 +281,10 @@ public sealed class HostExecutor
     {
         if (!SudoPresent())
             return "ERROR: sudo is not installed on this host.";
-        Directory.CreateDirectory(_logDir);
-        var logPath = NewBgLogPath();
+        var dir = ResolveBgLogDir();
+        if (dir is null)
+            return "ERROR: no writable log directory for background commands (host-bridge/logs, ~/.openmono/logs and temp are all unwritable).";
+        var logPath = NewBgLogPath(dir);
         var needsPassword = !SudoProbe(targetUser);
         if (needsPassword && !_identity.HasPassword)
             return $"ERROR: elevation to '{targetUser}' needs a sudo password and none is in memory.";
@@ -326,7 +330,48 @@ public sealed class HostExecutor
 
     private string EffectiveUserHint() => _identity.RunAsUser;
 
-    private string NewBgLogPath() => Path.Combine(_logDir,
+    private string? _bgLogDir;
+
+    /// <summary>
+    /// The directory used for background-command logs. The configured log dir
+    /// can exist but be unwritable — Docker auto-creates the tmpfs shadow's
+    /// mountpoint (~/.openmono/host-bridge/logs) as root inside the host bind,
+    /// while the daemon runs as the unprivileged user. Walk a fallback chain
+    /// (configured dir → ~/.openmono/logs → temp), probing each for write
+    /// access, so background exec never dies on a directory permission the
+    /// operator cannot see. A one-time audit note names the fallback.
+    /// </summary>
+    private string? ResolveBgLogDir()
+    {
+        if (_bgLogDir is not null) return _bgLogDir;
+        string[] candidates =
+        [
+            _logDir,
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".openmono", "logs"),
+            Path.GetTempPath(),
+        ];
+        foreach (var dir in candidates)
+        {
+            try
+            {
+                Directory.CreateDirectory(dir);
+                var probe = Path.Combine(dir, $".probe-{Guid.NewGuid():N}.tmp");
+                File.AppendAllText(probe, "");
+                File.Delete(probe);
+                _bgLogDir = dir;
+                if (!string.Equals(dir, _logDir, StringComparison.Ordinal))
+                    AuditLog.WriteNote($"bg-log dir fallback: {_logDir} is not writable (root-owned? created by Docker); using {dir}");
+                return _bgLogDir;
+            }
+            catch (Exception)
+            {
+                // Unwritable candidate — try the next one.
+            }
+        }
+        return null;
+    }
+
+    private string NewBgLogPath(string dir) => Path.Combine(dir,
         $"bg-{DateTime.UtcNow:yyyyMMdd-HHmmss}-{Guid.NewGuid().ToString("N")[..6]}.log");
 
     private ProcessStartInfo BashPsi(string command, bool stdin)

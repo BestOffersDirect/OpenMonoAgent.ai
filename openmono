@@ -473,7 +473,7 @@ cmd_setup() {
                 echo "  --model=qwen         Stock Qwen on standard llama.cpp  [DEFAULT]"
                 echo "  --model=bonsai-pq2   Ternary-Bonsai-2-27B PQ2_0 (~7.2GB) [NVIDIA CUDA / 7940HS Vulkan / Apple Silicon 16GB+ experimental]"
                 echo "  --model=bonsai-ptq1  Ternary-Bonsai-2-27B PTQ1_0 (~5.9GB, small cards)"
-                echo "  --model=flash-next   Qwen3.8-Flash-Next via Strata (~70GB, Linux + NVIDIA / CUDA 13)"
+                echo "  --model=flash-next   Qwen3.8-Flash-Next via Strata (~70GB, Linux + NVIDIA / CUDA 13, 64GB RAM+)"
                 echo "  --bonsai / --bonsai-ptq1 / --qwen / --flash-next   shorthands for the above"
                 echo ""
                 echo "GPU mode (applies to --full and --inference):"
@@ -1152,6 +1152,17 @@ _host_daemon_start() {
     kind="${spec%%$'\t'*}"
     target="${spec#*$'\t'}"
     mkdir -p "$HOME/.openmono/logs"
+    # Pre-create the daemon's bg-log dir as the current user. If Docker
+    # auto-created it first (it owns the tmpfs shadow mountpoint in
+    # ~/.openmono as root), background/as_root execs fail closed; tell the
+    # operator how to fix ownership instead of failing silently.
+    if ! mkdir -p "$HOME/.openmono/host-bridge/logs" 2>/dev/null; then
+        err "~/.openmono/host-bridge/logs is not writable (usually root-owned, created by Docker)."
+        err "Fix ownership with:  sudo chown -R \"$USER\" ~/.openmono/host-bridge"
+    elif [[ ! -w "$HOME/.openmono/host-bridge/logs" ]]; then
+        err "~/.openmono/host-bridge/logs exists but is not writable."
+        err "Fix ownership with:  sudo chown -R \"$USER\" ~/.openmono/host-bridge"
+    fi
     info "Starting host-bridge daemon on 127.0.0.1:${HOST_DAEMON_PORT} (log: $HOST_DAEMON_LOG)"
     if [[ "$kind" == "bin" ]]; then
         nohup "$target" --daemon --daemon-port "$HOST_DAEMON_PORT" --workdir "$(pwd)" \
@@ -1200,6 +1211,8 @@ cmd_host() {
             ok "host-bridge daemon is running on 127.0.0.1:${HOST_DAEMON_PORT}"
             info "Pair secret: ~/.openmono/host-bridge.json (0600) · audit: ~/.openmono/logs/"
             info "In the sandbox agent, connect with: /host on"
+            info "Then approve the pairing request on the host: openmono host requests && openmono host approve <id>"
+            info "(Or launch with an invite — no approval step: OPENMONO_HOST_INVITE=\$(openmono host invite) openmono agent)"
             info "Stop with: openmono host stop"
             ;;
         stop)

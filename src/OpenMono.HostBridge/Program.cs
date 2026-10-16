@@ -197,7 +197,8 @@ if (options.Daemon)
     // Console approver: when this daemon has a real terminal, an approval-less
     // pair request prompts [y/N] right here. Without a TTY (launched by
     // openmono host daemon via nohup) the operator approves with
-    // `openmono host approve <session>` instead — never a silent pair.
+    // `openmono host approve <session>` instead — never a silent pair. Without
+    // a console the queue is invisible, so say so up front.
     if (!Console.IsInputRedirected)
     {
         daemon.PairRequested += req => _ = Task.Run(() =>
@@ -213,6 +214,13 @@ if (options.Daemon)
                 Console.Error.WriteLine(ok ? "[bridge] pair approved." : "[bridge] pair denied.");
         });
     }
+    else
+    {
+        daemon.PairRequested += req =>
+            Console.Error.WriteLine(
+                $"[bridge] PAIR REQUEST queued — session {req.SessionId} · workdir {req.WorkDir} · " +
+                $"no console attached (nohup daemon): approve with `openmono host approve {req.SessionId}`");
+    }
     try
     {
         daemon.Start();
@@ -227,6 +235,8 @@ if (options.Daemon)
         $"[bridge] host daemon on {string.Join(" + ", daemon.BoundAddresses.Select(a => $"http://{a}:{options.DaemonPort}"))} · workdir {workDir} · " +
         $"run as {identity.RunAsUser} · sudo={identity.Sudo.ToString().ToLowerInvariant()} · " +
         "sandbox sessions pair with: openmono agent → /host on");
+    if (Console.IsInputRedirected)
+        Console.Error.WriteLine("[bridge] no console attached — pair requests queue; approve with: openmono host requests / openmono host approve <id>");
     Console.Error.WriteLine("[bridge] Ctrl+C to stop. Every host command is audited + policy-gated.");
 
     await Task.Delay(Timeout.Infinite, daemonCts.Token).ContinueWith(_ => { });
