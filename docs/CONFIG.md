@@ -389,9 +389,11 @@ openmono host stop       # stop it
 ```
 
 Then pair any sandbox agent to it with `/host on` inside the agent (`/host off`
-revokes it mid-session). The daemon listens on `127.0.0.1:7476`; from inside the
-agent container it is reached via `host.docker.internal`, and the pair secret is
-read from the bind-mounted `~/.openmono/host-bridge.json`.
+revokes it mid-session). The daemon listens on `127.0.0.1:7476` plus — on Linux —
+the docker bridge gateway (`docker0`/`br-*`) so the agent container reaches it
+via `host.docker.internal`; on macOS Docker Desktop forwards that name to the
+host loopback natively. It never binds `0.0.0.0` or any LAN interface. The pair
+secret is read from the bind-mounted `~/.openmono/host-bridge.json`.
 
 ### Policy keys
 

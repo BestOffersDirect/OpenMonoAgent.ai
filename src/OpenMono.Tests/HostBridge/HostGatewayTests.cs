@@ -78,6 +78,78 @@ public class HostGatewayTests : IAsyncLifetime
         gw.IsPaired.Should().BeFalse();
     }
 
+    // ── Bridge-address binding (Linux host.docker.internal reachability) ──
+
+    [Fact]
+    public async Task Pair_ExtraBoundAddress_PairAndExecSucceedViaIt()
+    {
+        // 127.0.0.2 is a real loopback address on every Linux/macOS box; it
+        // stands in for a docker bridge gateway IP the daemon now binds.
+        // HttpListener matches the Host: header against bound prefixes, so a
+        // client that dials the bound address must succeed end-to-end.
+        await using var daemon = new HostDaemon(
+            new BridgeConfig { PairSecret = Secret, HostExec = new HostExecPolicy { Default = "allow", Deny = [.. HostExecPolicy.SampleDeny] } },
+            new HostIdentity("", SudoPolicy.Ask, null), _workDir, GetFreePort(),
+            null, ["127.0.0.2"]);
+        daemon.Start();
+
+        var gw = new HostGateway($"http://127.0.0.2:{daemon.Port}", "gw-bridge", _workDir, Secret);
+        var error = await gw.PairAsync();
+        error.Should().BeNull();
+        gw.IsPaired.Should().BeTrue();
+
+        var result = await gw.RunAsync(
+            new HostExecRequest("echo bridge-ok", null, false, false),
+            (_, _, _) => Task.FromResult(HostConsentDecision.AllowOnce),
+            CancellationToken.None);
+        result.Should().Contain("bridge-ok");
+    }
+
+    [Fact]
+    public async Task Pair_HostHeaderMismatch_FailsClosed()
+    {
+        // The other half of the Linux bug: dialing an address the daemon does
+        // NOT bind gets rejected by HttpListener (404 on the wire). This is
+        // why the agent must resolve host.docker.internal to the gateway IP
+        // the daemon binds, not just hope the hostname matches.
+        await using var daemon = new HostDaemon(
+            new BridgeConfig { PairSecret = Secret, HostExec = new HostExecPolicy { Default = "allow", Deny = [.. HostExecPolicy.SampleDeny] } },
+            new HostIdentity("", SudoPolicy.Ask, null), _workDir, GetFreePort());
+        daemon.Start();
+
+        var gw = new HostGateway($"http://127.0.0.2:{daemon.Port}", "gw-mismatch", _workDir, Secret);
+        var error = await gw.PairAsync();
+        error.Should().NotBeNull();
+        gw.IsPaired.Should().BeFalse();
+    }
+
+    [Fact]
+    public void DetectDockerBridgeAddresses_NeverWildcardAndNeverThrows()
+    {
+        var addrs = HostDaemon.DetectDockerBridgeAddresses();
+        addrs.Should().NotBeNull();
+        foreach (var a in addrs)
+        {
+            a.Should().NotBe("0.0.0.0").And.NotBe("+").And.NotBe("*");
+            System.Net.IPAddress.TryParse(a, out var parsed).Should().BeTrue();
+            parsed!.AddressFamily.Should().Be(AddressFamily.InterNetwork);
+        }
+    }
+
+    [Fact]
+    public async Task Start_RejectsWildcardBind()
+    {
+        await using var daemon = new HostDaemon(
+            new BridgeConfig { PairSecret = Secret, HostExec = new HostExecPolicy { Default = "allow", Deny = [.. HostExecPolicy.SampleDeny] } },
+            new HostIdentity("", SudoPolicy.Ask, null), _workDir, GetFreePort(),
+            null, ["0.0.0.0", "+"]);
+        daemon.Start();
+        daemon.BoundAddresses.Should().BeEquivalentTo(["127.0.0.1"]);
+        // Wildcard sneaked in? Nothing should answer on the bridge stand-in.
+        var gw = new HostGateway($"http://127.0.0.2:{daemon.Port}", "gw-wild", _workDir, Secret);
+        (await gw.PairAsync()).Should().NotBeNull();
+    }
+
     // ── Execution + consent ───────────────────────────────────────────
 
     [Fact]

@@ -187,8 +187,12 @@ if (options.Daemon)
     Console.CancelKeyPress += (_, e) => { e.Cancel = true; daemonCts.Cancel(); };
     AppDomain.CurrentDomain.ProcessExit += (_, _) => daemonCts.Cancel();
 
+    var daemonBinds = options.DaemonBinds.Count > 0
+        ? options.DaemonBinds.ToArray()
+        : HostDaemon.DetectDockerBridgeAddresses();
+
     await using var daemon = new HostDaemon(config, identity, workDir, options.DaemonPort,
-        TimeSpan.FromHours(options.DaemonIdleTimeoutHours));
+        TimeSpan.FromHours(options.DaemonIdleTimeoutHours), daemonBinds);
     try
     {
         daemon.Start();
@@ -200,7 +204,7 @@ if (options.Daemon)
     }
 
     Console.Error.WriteLine(
-        $"[bridge] host daemon on http://127.0.0.1:{options.DaemonPort} · workdir {workDir} · " +
+        $"[bridge] host daemon on {string.Join(" + ", daemon.BoundAddresses.Select(a => $"http://{a}:{options.DaemonPort}"))} · workdir {workDir} · " +
         $"run as {identity.RunAsUser} · sudo={identity.Sudo.ToString().ToLowerInvariant()} · " +
         "sandbox sessions pair with: openmono agent → /host on");
     Console.Error.WriteLine("[bridge] Ctrl+C to stop. Every host command is audited + policy-gated.");

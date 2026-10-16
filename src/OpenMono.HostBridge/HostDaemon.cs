@@ -6,8 +6,11 @@ namespace OpenMono.HostBridge;
 /// <summary>
 /// Bare-metal host daemon: the bare-metal half of host mode when the model
 /// loop lives in a sandbox container (TUI or ACP/extension), not the operator
-/// bridge. It listens on LOOPBACK ONLY and is reached from the container via
+/// bridge. It listens on LOOPBACK and, on Linux, additionally on the local
+/// docker bridge gateway (docker0 / br-*) so containers can reach it via
 /// <c>host.docker.internal</c> (docker-compose sets <c>host-gateway</c>).
+/// The daemon never binds 0.0.0.0 or a wildcard: it stays unreachable from
+/// any LAN/WAN interface.
 ///
 /// Trust model (defense in depth):
 ///  - Pairing requires the shared <c>pair_secret</c> (0600 config / env).
@@ -38,6 +41,10 @@ public sealed class HostDaemon : IAsyncDisposable
     private readonly Dictionary<string, SessionLock> _sessions = [];
     private readonly object _sessionsLock = new();
     private readonly TimeSpan _idleTimeout;
+    private readonly string[] _extraBindAddresses;
+
+    /// <summary>Addresses the daemon is actually listening on (loopback first).</summary>
+    public string[] BoundAddresses { get; private set; } = ["127.0.0.1"];
 
     /// <summary>Default idle window after which a session token expires.</summary>
     public static readonly TimeSpan DefaultIdleTimeout = TimeSpan.FromHours(2);
@@ -49,7 +56,11 @@ public sealed class HostDaemon : IAsyncDisposable
     /// <param name="idleTimeout">Idle-token expiry: a pairing whose last seen
     /// activity is older than this dies on the next call (activity refreshes
     /// the clock). <see cref="TimeSpan.Zero"> disables expiry.</see></param>
-    public HostDaemon(BridgeConfig config, HostIdentity identity, string workDir, int port, TimeSpan? idleTimeout = null)
+    /// <param name="extraBindAddresses">Addresses beyond loopback to bind —
+    /// docker bridge gateway IPs detected automatically, or explicit
+    /// operator-supplied ones. Never 0.0.0.0/"+"; wildcards are rejected.</param>
+    public HostDaemon(BridgeConfig config, HostIdentity identity, string workDir, int port,
+        TimeSpan? idleTimeout = null, IEnumerable<string>? extraBindAddresses = null)
     {
         _config = config;
         _identity = identity;
@@ -58,6 +69,11 @@ public sealed class HostDaemon : IAsyncDisposable
         Port = port;
         _pairSecret = config.PairSecret;
         _idleTimeout = idleTimeout ?? DefaultIdleTimeout;
+        _extraBindAddresses = (extraBindAddresses ?? [])
+            .Where(a => a is { Length: > 0 })
+            .Where(a => a is not ("+" or "*") && a != "0.0.0.0")
+            .Distinct()
+            .ToArray();
     }
 
     /// <summary>
@@ -69,9 +85,52 @@ public sealed class HostDaemon : IAsyncDisposable
 
     public void Start()
     {
+        var bound = new List<string> { "127.0.0.1" };
         _listener.Prefixes.Add($"http://127.0.0.1:{Port}/");
+        foreach (var addr in _extraBindAddresses)
+        {
+            // Containers reach the host at the bridge gateway; HttpListener
+            // also matches the Host: header against bound prefixes, so the
+            // client must dial the same address it is bound to (see
+            // HostGatewayBootstrap, which resolves host.docker.internal).
+            _listener.Prefixes.Add($"http://{addr}:{Port}/");
+            bound.Add(addr);
+        }
+        BoundAddresses = [.. bound];
         _listener.Start();
         _ = AcceptLoopAsync(_cts.Token);
+    }
+
+    /// <summary>
+    /// Docker bridge gateway IPs on this box (docker0 / br-*) that a sandbox
+    /// container reaches as <c>host.docker.internal</c> when Docker resolves
+    /// <c>host-gateway</c>. Empty on macOS (Docker Desktop's VM forwards the
+    /// host loopback) and when Docker has no bridge yet. Loopback-only
+    /// listeners are NOT reachable this way on Linux — that is why the daemon
+    /// binds these too. Only ever local bridge subnets, never a LAN address.
+    /// Down bridges are included: an idle docker0 (carrier=0) still owns its
+    /// IP and still accepts connections routed in from other bridge networks
+    /// — which is exactly how host-gateway resolves on multi-network hosts.
+    /// </summary>
+    public static string[] DetectDockerBridgeAddresses()
+    {
+        if (!OperatingSystem.IsLinux()) return [];
+        try
+        {
+            return System.Net.NetworkInformation.NetworkInterface.GetAllNetworkInterfaces()
+                .Where(ni => ni.NetworkInterfaceType != System.Net.NetworkInformation.NetworkInterfaceType.Loopback &&
+                             (ni.Name.StartsWith("docker", StringComparison.Ordinal) ||
+                              ni.Name.StartsWith("br-", StringComparison.Ordinal)))
+                .SelectMany(ni => ni.GetIPProperties().UnicastAddresses)
+                .Where(ua => ua.Address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
+                .Select(ua => ua.Address.ToString())
+                .Distinct()
+                .ToArray();
+        }
+        catch
+        {
+            return [];
+        }
     }
 
     private async Task AcceptLoopAsync(CancellationToken ct)

@@ -31,9 +31,36 @@ public static class HostGatewayBootstrap
     public static string ResolveBaseUrl()
     {
         var url = Environment.GetEnvironmentVariable(UrlEnv);
-        if (!string.IsNullOrWhiteSpace(url)) return url.Trim();
-        var host = File.Exists("/.dockerenv") ? "host.docker.internal" : "127.0.0.1";
-        return $"http://{host}:{DefaultPort}";
+        Uri? parsed = null;
+        if (!string.IsNullOrWhiteSpace(url))
+            Uri.TryCreate(url.Trim(), UriKind.Absolute, out parsed);
+        var host = parsed?.Host is { Length: > 0 } h ? h : (File.Exists("/.dockerenv") ? "host.docker.internal" : "127.0.0.1");
+        var port = parsed is not null && parsed.Port > 0 ? parsed.Port : int.Parse(DefaultPort);
+
+        // On Linux the daemon binds the docker bridge gateway IPs (docker0 /
+        // br-*), and managed HttpListener matches the Host: header against
+        // bound prefixes — so dialing the literal name host.docker.internal
+        // 404s even when routing works. Dial its resolved IPv4 instead; the
+        // Host header then matches the bridge the daemon bound. Only that
+        // well-known name is rewritten: any other explicit URL is used
+        // exactly as configured (an operator pointing at a dead URL must
+        // get the error they configured for, not a silent fallback).
+        // macOS (Docker Desktop) forwards host.docker.internal to host
+        // loopback with a matching Host header — leave it alone.
+        if (OperatingSystem.IsLinux() && File.Exists("/.dockerenv") && host == "host.docker.internal")
+        {
+            try
+            {
+                var v4 = System.Net.Dns.GetHostAddresses("host.docker.internal")
+                    .FirstOrDefault(a => a.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork);
+                if (v4 is not null) host = v4.ToString();
+            }
+            catch
+            {
+                // Name unresolvable: pair will fail with a clear connect error.
+            }
+        }
+        return $"http://{host}:{port}";
     }
 
     public static string ResolveSecret()

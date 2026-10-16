@@ -58,6 +58,11 @@ public sealed class BridgeOptions
     /// <summary>Hours of inactivity before a paired session's token expires (0 = never).</summary>
     public double DaemonIdleTimeoutHours { get; private set; } = 2;
 
+    /// <summary>Extra addresses for the daemon to bind besides loopback
+    /// (docker bridge gateway IPs detected automatically; these are for
+    /// non-standard setups). Wildcards and 0.0.0.0 are never allowed.</summary>
+    public List<string> DaemonBinds { get; } = [];
+
     public static BridgeOptions Parse(string[] args)
     {
         var options = new BridgeOptions();
@@ -93,6 +98,10 @@ public sealed class BridgeOptions
                 case "--classic": options.Classic = true; break;
                 case "--plan": options.Plan = true; break;
                 case "--daemon": options.Daemon = true; break;
+                case "--daemon-bind":
+                    options.Daemon = true;
+                    if (Next() is { Length: > 0 } bind) options.DaemonBinds.Add(bind);
+                    break;
                 case "--daemon-port":
                     options.Daemon = true;
                     if (int.TryParse(Next(), out var dport)) options.DaemonPort = dport;
@@ -159,11 +168,14 @@ public sealed class BridgeOptions
         Console.WriteLine("                      (env: OPENMONO_HOST_RUN_AS, OPENMONO_HOST_PASSWORD_FILE)");
         Console.WriteLine("  --daemon            Run as the bare-metal host DAEMON (sandbox sessions pair in)");
         Console.WriteLine("                      instead of driving a container as an operator. Listens on");
-        Console.WriteLine("                      127.0.0.1:<--daemon-port> (default 7476); container reaches");
-        Console.WriteLine("                      it via host.docker.internal. Pairing needs pair_secret");
-        Console.WriteLine("                      (config / OPENMONO_HOST_PAIR_SECRET). Sudo needs");
-        Console.WriteLine("                      allow_sudo=allow (no human at the daemon). See --help.");
+        Console.WriteLine("                      127.0.0.1:<--daemon-port> (default 7476) plus, on Linux, the");
+        Console.WriteLine("                      docker bridge gateway (docker0/br-*) so containers can reach");
+        Console.WriteLine("                      it via host.docker.internal. Never binds 0.0.0.0. Pairing");
+        Console.WriteLine("                      needs pair_secret (config / OPENMONO_HOST_PAIR_SECRET).");
+        Console.WriteLine("                      Sudo needs allow_sudo=allow (no human at the daemon).");
         Console.WriteLine("  --daemon-port <n>   Loopback port for --daemon (default 7476)");
+        Console.WriteLine("  --daemon-bind <ip>  Also bind this address (repeatable); for non-standard docker");
+        Console.WriteLine("                      bridges. Wildcards / 0.0.0.0 are rejected.");
         Console.WriteLine("  --idle-timeout <h>  Hours before an idle paired session's token expires");
         Console.WriteLine("                      (default 2; 0 disables expiry; activity keeps it alive)");
         Console.WriteLine("  --verbose, -v       Print resolved ACP/config summary at startup");
