@@ -125,7 +125,14 @@ confirm() {
         return 0
     fi
     if [ "$DRY_RUN" = "1" ]; then
-        info "$prompt → would prompt (--dry-run, defaulting NO)"
+        # Nothing destructive can run in dry-run mode, so simulate the
+        # prompt's DEFAULT answer instead of declining everything: that lets
+        # the main "Proceed?" gate pass so the full plan is actually shown.
+        if [ "$default" = "Y" ]; then
+            info "$prompt → default YES (dry-run preview; nothing changes)"
+            return 0
+        fi
+        info "$prompt → default NO (dry-run preview; nothing changes)"
         return 1
     fi
 
@@ -279,9 +286,12 @@ pip_uninstall() {
     local pkg="$1"
     [ -z "$PIP_CMD" ] && { detail "no pip available — skipping $pkg"; return 0; }
     if $PIP_CMD show "$pkg" &>/dev/null 2>&1; then
-        info "Uninstalling $pkg (pip)..."
         do_run $PIP_CMD uninstall -y "$pkg"
-        ok "$pkg uninstalled"
+        if [ "$DRY_RUN" = "1" ]; then
+            printf "  ${DIM}[dry-run] would uninstall %s${NC}\n" "$pkg"
+        else
+            ok "$pkg uninstalled"
+        fi
     else
         detail "$pkg not installed via pip — skipping"
     fi
@@ -716,8 +726,12 @@ if [ "$IS_UBUNTU" != "1" ]; then
 fi
 
 if [ -z "$SUDO" ] && [ "$(id -u)" -ne 0 ]; then
-    err "--deep requires sudo on Ubuntu but no sudo is available."
-    die "Cannot remove system packages without root."
+    if [ "$DRY_RUN" = "1" ]; then
+        warn "--deep would require sudo on Ubuntu (dry-run continues the preview; a real run would stop here)."
+    else
+        err "--deep requires sudo on Ubuntu but no sudo is available."
+        die "Cannot remove system packages without root."
+    fi
 fi
 
 # ── Step 11: Remove pip --user packages ──────────────────────────────────────

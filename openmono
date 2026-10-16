@@ -373,6 +373,7 @@ cmd_help() {
     echo "Any box:"
     printf "  %-14s %s\n" "setup"   "Install (--full|--inference|--agent) [--gpu|--cpu] [--model=bonsai-pq2|bonsai-ptq1|qwen]"
     printf "  %-14s %s\n" "upgrade" "Update to the latest version + rebuild the agent (--check to preview)"
+    printf "  %-14s %s\n" "uninstall" "Remove OpenMono (--dry-run to preview; --deep also removes system packages)"
     printf "  %-14s %s\n" "config"  "Read/write ~/.openmono/settings.json (e.g. llm.endpoint, llm.api_key)"
     printf "  %-14s %s\n" "host"    "Host-bridge daemon for whole-machine mode [daemon|stop|status]"
     printf "  %-14s %s\n" "version" "Print the CLI version"
@@ -2359,6 +2360,7 @@ case "$COMMAND" in
     graph)          cmd_graph "$@" ;;
     graphify)       cmd_graphify "$@" ;;
     upgrade|update) cmd_upgrade "$@" ;;
+    uninstall)      bash "$REPO_DIR/scripts/uninstall.sh" "$@" ;;
     config)         cmd_config "$@" ;;
     tunnel)         cmd_tunnel "$@" ;;
     version|--version|-V) cmd_version ;;
