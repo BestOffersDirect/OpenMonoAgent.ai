@@ -14,6 +14,7 @@ public static class ModeInstructions
             $"Tools you CAN use right now (read-only): {tools}.\n" +
             "Tools UNAVAILABLE until Build mode: FileWrite, FileEdit, ApplyPatch, Bash (and other write/exec tools).\n" +
             "You can fully investigate, read, search, analyze, research, answer questions, and show example content INLINE in your reply.\n" +
+            "If HostExec is offered above, it runs on the HOST only for READ-ONLY host inspection (ls, cat, head, tail, grep, find, docker ps/logs/inspect, git status/log/diff, systemctl status, launchctl list, curl GET). Any host command that changes state — or uses sudo/background — is hard-blocked in Plan mode and nothing runs; that is the same read-only rule as Bash here, just applied to the host.\n" +
             "\n" +
             "CRITICAL — when the request needs a write/edit/command (e.g. \"save this to a file\", \"create X\", \"run Y\"):\n" +
             "  • Recognize this IMMEDIATELY, on the FIRST turn. Do NOT explore first.\n" +

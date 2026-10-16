@@ -463,8 +463,20 @@ public sealed class ConversationLoop : IDisposable
             // Recompute the tool set EACH iteration so a mid-turn mode flip (e.g. ImplementPlan
             // switching Plan→Build) immediately changes which tools the model is offered — the
             // banner below and these defs always reflect the same, current mode.
-            var allowedToolNames = (_toolSubset?.Select(t => t.Name) ?? _tools.All.Select(t => t.Name)).ToArray();
-            var planModeToolNames = allowedToolNames.Where(n => _tools.Resolve(n)?.IsReadOnly == true).ToArray();
+            // HostExec is only offered while the session is paired with a host daemon
+            // (HostEnabled); when Host is off the tool is not in the model's tool set at all,
+            // so it cannot be called (enforced again by a hard gate in LocalToolExecutor).
+            var allowedToolNames = (_toolSubset?.Select(t => t.Name) ?? _tools.All.Select(t => t.Name))
+                .Where(n => _session.Meta.HostEnabled || !string.Equals(n, "HostExec", StringComparison.OrdinalIgnoreCase))
+                .ToArray();
+            // Plan mode = read-only tools, PLUS HostExec when paired: planning requires
+            // inspecting host state (the container cannot see host paths), but the
+            // executor gate (PlanModePolicy.HostCommandAllowedInPlanMode) only lets
+            // read-only inspection commands through while planning.
+            var planModeToolNames = allowedToolNames
+                .Where(n => _tools.Resolve(n)?.IsReadOnly == true ||
+                            (_session.Meta.HostEnabled && string.Equals(n, "HostExec", StringComparison.OrdinalIgnoreCase)))
+                .ToArray();
             var toolDefs = _session.Meta.PlanMode
                 ? _tools.BuildToolDefinitionsFor(planModeToolNames)
                 : _tools.BuildToolDefinitionsFor(allowedToolNames);
@@ -479,9 +491,22 @@ public sealed class ConversationLoop : IDisposable
                 if (sysIdx >= 0)
                 {
                     var banner = ModeInstructions.CurrentModeBanner(_session.Meta.PlanMode, planModeToolNames);
+                    // Authoritative host-state banner: tells the model, fresh every
+                    // turn, whether Host mode is on and that host actions go through
+                    // the HostExec tool (never AskUser, never faked with Bash). When
+                    // Host is off it states the tool is unavailable so the model does
+                    // not smuggle a HOST_EXEC envelope or beg the user to run commands.
+                    // Host banner is MODE-AGNOSTIC: host mode only gates host ACCESS.
+                    // Whether a host command may actually run (read-only vs state-changing)
+                    // is the plan/build command-type gate's job — stated in the mode banner
+                    // and enforced in the executor — and it applies on the host exactly as
+                    // it does in the container. Keep these two banners independent.
+                    var hostBanner = _session.Meta.HostEnabled
+                        ? "[HOST MODE: ON — host actions go through the HostExec tool (a real tool call the user approves in their UI), never through AskUser and never faked with Bash.]"
+                        : "[HOST MODE: OFF — you have NO HostExec tool and CANNOT run anything on the host. Do not emit HOST_EXEC envelopes, do not ask the user to run host commands for you, and do not fake host actions with Bash. Your Bash/FileRead/Grep/Glob tools see only the container workspace. If a host action is truly needed, tell the user to turn Host on.]";
                     contextWindow[sysIdx] = contextWindow[sysIdx] with
                     {
-                        Content = banner + (contextWindow[sysIdx].Content ?? ""),
+                        Content = banner + hostBanner + "\n\n" + (contextWindow[sysIdx].Content ?? ""),
                     };
                 }
                 Log.Info($"[OMA_MODE] turn {_session.TurnCount}: PlanMode={_session.Meta.PlanMode}; " +
