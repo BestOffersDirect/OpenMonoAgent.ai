@@ -49,6 +49,15 @@ public sealed class BridgeOptions
     /// <summary>Leave the session in Plan mode instead of defaulting to Build.</summary>
     public bool Plan { get; private set; }
 
+    /// <summary>Run as the bare-metal host daemon (sandbox sessions pair in). Sibling of operator mode.</summary>
+    public bool Daemon { get; private set; }
+
+    /// <summary>Loopback port for the daemon (default 7476).</summary>
+    public int DaemonPort { get; private set; } = 7476;
+
+    /// <summary>Hours of inactivity before a paired session's token expires (0 = never).</summary>
+    public double DaemonIdleTimeoutHours { get; private set; } = 2;
+
     public static BridgeOptions Parse(string[] args)
     {
         var options = new BridgeOptions();
@@ -83,6 +92,15 @@ public sealed class BridgeOptions
                 case "--tui": options.ForceTui = true; break;
                 case "--classic": options.Classic = true; break;
                 case "--plan": options.Plan = true; break;
+                case "--daemon": options.Daemon = true; break;
+                case "--daemon-port":
+                    options.Daemon = true;
+                    if (int.TryParse(Next(), out var dport)) options.DaemonPort = dport;
+                    break;
+                case "--idle-timeout":
+                    if (double.TryParse(Next(), out var idle) && idle >= 0)
+                        options.DaemonIdleTimeoutHours = idle;
+                    break;
                 case "--verbose":
                 case "-v": options.Verbose = true; break;
                 case "--help":
@@ -139,6 +157,15 @@ public sealed class BridgeOptions
         Console.WriteLine("  --allow-sudo        Explicitly allow sudo escalation for this run");
         Console.WriteLine("  --no-sudo           Explicitly forbid sudo escalation for this run");
         Console.WriteLine("                      (env: OPENMONO_HOST_RUN_AS, OPENMONO_HOST_PASSWORD_FILE)");
+        Console.WriteLine("  --daemon            Run as the bare-metal host DAEMON (sandbox sessions pair in)");
+        Console.WriteLine("                      instead of driving a container as an operator. Listens on");
+        Console.WriteLine("                      127.0.0.1:<--daemon-port> (default 7476); container reaches");
+        Console.WriteLine("                      it via host.docker.internal. Pairing needs pair_secret");
+        Console.WriteLine("                      (config / OPENMONO_HOST_PAIR_SECRET). Sudo needs");
+        Console.WriteLine("                      allow_sudo=allow (no human at the daemon). See --help.");
+        Console.WriteLine("  --daemon-port <n>   Loopback port for --daemon (default 7476)");
+        Console.WriteLine("  --idle-timeout <h>  Hours before an idle paired session's token expires");
+        Console.WriteLine("                      (default 2; 0 disables expiry; activity keeps it alive)");
         Console.WriteLine("  --verbose, -v       Print resolved ACP/config summary at startup");
         Console.WriteLine("  --help, -h          Show this help");
         Console.WriteLine("  --version           Show version");

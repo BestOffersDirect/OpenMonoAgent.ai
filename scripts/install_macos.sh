@@ -20,6 +20,8 @@ INSTALL_DIR="$(dirname "$SCRIPT_DIR")"  # repo root (parent of scripts/)
 source "$SCRIPT_DIR/lib/log.sh"
 # shellcheck source=lib/prism.sh
 source "$SCRIPT_DIR/lib/prism.sh"
+# shellcheck source=lib/model-catalog.sh
+source "$SCRIPT_DIR/lib/model-catalog.sh"
 
 # ── Context size presets (tokens) — edit here to change globally ──────────────
 CTX_48G=196608       # >=48 GB Metal  q8_0 KV
@@ -39,44 +41,14 @@ CTX_VISION_16G=12288 # 16 GB + mmproj   (~25% reduction)
 #   27B dense    — 52 layers, 8 KV heads, head_dim 128 → KV  ~6.5 GB @ q8_0/65536
 #   9B dense     — 36 layers, 8 KV heads, head_dim 128 → KV  ~1.1 GB @ q8_0/16384
 select_model() {
-    local ram_gb="${1:-0}"
-    if [ "$ram_gb" -ge 48 ]; then
-        # ~17.6 GB weights + ~18.5 GB KV + ~6 GB OS ≈ 42 GB on 48 GB Mac
-        MODEL_NAME="Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"
-        MODEL_URL="https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/main/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"
-        MODEL_ACCURACY="standard"
-        MODEL_MMPROJ="mmproj-qwen3.6-35B-A3B-F16.gguf"
-        MODEL_MMPROJ_URL="https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/main/mmproj-F16.gguf"
-        _MODEL_LABEL="Qwen3.6-35B-A3B (~17.6GB) [Apple Silicon >=48GB — standard]"
-        _CTX_SIZE=$CTX_48G
-    elif [ "$ram_gb" -ge 32 ]; then
-        # ~5 GB weights + ~1.1 GB KV + ~6 GB OS ≈ 12 GB on 32 GB Mac
-        MODEL_NAME="Qwen3.5-9B-UD-Q4_K_XL.gguf"
-        MODEL_URL="https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-UD-Q4_K_XL.gguf"
-        MODEL_ACCURACY="lower"
-        MODEL_MMPROJ="mmproj-qwen3.5-9B-F16.gguf"
-        MODEL_MMPROJ_URL="https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/mmproj-F16.gguf"
-        _MODEL_LABEL="Qwen3.5-9B-UD-Q4_K_XL (~5GB) [Apple Silicon 32GB]"
-        _CTX_SIZE=$CTX_32G
-    elif [ "$ram_gb" -ge 16 ]; then
-        # ~5 GB weights + ~1.1 GB KV + ~6 GB OS ≈ 12 GB on 16 GB Mac
-        MODEL_NAME="Qwen3.5-9B-UD-Q4_K_XL.gguf"
-        MODEL_URL="https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-UD-Q4_K_XL.gguf"
-        MODEL_ACCURACY="lower"
-        MODEL_MMPROJ="mmproj-qwen3.5-9B-F16.gguf"
-        MODEL_MMPROJ_URL="https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/mmproj-F16.gguf"
-        _MODEL_LABEL="Qwen3.5-9B-UD-Q4_K_XL (~5GB) [Apple Silicon 16GB — lower accuracy]"
-        _CTX_SIZE=$CTX_16G
-    else
-        MODEL_NAME="Qwen3.5-9B-UD-Q4_K_XL.gguf"
-        MODEL_URL="https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-UD-Q4_K_XL.gguf"
-        MODEL_ACCURACY="lower"
-        MODEL_MMPROJ=""
-        MODEL_MMPROJ_URL=""
-        _MODEL_LABEL="Qwen3.5-9B-UD-Q4_K_XL (~5GB) [Apple Silicon <16GB]"
-        _CTX_SIZE=$CTX_8G
-    fi
-    MODEL_ALIAS="${MODEL_NAME%.gguf}"
+    local ram_gb="${1:-0}" key
+    # Data-driven: the macos tier ladder (>=48/32/16/else->8) and per-tier
+    # ctx/name/url/label live in scripts/models.json. mc_pick_tier mirrors the
+    # old >= ladders (largest tier key <= ram_gb, clamped to the smallest).
+    key="$(mc_pick_tier qwen macos "$ram_gb")"
+    [ -n "$key" ] || key=8
+    mc_select qwen macos "$key"
+    _CTX_SIZE="$(mc_tier_field qwen macos "$key" ctx)"
 }
 
 # Bonsai picker for Apple Silicon. Called AFTER unified-memory detection in

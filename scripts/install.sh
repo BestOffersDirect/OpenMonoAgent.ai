@@ -47,6 +47,8 @@ INSTALL_DIR="$(dirname "$SCRIPT_DIR")"  # repo root (parent of scripts/)
 source "$SCRIPT_DIR/lib/log.sh"
 # shellcheck source=lib/prism.sh
 source "$SCRIPT_DIR/lib/prism.sh"
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR/lib/model-catalog.sh"
 
 # ── Context size presets (tokens) — edit here to change globally ─────────────
 CTX_24G=196608       # GPU 24GB+  q8_0 KV  (~8GB KV + 15GB weights ≈ 23GB)
@@ -57,34 +59,16 @@ CTX_VISION=172032    # 24GB+ tier + mmproj — 723 MiB free at rest; vision enco
 CTX_VISION_16G=98304  # 16GB tier + mmproj — ~1GB less KV than 128k, gives vision encoder burst headroom
 
 # MODEL_ACCURACY, MODEL_ALIAS, and _MODEL_LABEL.
+# Data-driven: the per-tier Qwen rows live in scripts/models.json and are
+# resolved by lib/model-catalog.sh. _GPU_TIER maps to a linux tier key
+# (24/16/12, everything else -> cpu) exactly as the old case table did.
 select_model() {
+    local key
     case "${1:-0}" in
-        24) MODEL_NAME="Qwen3.8-27B-UD-Q4_K_M.gguf"
-            MODEL_URL="https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/resolve/main/Qwen3.8-27B-UD-Q4_K_M.gguf"
-            MODEL_ACCURACY="full"
-            MODEL_MMPROJ="mmproj-qwen3.8-27B-F16.gguf"
-            MODEL_MMPROJ_URL="https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/resolve/main/mmproj-F16.gguf"
-            _MODEL_LABEL="Qwen3.8-27B-UD-Q4_K_M (~15GB) [GPU 24GB+ — full accuracy]" ;;
-        16) MODEL_NAME="Qwen3.8-27B-UD-IQ3_XXS.gguf"
-            MODEL_URL="https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/resolve/main/Qwen3.8-27B-UD-IQ3_XXS.gguf"
-            MODEL_ACCURACY="lower"
-            MODEL_MMPROJ="mmproj-qwen3.8-27B-F16.gguf"
-            MODEL_MMPROJ_URL="https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/resolve/main/mmproj-F16.gguf"
-            _MODEL_LABEL="Qwen3.8-27B-UD-IQ3_XXS (~12GB) [GPU 16GB — lower accuracy]" ;;
-        12) MODEL_NAME="Qwen3.5-9B-UD-Q4_K_XL.gguf"
-            MODEL_URL="https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-UD-Q4_K_XL.gguf"
-            MODEL_ACCURACY="lower"
-            MODEL_MMPROJ="mmproj-qwen3.5-9B-F16.gguf"
-            MODEL_MMPROJ_URL="https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/mmproj-F16.gguf"
-            _MODEL_LABEL="Qwen3.5-9B-UD-Q4_K_XL (~5GB) [GPU 12GB — lower accuracy]" ;;
-        *)  MODEL_NAME="Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"
-            MODEL_URL="https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/main/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"
-            MODEL_ACCURACY="standard"
-            MODEL_MMPROJ="mmproj-qwen3.6-35B-A3B-F16.gguf"
-            MODEL_MMPROJ_URL="https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/main/mmproj-F16.gguf"
-            _MODEL_LABEL="Qwen3.6-35B-A3B (~17.6GB) [CPU]" ;;
+        24|16|12) key="${1:-0}" ;;
+        *)        key="cpu" ;;
     esac
-    MODEL_ALIAS="${MODEL_NAME%.gguf}"
+    mc_select qwen linux "$key"
 }
 
 # (Bonsai model selection lives in scripts/lib/prism.sh as
@@ -106,8 +90,8 @@ prompt_model_choice() {
     # Explicit Strata opt-in (by model name or backend) — validated up front so
     # nobody is offered a ~70GB install their box can't run.
     if [ "$choice" = "flash-next" ] || [ "$explicit_backend" = "strata" ]; then
-        if [ "${CAN_STRATA:-0}" != "1" ]; then
-            die "Qwen3.8-Flash-Next (Strata) needs Linux + an NVIDIA GPU (CUDA 13, auto-installed by scripts/strata.sh). Not available on this box — re-run with --model=qwen."
+        if [ "$(mc_flag "$(mc_requires flash-next)")" != "1" ]; then
+            die "$(mc_deny flash-next)"
         fi
         INFERENCE_BACKEND=strata
         return 0
@@ -132,15 +116,18 @@ prompt_model_choice() {
     echo ""
     echo "  Which model + engine for this box? (GPU tier: ${_GPU_TIER:-CPU})"
     echo ""
-    echo "  1) Qwen on llama.cpp  [default — standard, most compatible]"
-    local bonsai_pq2=0 bonsai_ptq1=0 strata_n=0 n=1
-    if [ "${CAN_BONSAI:-0}" = "1" ]; then
-        bonsai_pq2=$(( n + 1 )); echo "  $bonsai_pq2) Ternary-Bonsai-2-27B PQ2_0 (~7.2GB) [Prism CUDA/Vulkan]"
-        bonsai_ptq1=$(( n + 2 )); echo "  $bonsai_ptq1) Ternary-Bonsai-2-27B PTQ1_0 (~5.9GB) [tightest VRAM]"
+    printf '  1) %s\n' "$(mc_menu qwen line)"
+    local bonsai_pq2=0 bonsai_ptq1=0 strata_n=0 n=1 _ln
+    _ln="$(mc_menu bonsai-pq2 line)"
+    if [ -n "$_ln" ] && [ "$(mc_flag "$(mc_requires bonsai-pq2)")" = "1" ]; then
+        bonsai_pq2=$(( n + 1 ));  printf '  %s) %s\n' "$bonsai_pq2"  "$_ln"
+        _ln="$(mc_menu bonsai-ptq1 line)"
+        bonsai_ptq1=$(( n + 2 )); printf '  %s) %s\n' "$bonsai_ptq1" "$_ln"
         n=$(( n + 2 ))
     fi
-    if [ "${CAN_STRATA:-0}" = "1" ]; then
-        strata_n=$(( n + 1 )); echo "  $strata_n) Qwen3.8-Flash-Next via Strata (~70GB, NVIDIA / CUDA 13)"
+    _ln="$(mc_menu flash-next line)"
+    if [ -n "$_ln" ] && [ "$(mc_flag "$(mc_requires flash-next)")" = "1" ]; then
+        strata_n=$(( n + 1 )); printf '  %s) %s\n' "$strata_n" "$_ln"
     fi
     echo ""
     printf "  Enter choice [default: 1]: "

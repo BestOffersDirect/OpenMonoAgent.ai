@@ -11,6 +11,10 @@ namespace OpenMono.HostBridge;
 /// <c>OpenMono.Utils.SecretScanner</c> (Redact policy): the audit trail never
 /// carries passwords or secret values, while the live turn stream still shows
 /// the operator the raw output they need to troubleshoot.
+///
+/// Lives in the shared kernel so the host-bridge daemon, the operator bridge,
+/// and the sandbox agent's gateway all write to one trail with one format —
+/// the audit history can never diverge between surfaces.
 /// </summary>
 public static class AuditLog
 {

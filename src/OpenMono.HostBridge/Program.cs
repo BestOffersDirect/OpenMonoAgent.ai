@@ -150,6 +150,66 @@ if (!identity.RunAsUser.Equals(HostIdentity.CurrentUser, StringComparison.Ordina
     return 1;
 }
 
+// ── Daemon mode (--daemon): the bare-metal half of host mode for SANDBOX
+// sessions (openmono agent TUI / ACP extension). Sandbox containers pair in
+// over host.docker.internal and run user-approved commands here. The operator
+// path (--acp / spawn) below is unchanged. Defense in depth: pairing needs the
+// shared pair_secret, every exec needs a live session token, the deny-list and
+// sudo policy are enforced here as the last line of defense, and every call is
+// audited. The daemon never re-consents — the client UI is where the human
+// says yes to each command. See docs/DEPLOYMENT-MODES.md.
+if (options.Daemon)
+{
+    // Pairing secret: env wins; otherwise reuse the saved config secret; a
+    // fresh daemon generates one and persists it (0600) so the launcher can
+    // hand it to the sandbox container. Without a secret, pairing is disabled
+    // (the daemon refuses everything) — never pair with an empty secret.
+    var envSecret = Environment.GetEnvironmentVariable("OPENMONO_HOST_PAIR_SECRET");
+    if (!string.IsNullOrWhiteSpace(envSecret))
+        config.PairSecret = envSecret.Trim();
+    if (string.IsNullOrWhiteSpace(config.PairSecret))
+    {
+        var bytes = new byte[24];
+        System.Security.Cryptography.RandomNumberGenerator.Fill(bytes);
+        config.PairSecret = Convert.ToHexString(bytes);
+        BridgeConfig.Save(options.ConfigPath, config);
+        Console.Error.WriteLine($"[bridge] generated pair_secret in {BridgeConfig.DefaultPath} (0600).");
+    }
+
+    // Escalation at the daemon has no human to answer an "ask", so warn early
+    // when sudo is not an explicit allow (the daemon still fails those closed).
+    if (identity.Sudo != SudoPolicy.Allow)
+        Console.Error.WriteLine(
+            "[bridge] host mode: sudo policy is not 'allow' — as_root / sudo commands will be refused " +
+            "(set openmono config host.sudo_policy allow to enable them for unattended host mode).");
+
+    using var daemonCts = new CancellationTokenSource();
+    Console.CancelKeyPress += (_, e) => { e.Cancel = true; daemonCts.Cancel(); };
+    AppDomain.CurrentDomain.ProcessExit += (_, _) => daemonCts.Cancel();
+
+    await using var daemon = new HostDaemon(config, identity, workDir, options.DaemonPort,
+        TimeSpan.FromHours(options.DaemonIdleTimeoutHours));
+    try
+    {
+        daemon.Start();
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine($"[bridge] ERROR: could not listen on 127.0.0.1:{options.DaemonPort}: {ex.Message}");
+        return 1;
+    }
+
+    Console.Error.WriteLine(
+        $"[bridge] host daemon on http://127.0.0.1:{options.DaemonPort} · workdir {workDir} · " +
+        $"run as {identity.RunAsUser} · sudo={identity.Sudo.ToString().ToLowerInvariant()} · " +
+        "sandbox sessions pair with: openmono agent → /host on");
+    Console.Error.WriteLine("[bridge] Ctrl+C to stop. Every host command is audited + policy-gated.");
+
+    await Task.Delay(Timeout.Infinite, daemonCts.Token).ContinueWith(_ => { });
+    Console.Error.WriteLine("[bridge] host daemon stopped (all session tokens revoked).");
+    return 0;
+}
+
 // Full-screen agent TUI on a real terminal (same renderer as openmono agent);
 // plain lines when piped, non-interactive, or --classic.
 var useTui = !options.Classic &&

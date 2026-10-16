@@ -49,14 +49,24 @@ endpoints the VS Code extension and `scripts/acp-smoke.sh` use:
 - Host execution rides the existing `AskUser` → `user_input_request` channel:
   the agent asks `HOST_EXEC: {"command": "...", "timeout_ms": N,
   "background": false}`; the bridge allow-list checks it, runs it on bare
-  metal, and resumes the turn with the output. No new endpoint, no new pause
-  kind, no container or extension changes.
+  metal, and resumes the turn with the output. The pause now also carries
+  structured `host_exec` fields (`kind: "host_exec"`, `command`, `as_root`)
+  so a remote client can render an approve/deny UI without scraping the
+  prompt text; answers use the shared consent vocabulary (`y`/`n`/`a`/`!`,
+  `HOST_EXEC_APPROVE` / `HOST_EXEC_DENY`).
+- Session host toggle: `POST /api/v1/sessions/{id}/host` with
+  `{"action":"on"|"off"}` — the ACP equivalent of the TUI's `/host on|off`.
+  `on` pairs with the host daemon and injects the standing orders; `off`
+  revokes the pairing and strips them. Wire contract: 200 with
+  `{ok, host_enabled, run_as?, sudo?, error?}`; pairing failures come back
+  as `ok:false` + human-readable `error` (start the daemon, check the
+  secret), never a 4xx crash.
 
 Project layout (`src/OpenMono.HostBridge/`, .NET 10, references the CLI project for its TUI):
 
 | File | Responsibility |
 |---|---|
-| `Program.cs` / `BridgeOptions.cs` | CLI (`--task`, `--session`, `--acp`, `--port`, `--keep`, `--init`, `--run-as`, `--allow-sudo`, `--no-sudo`, `--non-interactive`, `--tui`, `--classic`, `--plan`, …), TUI/line loops, discovery wait, mode ensure |
+| `Program.cs` / `BridgeOptions.cs` | CLI (`--task`, `--session`, `--acp`, `--port`, `--keep`, `--init`, `--run-as`, `--allow-sudo`, `--no-sudo`, `--non-interactive`, `--tui`, `--classic`, `--plan`, `--daemon`, `--daemon-port`, `--workdir`, `--idle-timeout`, …), TUI/line loops, discovery wait, mode ensure |
 | `AcpClient.cs` | HTTP + SSE client for the stock ACP API (+ `{"mode":…}` ensure) |
 | `AgentContainer.cs` | Spawns the unmodified `agent` service detached (`--acp-only`, loopback port publish, git passthrough, endpoint mapping: Linux `llama-server:7474` / `caddy:8080`, macOS `host.docker.internal` for native Metal inference), stops what it started |
 | `HostExecutor.cs` | `HOST_EXEC` envelope parse, allow → deny → default policy, foreground/background bare-metal execution, sudo via run-as identity, audit |
@@ -148,6 +158,14 @@ Project layout (`src/OpenMono.HostBridge/`, .NET 10, references the CLI project 
 - **Legacy bool configs.** Old `host-bridge.json` files stored `allow_sudo` as a
   JSON boolean; it is mapped on load (`true` → `allow`, `false` → `deny`,
   missing/null → `ask`) and normalized to the string form on the next save.
+- **Idle-token expiry.** A paired sandbox session holds a daemon session
+  token; if it goes silent for longer than `--idle-timeout <hours>` (default
+  **2**, `0` disables), the token dies on its next call — the pairing fails
+  closed and the agent must re-pair (`/host on` again). Any validated call
+  refreshes the clock, so an active session never expires mid-task.
+  `GET /status` on the daemon reports `ok`, `port`, `version`, and a
+  `paired_sessions` count (counts only — never tokens or session ids);
+  `openmono host status` uses it.
 - **Timeouts.** A timed-out foreground command is killed (whole process tree;
   via passwordless sudo when the command ran elevated) and the report says
   `was terminated` only when the process is confirmed gone. Otherwise it says

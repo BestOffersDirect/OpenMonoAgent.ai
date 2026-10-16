@@ -1,5 +1,7 @@
+using OpenMono.HostBridge;
 using OpenMono.Permissions;
 using OpenMono.Playbooks;
+using OpenMono.Session;
 using OpenMono.Utils;
 
 namespace OpenMono.Acp;
@@ -139,11 +141,34 @@ public sealed class AcpUserInteractionForwarder : IAcpUserInteraction
         var id = "ask_" + Guid.NewGuid().ToString("N")[..12];
         _session.RegisterPause(id, PendingResponseKind.UserInput, question);
 
-        await _writer.WriteEventAsync("user_input_request", new
+        // HOST_EXEC envelope: emit structured fields next to the raw question
+        // so the client can render a proper consent card (command, cwd,
+        // escalation, timeout) without re-parsing the question text. Additive:
+        // old clients keep the {id, question} shape they already handle, and
+        // unparseable envelopes are sent exactly as before.
+        if (HostExecRequest.LooksLikeHostExec(question) &&
+            HostExecRequest.TryParse(question, out var hostExec) && hostExec is not null)
         {
-            id,
-            question,
-        });
+            await _writer.WriteEventAsync("user_input_request", new
+            {
+                id,
+                question,
+                kind = "host_exec",
+                command = hostExec.Command,
+                cwd = HostGatewayBootstrap.ResolveWorkDir(),
+                as_root = hostExec.AsRoot,
+                timeout_ms = hostExec.TimeoutMs,
+                background = hostExec.Background,
+            });
+        }
+        else
+        {
+            await _writer.WriteEventAsync("user_input_request", new
+            {
+                id,
+                question,
+            });
+        }
 
         DesktopNotifier.Alert(
             "OpenMono — input needed",

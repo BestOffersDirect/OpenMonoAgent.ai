@@ -1,5 +1,6 @@
 using System.Text.Json;
 using OpenMono.Config;
+using OpenMono.HostBridge;
 using OpenMono.Memory;
 using OpenMono.Permissions;
 using OpenMono.Playbooks;
@@ -213,6 +214,18 @@ public sealed class AcpTurnRunner : IAcpEventSink
                 Log.Info($"[OMA_SYSTEMPROMPT] System prompt built: {_cachedSystemPrompt.Length} chars, {(_playbookRegistry?.All.Count ?? 0)} playbooks included");
             }
 
+            // Host mode: pair with the host daemon when the launcher injected
+            // the host env, and append the standing orders once so the model
+            // knows its own tools see only the container workspace.
+            var gateway = await HostGatewayBootstrap.GetOrCreateAsync(_acpSession.State, ct);
+            if (gateway is not null)
+            {
+                _acpSession.State.Meta.HostEnabled = true;
+                if (!_cachedSystemPrompt.Contains(HostStandingOrders.Marker))
+                    _cachedSystemPrompt += "\n\n" + gateway.BuildStandingOrders();
+                Log.Info($"[OMA_SYSTEMPROMPT] Host mode ON for ACP session {_acpSession.Id} at {gateway.BaseUrl}");
+            }
+
             Log.Info($"[OMA_SYSTEMPROMPT] Session {_acpSession.Id}: Adding system prompt ({_cachedSystemPrompt.Length} chars). Messages before: {_acpSession.Messages.Count}");
             _acpSession.Messages.Insert(0, new Message
             {
@@ -414,6 +427,23 @@ public sealed class AcpTurnRunner : IAcpEventSink
         if (!_acpSession.TryResolvePause(id, new AcpUserInputResponse(resolvedValue)))
             throw new InvalidOperationException($"failed to resolve pause id: {id}");
 
+        // Host mode on the ACP surface: the pause's question WAS a HOST_EXEC
+        // envelope (the client UI showed it as the consent card). The answer is
+        // the user's consent; on approval the command runs on bare metal via
+        // the daemon and the model is fed the execution result, not the answer.
+        if (HostExecRequest.LooksLikeHostExec(ctx.ContextKey))
+        {
+            var gateway = HostGatewayRegistry.Get(_acpSession.Id);
+            if (gateway is not null)
+            {
+                var answer = await RunHostExecOnResumeAsync(ctx.ContextKey, resolvedValue, gateway, ct);
+                AppendSyntheticToolMessages(answer);
+                _acpSession.State.Meta.AwaitingEscalationAck = false;
+                await DriveLoopAsync(ct);
+                return;
+            }
+        }
+
         // No general user-input caching: each free-form question prompts fresh.
         // (HOST_EXEC authorization is grant-cached bridge-side, never as answers.)
         AppendSyntheticToolMessages(resolvedValue);
@@ -421,6 +451,32 @@ public sealed class AcpTurnRunner : IAcpEventSink
         // A user_input answer is genuine user direction.
         _acpSession.State.Meta.AwaitingEscalationAck = false;
         await DriveLoopAsync(ct);
+    }
+
+    /// <summary>
+    /// Execute a HOST_EXEC envelope on resume, after the ACP client answered
+    /// the envelope (the consent card). The answer maps through the shared
+    /// consent vocabulary; on approval the command runs on bare metal via the
+    /// daemon and the execution output is the tool answer to the model.
+    /// </summary>
+    private async Task<string> RunHostExecOnResumeAsync(
+        string question,
+        string answer,
+        HostGateway gateway,
+        CancellationToken ct)
+    {
+        if (!HostExecRequest.TryParse(question, out var request) || request is null)
+            return HostExecRequest.MalformedEnvelopeAnswer(question);
+
+        var decision = HostConsent.Map(answer);
+
+        // The client already gave its consent (the envelope question IS the
+        // consent card); hand the mapped decision to the gateway so it records
+        // the session grant the same way the TUI card does. Always route
+        // through RunAsync — a DenyAll must set the gateway's deny-all flag so
+        // later commands never re-prompt, exactly like the TUI surface.
+        return await gateway.RunAsync(request,
+            (_, _, _) => Task.FromResult(decision), ct);
     }
 
     public async Task ResumeWithPlanDecisionAsync(string decision, CancellationToken ct)

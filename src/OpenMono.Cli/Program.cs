@@ -188,6 +188,7 @@ static async Task RunAgentAsync(string? endpoint, string? model, string? workdir
     tools.Register(new AgentTool());
     tools.Register(new TodoTool());
     tools.Register(new AskUserTool());
+    tools.Register(new HostExecTool());
     tools.Register(new MemorySaveTool(memoryStore));
     tools.Register(new WebFetchTool());
     tools.Register(new WebSearchTool());
@@ -219,6 +220,19 @@ static async Task RunAgentAsync(string? endpoint, string? model, string? workdir
     tools.Register(new PlaybookTool(playbookRegistry, playbookExecutor));
 
     var systemPrompt = await SystemPrompt.BuildAsync(config, memoryStore, playbookRegistry);
+
+    // Host mode: when the launcher injected the host-daemon env (openmono
+    // agent --host), pair now so HOST:ON + standing orders are live from the
+    // first turn. No env → stays sandboxed, HOST_EXEC falls through as a
+    // normal question and /host on can pair manually.
+    var hostGateway = await HostGatewayBootstrap.GetOrCreateAsync(session);
+    if (hostGateway is not null)
+    {
+        session.Meta.HostEnabled = true;
+        systemPrompt += "\n\n" + hostGateway.BuildStandingOrders();
+        renderer.WriteInfo($"HOST:ON — paired to {hostGateway.BaseUrl} (run as {hostGateway.RunAs}, sudo={hostGateway.Sudo}). Host actions ask a HOST EXECUTION card first.");
+    }
+
     session.AddMessage(new Message { Role = MessageRole.System, Content = systemPrompt });
 
     using var mcpManager = new McpServerManager(msg => renderer.WriteInfo(msg));

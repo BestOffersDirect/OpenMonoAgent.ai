@@ -19,9 +19,11 @@ COPY OpenMono.sln ./
 COPY global.json ./
 
 COPY src/OpenMono.Cli/OpenMono.Cli.csproj src/OpenMono.Cli/
+COPY src/OpenMono.Core/OpenMono.Core.csproj src/OpenMono.Core/
 RUN dotnet restore src/OpenMono.Cli/OpenMono.Cli.csproj
 
 COPY src/OpenMono.Cli/ src/OpenMono.Cli/
+COPY src/OpenMono.Core/ src/OpenMono.Core/
 RUN dotnet publish src/OpenMono.Cli/OpenMono.Cli.csproj \
     -c Release \
     -o /app \

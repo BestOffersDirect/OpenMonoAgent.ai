@@ -419,6 +419,14 @@ public sealed class PermissionEngine
         if (toolName == "Bash" && input.TryGetProperty("command", out var cmd))
             return cmd.GetString() ?? input.ToString();
 
+        if (toolName == "HostExec" && input.TryGetProperty("command", out var hostCmd))
+        {
+            var asRoot = input.TryGetProperty("as_root", out var ar) && ar.ValueKind == JsonValueKind.True;
+            var bg = input.TryGetProperty("background", out var b) && b.ValueKind == JsonValueKind.True;
+            var tag = (asRoot ? "sudo " : "") + (bg ? "(bg) " : "");
+            return $"[host] {tag}{hostCmd.GetString() ?? input.ToString()}";
+        }
+
         if ((toolName == "FileWrite" || toolName == "FileEdit") &&
             input.TryGetProperty("file_path", out var fp))
             return fp.GetString() ?? input.ToString();

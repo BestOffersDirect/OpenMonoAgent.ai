@@ -374,6 +374,7 @@ cmd_help() {
     printf "  %-14s %s\n" "setup"   "Install (--full|--inference|--agent) [--gpu|--cpu] [--model=bonsai-pq2|bonsai-ptq1|qwen]"
     printf "  %-14s %s\n" "upgrade" "Update to the latest version + rebuild the agent (--check to preview)"
     printf "  %-14s %s\n" "config"  "Read/write ~/.openmono/settings.json (e.g. llm.endpoint, llm.api_key)"
+    printf "  %-14s %s\n" "host"    "Host-bridge daemon for whole-machine mode [daemon|stop|status]"
     printf "  %-14s %s\n" "version" "Print the CLI version"
     printf "  %-14s %s\n" "help"    "Show this help"
     echo ""
@@ -385,11 +386,12 @@ cmd_help() {
     echo "Agent modes (pick one per run; default: sandbox):"
     echo "  --sandbox  Container sandbox: project bind-mounted as /workspace."
     echo "             Required for the VS Code / Cursor extension (--acp-only)."
-    echo "  --host     Server sub-agent (.NET, bare metal): drives this box's"
-    echo "             in-container agent over ACP and runs host commands"
-    echo "             (pull, build, install, redeploy, troubleshoot)."
-    echo "             Model loop stays in the container; inference is"
-    echo "             llm.endpoint (local or relay)."
+    echo "  --host     Whole-machine mode: starts the host-bridge daemon on"
+    echo "             this box, then runs the agent sandboxed as usual. The"
+    echo "             agent pairs with the daemon; every host command shows"
+    echo "             a HOST EXECUTION card first, then runs audited on bare"
+    echo "             metal (pull, build, install, redeploy, troubleshoot)."
+    echo "             Policy: ~/.openmono/host-bridge.json"
     echo ""
     echo "Inference box (inference backend lifecycle):"
     printf "  %-14s %s\n" "start"   "Start inference backend + gateway services in the background"
@@ -1085,7 +1087,8 @@ cmd_agent_host_bin() {
         printf '%s' "$OPENMONO_HOST_BRIDGE_BIN"
         return 0
     fi
-    if [[ -x "$HOME/.openmono/bin/host-bridge/host-bridge" ]]; then
+    if [[ -x "$HOME/.openmono/bin/host-bridge/host-bridge" ]] &&
+       "$HOME/.openmono/bin/host-bridge/host-bridge" --version &>/dev/null; then
         printf '%s' "$HOME/.openmono/bin/host-bridge/host-bridge"
         return 0
     fi
@@ -1098,6 +1101,138 @@ cmd_agent_host_project() {
     command -v dotnet &>/dev/null || return 1
     printf '%s' "$proj"
     return 0
+}
+
+# Host-bridge daemon: the bare-metal half of host mode. The sandbox agent
+# pairs with it over host.docker.internal using the shared pair_secret from
+# ~/.openmono/host-bridge.json; every host command the user approves runs on
+# the host machine, audited + policy-gated. `openmono agent --host` starts it
+# automatically; `openmono host daemon` starts it standalone (manual /host on).
+HOST_DAEMON_PORT="${OPENMONO_HOST_DAEMON_PORT:-7476}"
+HOST_DAEMON_PIDFILE="$HOME/.openmono/host-daemon.pid"
+HOST_DAEMON_LOG="$HOME/.openmono/logs/host-daemon.log"
+
+_host_daemon_bin() {
+    local bin proj
+    if bin="$(cmd_agent_host_bin)"; then
+        printf 'bin\t%s' "$bin"
+        return 0
+    fi
+    if proj="$(cmd_agent_host_project)"; then
+        printf 'proj\t%s' "$proj"
+        return 0
+    fi
+    return 1
+}
+
+_host_daemon_alive() {
+    curl -sf --max-time 2 "http://127.0.0.1:${HOST_DAEMON_PORT}/ping" &>/dev/null
+}
+
+_host_daemon_start() {
+    _HOST_DAEMON_LAUNCHED=0
+    _host_daemon_alive && return 0
+    local spec kind target
+    spec="$(_host_daemon_bin)" || {
+        err "Host sub-agent is not installed."
+        err "Install it with: bash $REPO_DIR/scripts/install-host-bridge.sh"
+        return 1
+    }
+    kind="${spec%%$'\t'*}"
+    target="${spec#*$'\t'}"
+    mkdir -p "$HOME/.openmono/logs"
+    info "Starting host-bridge daemon on 127.0.0.1:${HOST_DAEMON_PORT} (log: $HOST_DAEMON_LOG)"
+    if [[ "$kind" == "bin" ]]; then
+        nohup "$target" --daemon --daemon-port "$HOST_DAEMON_PORT" --workdir "$(pwd)" \
+            >>"$HOST_DAEMON_LOG" 2>&1 &
+    else
+        nohup dotnet run --project "$target" -- --daemon --daemon-port "$HOST_DAEMON_PORT" --workdir "$(pwd)" \
+            >>"$HOST_DAEMON_LOG" 2>&1 &
+    fi
+    echo $! > "$HOST_DAEMON_PIDFILE"
+    _HOST_DAEMON_LAUNCHED=1
+    for _ in $(seq 1 20); do
+        _host_daemon_alive && return 0
+        sleep 0.5
+    done
+    err "Host-bridge daemon did not become reachable on port $HOST_DAEMON_PORT."
+    err "See $HOST_DAEMON_LOG for details."
+    return 1
+}
+
+_host_daemon_pair_secret() {
+    local settings="$HOME/.openmono/host-bridge.json"
+    if [[ -f "$settings" ]] && command -v jq &>/dev/null; then
+        jq -r '.pair_secret // empty' "$settings"
+    fi
+}
+
+_host_daemon_stop_owned() {
+    # Only stop daemons this invocation started (pidfile), never a pre-existing
+    # daemon the user started deliberately with `openmono host daemon`.
+    [[ "${_HOST_DAEMON_OWNED:-}" == "1" ]] || return 0
+    _HOST_DAEMON_OWNED=0
+    if [[ -f "$HOST_DAEMON_PIDFILE" ]]; then
+        local pid
+        pid="$(cat "$HOST_DAEMON_PIDFILE" 2>/dev/null)" || true
+        [[ -n "$pid" ]] && kill "$pid" &>/dev/null || true
+        rm -f "$HOST_DAEMON_PIDFILE"
+    fi
+}
+
+cmd_host() {
+    local sub="${1:-status}"
+    case "$sub" in
+        daemon|start)
+            shift 2>/dev/null || true
+            _host_daemon_start || return 1
+            ok "host-bridge daemon is running on 127.0.0.1:${HOST_DAEMON_PORT}"
+            info "Pair secret: ~/.openmono/host-bridge.json (0600) · audit: ~/.openmono/logs/"
+            info "In the sandbox agent, connect with: /host on"
+            info "Stop with: openmono host stop"
+            ;;
+        stop)
+            if [[ -f "$HOST_DAEMON_PIDFILE" ]]; then
+                local pid
+                pid="$(cat "$HOST_DAEMON_PIDFILE" 2>/dev/null)" || true
+                if [[ -n "$pid" ]] && kill "$pid" &>/dev/null; then
+                    rm -f "$HOST_DAEMON_PIDFILE"
+                    ok "host-bridge daemon stopped"
+                else
+                    rm -f "$HOST_DAEMON_PIDFILE"
+                    err "pidfile exists but process $pid is not running (cleaned up)"
+                fi
+            elif _host_daemon_alive; then
+                err "a daemon is reachable on port $HOST_DAEMON_PORT but has no pidfile — stop it manually (find/pkill host-bridge)"
+                return 1
+            else
+                info "no host-bridge daemon running"
+            fi
+            ;;
+        status)
+            local status_json
+            status_json="$(curl -sf --max-time 2 "http://127.0.0.1:${HOST_DAEMON_PORT}/status" 2>/dev/null)" || status_json=""
+            if [[ -n "$status_json" ]]; then
+                ok "host-bridge daemon is up on 127.0.0.1:${HOST_DAEMON_PORT}"
+                if command -v jq &>/dev/null; then
+                    local ver paired
+                    ver="$(jq -r '.version // "?"' <<<"$status_json" 2>/dev/null)"
+                    paired="$(jq -r '.paired_sessions // 0' <<<"$status_json" 2>/dev/null)"
+                    info "version ${ver} · paired sessions: ${paired}"
+                else
+                    head -c 200 <<<"$status_json"; echo ""
+                fi
+            elif _host_daemon_alive; then
+                ok "host-bridge daemon is up on 127.0.0.1:${HOST_DAEMON_PORT} (no /status support - upgrade for details)"
+            else
+                info "host-bridge daemon is not running (start with: openmono host daemon)"
+            fi
+            ;;
+        *)
+            err "Usage: openmono host [daemon|stop|status]"
+            return 1
+            ;;
+    esac
 }
 
 cmd_agent_host() {
@@ -1150,19 +1285,34 @@ cmd_agent_host() {
     fi
 
     export OPENMONO_REPO_DIR="$REPO_DIR"
-    local bin proj
-    if bin="$(cmd_agent_host_bin)"; then
-        info "Running host sub-agent: $bin"
-        exec "$bin" --workdir "$(pwd)" "$@"
-    elif proj="$(cmd_agent_host_project)"; then
-        info "Host sub-agent not published — running from source (publish with: bash scripts/install-host-bridge.sh)"
-        exec dotnet run --project "$proj" -- --workdir "$(pwd)" "$@"
-    else
-        err "Host sub-agent is not installed."
-        err "Install it with: bash $REPO_DIR/scripts/install-host-bridge.sh  (installs .NET 10 via the existing prereqs when missing)"
-        err "Or use the sandbox instead: openmono agent --sandbox"
+
+    # New host mode: the model loop still runs in the sandbox (same safety,
+    # same UI), while a host-bridge daemon runs on this machine. Pairing uses
+    # the shared secret; every host action gets a HOST EXECUTION card first,
+    # then runs audited + policy-gated on bare metal. The daemon is started
+    # here and stopped when the agent exits (unless the user started their own).
+    _host_daemon_start || exit 1
+    if [[ "${_HOST_DAEMON_LAUNCHED:-0}" == "1" ]]; then
+        _HOST_DAEMON_OWNED=1
+        trap '_host_daemon_stop_owned' EXIT INT TERM
+    fi
+
+    local secret
+    secret="$(_host_daemon_pair_secret)"
+    if [[ -z "$secret" ]]; then
+        err "No pair_secret in ~/.openmono/host-bridge.json — the daemon failed to generate one."
+        err "Check $HOST_DAEMON_LOG"
         exit 1
     fi
+    export OPENMONO_HOST_MODE=1
+    export OPENMONO_HOST_DAEMON_URL="http://host.docker.internal:${HOST_DAEMON_PORT}"
+    export OPENMONO_HOST_PAIR_SECRET="$secret"
+    export OPENMONO_HOST_WORKSPACE="$(pwd)"
+
+    cmd_agent_sandbox "$@"
+    local rc=$?
+    _host_daemon_stop_owned
+    return $rc
 }
 
 cmd_agent() {
@@ -1323,6 +1473,16 @@ cmd_agent_sandbox() {
     local extra_env=()
     local _upd; _upd="$(_update_notice 2>/dev/null || true)"
     [[ -n "$_upd" ]] && extra_env+=(-e "OPENMONO_UPDATE_NOTICE=$_upd")
+
+    # Host mode: forward the daemon pairing details injected by cmd_agent_host
+    # into the sandbox so the agent pairs on boot (HOST:ON + standing orders).
+    if [[ "${OPENMONO_HOST_MODE:-}" == "1" ]]; then
+        extra_env+=(
+            -e "OPENMONO_HOST_MODE=1"
+            -e "OPENMONO_HOST_DAEMON_URL=${OPENMONO_HOST_DAEMON_URL:-}"
+            -e "OPENMONO_HOST_PAIR_SECRET=${OPENMONO_HOST_PAIR_SECRET:-}"
+            -e "OPENMONO_HOST_WORKSPACE=${OPENMONO_HOST_WORKSPACE:-$WORKSPACE}")
+    fi
 
     _clipboard_bridge_start
     trap '_clipboard_bridge_stop' EXIT INT TERM
@@ -2052,6 +2212,7 @@ case "$COMMAND" in
     stop)           cmd_stop "$@" ;;
     restart)        cmd_restart "$@" ;;
     agent)          cmd_agent "${AGENT_FORWARD[@]+"${AGENT_FORWARD[@]}"}" "$@" ;;
+    host)           cmd_host "$@" ;;
     logs)           cmd_logs ;;
     status)         cmd_status ;;
     graph)          cmd_graph "$@" ;;

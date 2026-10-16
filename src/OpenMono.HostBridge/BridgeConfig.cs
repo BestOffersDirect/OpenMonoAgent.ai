@@ -32,6 +32,16 @@ public sealed class BridgeConfig
     public HostExecPolicy HostExec { get; set; } = new();
 
     /// <summary>
+    /// Shared secret required by sandbox sessions to pair with the daemon
+    /// (<c>host-bridge daemon</c>). Generated on first daemon start when empty
+    /// and stored here (0600, same rules as every other bridge config). It is
+    /// a guardrail against unrelated containers/processes pairing with the
+    /// daemon — not a sandbox boundary (see docs/DEPLOYMENT-MODES.md).
+    /// </summary>
+    [JsonPropertyName("pair_secret")]
+    public string PairSecret { get; set; } = "";
+
+    /// <summary>
     /// Account host commands run as. Empty = whoever runs the bridge. A
     /// username is not a secret and may live in this file; the password for
     /// it NEVER does — it stays in memory only (prompted or via

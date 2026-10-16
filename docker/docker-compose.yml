@@ -136,6 +136,12 @@ services:
       - OPENMONO_WEB_GATEWAY=${OPENMONO_WEB_GATEWAY:-}
       - OPENMONO_WEB_SEARCH=${OPENMONO_WEB_SEARCH:-}
       - OPENMONO_WEB_SCRAPE=${OPENMONO_WEB_SCRAPE:-}
+      # Host mode passthrough: `openmono agent` injects the real values (daemon
+      # URL via host.docker.internal + pair secret) when it starts the daemon.
+      # Empty default = host feature off inside the container; /host on can
+      # still pair manually against a reachable daemon.
+      - OPENMONO_HOST_MODE=${OPENMONO_HOST_MODE:-}
+      - OPENMONO_HOST_DAEMON_URL=${OPENMONO_HOST_DAEMON_URL:-}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     stdin_open: true

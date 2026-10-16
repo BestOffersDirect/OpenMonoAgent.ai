@@ -1,0 +1,144 @@
+namespace OpenMono.Session;
+
+/// <summary>
+/// Creates and pairs <see cref="HostGateway"/> instances. When the launcher
+/// runs <c>openmono agent --host</c> it starts a host-bridge daemon on the
+/// host machine and injects the pairing details into the sandbox, so host
+/// mode is live from the first turn. Without that env, <c>/host on</c> can
+/// still pair manually (same machine: daemon + agent side by side).
+///
+/// Env contract (launcher → sandbox):
+///  - OPENMONO_HOST_MODE=1       host mode intended for this run
+///  - OPENMONO_HOST_DAEMON_URL   e.g. http://host.docker.internal:7476
+///  - OPENMONO_HOST_PAIR_SECRET  shared secret (host ~/.openmono/host-bridge.json)
+///  - OPENMONO_HOST_WORKSPACE    host directory bind-mounted at /workspace
+/// </summary>
+public static class HostGatewayBootstrap
+{
+    public const string ModeEnv = "OPENMONO_HOST_MODE";
+    public const string UrlEnv = "OPENMONO_HOST_DAEMON_URL";
+    public const string SecretEnv = "OPENMONO_HOST_PAIR_SECRET";
+    public const string WorkDirEnv = "OPENMONO_HOST_WORKSPACE";
+    public const string DefaultPort = "7476";
+
+    private static readonly SemaphoreSlim Gate = new(1, 1);
+
+    /// <summary>True when the launcher marked this run as host mode.</summary>
+    public static bool EnvEnabled =>
+        Environment.GetEnvironmentVariable(ModeEnv) is { Length: > 0 } &&
+        Environment.GetEnvironmentVariable(ModeEnv) != "0";
+
+    public static string ResolveBaseUrl()
+    {
+        var url = Environment.GetEnvironmentVariable(UrlEnv);
+        if (!string.IsNullOrWhiteSpace(url)) return url.Trim();
+        var host = File.Exists("/.dockerenv") ? "host.docker.internal" : "127.0.0.1";
+        return $"http://{host}:{DefaultPort}";
+    }
+
+    public static string ResolveSecret()
+    {
+        var env = Environment.GetEnvironmentVariable(SecretEnv);
+        if (!string.IsNullOrWhiteSpace(env)) return env.Trim();
+        // Same-machine manual pairing: the daemon persists its secret here.
+        var path = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            ".openmono", "host-bridge.json");
+        try
+        {
+            if (File.Exists(path))
+            {
+                using var doc = System.Text.Json.JsonDocument.Parse(File.ReadAllText(path));
+                if (doc.RootElement.TryGetProperty("pair_secret", out var s))
+                    return s.GetString() ?? "";
+            }
+        }
+        catch { /* unreadable config = no secret */ }
+        return "";
+    }
+
+    public static string ResolveWorkDir()
+    {
+        var wd = Environment.GetEnvironmentVariable(WorkDirEnv);
+        return string.IsNullOrWhiteSpace(wd) ? "/workspace" : wd.Trim();
+    }
+
+    /// <summary>
+    /// The live gateway for this session, pairing when the launcher env says
+    /// host mode is intended. Returns null (never throws) when host mode is
+    /// not configured for this run.
+    /// </summary>
+    public static Task<HostGateway?> GetOrCreateAsync(SessionState session, CancellationToken ct = default) =>
+        CreateCoreAsync(session, force: false, ct);
+
+    /// <summary>
+    /// Manual pairing (<c>/host on</c>): pairs regardless of env as long as a
+    /// secret can be resolved. Returns the gateway or a human-readable reason.
+    /// </summary>
+    public static Task<(HostGateway? Gateway, string? Error)> TryPairAsync(SessionState session, CancellationToken ct = default) =>
+        PairCoreAsync(session, ct);
+
+    private static async Task<HostGateway?> CreateCoreAsync(SessionState session, bool force, CancellationToken ct)
+    {
+        var existing = HostGatewayRegistry.Get(session.Id);
+        if (existing is not null)
+            return existing;
+
+        if (!force && !EnvEnabled)
+            return null;
+
+        var secret = ResolveSecret();
+        if (string.IsNullOrWhiteSpace(secret))
+            return null;
+
+        await Gate.WaitAsync(ct);
+        try
+        {
+            existing = HostGatewayRegistry.Get(session.Id);
+            if (existing is not null)
+                return existing;
+
+            var gateway = new HostGateway(ResolveBaseUrl(), session.Id, ResolveWorkDir(), secret);
+            var error = await gateway.PairAsync(ct: ct);
+            if (error is not null)
+            {
+                Utils.Log.Info($"[HOSTGATEWAY] pair failed for session {session.Id}: {error}");
+                return null;
+            }
+
+            HostGatewayRegistry.Register(session.Id, gateway);
+            Utils.Log.Info($"[HOSTGATEWAY] paired session {session.Id} at {gateway.BaseUrl} run_as={gateway.RunAs} sudo={gateway.Sudo}");
+            return gateway;
+        }
+        finally
+        {
+            Gate.Release();
+        }
+    }
+
+    private static async Task<(HostGateway? Gateway, string? Error)> PairCoreAsync(SessionState session, CancellationToken ct)
+    {
+        var existing = HostGatewayRegistry.Get(session.Id);
+        if (existing is { IsPaired: true })
+            return (existing, null);
+
+        if (existing is not null)
+        {
+            HostGatewayRegistry.Unregister(session.Id);
+        }
+
+        var secret = ResolveSecret();
+        if (string.IsNullOrWhiteSpace(secret))
+            return (null,
+                "no pair secret found — start the host daemon first (openmono host daemon, or openmono agent --host on the host machine)");
+
+        var gateway = new HostGateway(ResolveBaseUrl(), session.Id, ResolveWorkDir(), secret);
+        var error = await gateway.PairAsync(ct: ct);
+        if (error is not null)
+            return (null, error);
+
+        HostGatewayRegistry.Register(session.Id, gateway);
+        Utils.Log.Info($"[HOSTGATEWAY] paired (manual) session {session.Id} at {gateway.BaseUrl} run_as={gateway.RunAs} sudo={gateway.Sudo}");
+        return (gateway, null);
+    }
+}
