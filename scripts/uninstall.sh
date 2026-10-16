@@ -544,12 +544,14 @@ if [ -f "$HOME/.openmono/host-daemon.pid" ]; then
     rm_path "$HOME/.openmono/host-daemon.pid" "host-daemon pidfile"
 fi
 # Belt-and-suspenders: a daemon started without the pidfile (or a crashed
-# pidfile match) — same pattern `openmono status` reports on.
-if pgrep -f 'host-bridge' &>/dev/null; then
+# pidfile match) — same pattern `openmono status` reports on. Match the
+# binary path, not the bare word: a wrapper/editor with 'host-bridge' in
+# its args must never be caught.
+if pgrep -f 'bin/host-bridge/host-bridge' &>/dev/null; then
     info "Stopping leftover host-bridge process(es)..."
-    do_run pkill -TERM -f 'host-bridge'
+    do_run pkill -TERM -f 'bin/host-bridge/host-bridge'
     sleep 1
-    pgrep -f 'host-bridge' &>/dev/null && do_run pkill -KILL -f 'host-bridge'
+    pgrep -f 'bin/host-bridge/host-bridge' &>/dev/null && do_run pkill -KILL -f 'bin/host-bridge/host-bridge'
     ok "Host-bridge process(es) stopped"
 else
     detail "No host-bridge daemon running — skipping"
