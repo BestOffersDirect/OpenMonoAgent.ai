@@ -42,6 +42,41 @@ public sealed class BridgeConfig
     public string PairSecret { get; set; } = "";
 
     /// <summary>
+    /// How the daemon answers sandbox pairing that carries no secret/invite.
+    /// "this_session" (default): a session id that was previously paired with
+    /// this daemon run re-pairs automatically (logged); everything else needs
+    /// an explicit approval on the host (<c>openmono host approve</c>).
+    /// "strict": every approval-less pair request waits for the operator.
+    /// </summary>
+    [JsonPropertyName("pair_auto")]
+    public string PairAuto { get; set; } = "this_session";
+
+    /// <summary>
+    /// Seconds a launcher-issued pairing invite stays valid (default 900 =
+    /// 15 min). An expired invite is dead: the agent falls back to a pair
+    /// request the operator approves on the host.
+    /// </summary>
+    [JsonPropertyName("invite_ttl_seconds")]
+    public int InviteTtlSeconds { get; set; } = 900;
+
+    /// <summary>
+    /// Hard lifetime of a session token since pairing, regardless of activity
+    /// (hours). 0 (default) = no cap, idle-timeout only. A positive cap forces
+    /// the agent to re-request pairing — and the operator's approval lane
+    /// (<see cref="PairAuto"/>) decides whether that is silent or explicit.
+    /// </summary>
+    [JsonPropertyName("token_max_hours")]
+    public double TokenMaxHours { get; set; } = 0;
+
+    /// <summary>
+    /// Seconds an approval-less pair request waits for the operator before
+    /// timing out (default 120). Test hook: a tiny value exercises the
+    /// timeout path without sleeping for minutes.
+    /// </summary>
+    [JsonPropertyName("pair_request_wait_seconds")]
+    public int PairRequestWaitSeconds { get; set; } = 120;
+
+    /// <summary>
     /// Account host commands run as. Empty = whoever runs the bridge. A
     /// username is not a secret and may live in this file; the password for
     /// it NEVER does — it stays in memory only (prompted or via

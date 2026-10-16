@@ -193,6 +193,26 @@ if (options.Daemon)
 
     await using var daemon = new HostDaemon(config, identity, workDir, options.DaemonPort,
         TimeSpan.FromHours(options.DaemonIdleTimeoutHours), daemonBinds);
+
+    // Console approver: when this daemon has a real terminal, an approval-less
+    // pair request prompts [y/N] right here. Without a TTY (launched by
+    // openmono host daemon via nohup) the operator approves with
+    // `openmono host approve <session>` instead — never a silent pair.
+    if (!Console.IsInputRedirected)
+    {
+        daemon.PairRequested += req => _ = Task.Run(() =>
+        {
+            Console.Error.WriteLine();
+            Console.Error.WriteLine($"[bridge] PAIR REQUEST — session {req.SessionId} · workdir {req.WorkDir}");
+            Console.Error.Write("[bridge] allow this sandbox session on the host? [y/N] ");
+            var answer = (Console.ReadLine() ?? "").Trim().ToLowerInvariant();
+            var ok = answer is "y" or "yes" or "approve" or "allow";
+            if (!daemon.ResolvePairRequest(req.SessionId, ok))
+                Console.Error.WriteLine("[bridge] (request already expired — too slow)");
+            else
+                Console.Error.WriteLine(ok ? "[bridge] pair approved." : "[bridge] pair denied.");
+        });
+    }
     try
     {
         daemon.Start();

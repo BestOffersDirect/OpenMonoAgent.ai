@@ -11,6 +11,8 @@ namespace OpenMono.Session;
 ///  - OPENMONO_HOST_MODE=1       host mode intended for this run
 ///  - OPENMONO_HOST_DAEMON_URL   e.g. http://host.docker.internal:7476
 ///  - OPENMONO_HOST_PAIR_SECRET  shared secret (host ~/.openmono/host-bridge.json)
+///  - OPENMONO_HOST_INVITE       one-shot pairing invite (single-use, TTL'd);
+///                               preferred over the secret when both are set
 ///  - OPENMONO_HOST_WORKSPACE    host directory bind-mounted at /workspace
 /// </summary>
 public static class HostGatewayBootstrap
@@ -18,6 +20,7 @@ public static class HostGatewayBootstrap
     public const string ModeEnv = "OPENMONO_HOST_MODE";
     public const string UrlEnv = "OPENMONO_HOST_DAEMON_URL";
     public const string SecretEnv = "OPENMONO_HOST_PAIR_SECRET";
+    public const string InviteEnv = "OPENMONO_HOST_INVITE";
     public const string WorkDirEnv = "OPENMONO_HOST_WORKSPACE";
     public const string DefaultPort = "7476";
 
@@ -84,6 +87,9 @@ public static class HostGatewayBootstrap
         return "";
     }
 
+    public static string ResolveInvite() =>
+        (Environment.GetEnvironmentVariable(InviteEnv) ?? "").Trim();
+
     public static string ResolveWorkDir()
     {
         var wd = Environment.GetEnvironmentVariable(WorkDirEnv);
@@ -115,7 +121,11 @@ public static class HostGatewayBootstrap
             return null;
 
         var secret = ResolveSecret();
-        if (string.IsNullOrWhiteSpace(secret))
+        var invite = ResolveInvite();
+        // Auto-pair only when the launcher handed us a credential (invite or
+        // secret). Without one we do not queue an approval prompt for a session
+        // that never asked — manual /host on is the request-mode entry point.
+        if (string.IsNullOrWhiteSpace(secret) && string.IsNullOrWhiteSpace(invite))
             return null;
 
         await Gate.WaitAsync(ct);
@@ -125,7 +135,7 @@ public static class HostGatewayBootstrap
             if (existing is not null)
                 return existing;
 
-            var gateway = new HostGateway(ResolveBaseUrl(), session.Id, ResolveWorkDir(), secret);
+            var gateway = new HostGateway(ResolveBaseUrl(), session.Id, ResolveWorkDir(), secret, invite);
             var error = await gateway.PairAsync(ct: ct);
             if (error is not null)
             {
@@ -155,11 +165,12 @@ public static class HostGatewayBootstrap
         }
 
         var secret = ResolveSecret();
-        if (string.IsNullOrWhiteSpace(secret))
-            return (null,
-                "no pair secret found — start the host daemon first (openmono host daemon, or openmono agent --host on the host machine)");
+        var invite = ResolveInvite();
+        // Manual pairing may run with no credential at all: the daemon then
+        // treats it as a pair *request* the operator approves on the host
+        // (openmono host approve). This is the request-mode entry point.
 
-        var gateway = new HostGateway(ResolveBaseUrl(), session.Id, ResolveWorkDir(), secret);
+        var gateway = new HostGateway(ResolveBaseUrl(), session.Id, ResolveWorkDir(), secret, invite);
         var error = await gateway.PairAsync(ct: ct);
         if (error is not null)
             return (null, error);

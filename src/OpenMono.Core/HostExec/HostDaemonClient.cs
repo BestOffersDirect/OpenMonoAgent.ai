@@ -20,7 +20,8 @@ namespace OpenMono.HostBridge;
 public sealed record PairRequest(
     [property: JsonPropertyName("secret")] string Secret,
     [property: JsonPropertyName("session_id")] string SessionId,
-    [property: JsonPropertyName("workdir")] string WorkDir);
+    [property: JsonPropertyName("workdir")] string WorkDir,
+    [property: JsonPropertyName("invite")] string? Invite = null);
 
 public sealed record PairResponse(
     [property: JsonPropertyName("ok")] bool Ok,
@@ -28,7 +29,8 @@ public sealed record PairResponse(
     [property: JsonPropertyName("run_as")] string? RunAs = null,
     [property: JsonPropertyName("sudo")] string? Sudo = null,
     [property: JsonPropertyName("log_dir")] string? LogDir = null,
-    [property: JsonPropertyName("error")] string? Error = null);
+    [property: JsonPropertyName("error")] string? Error = null,
+    [property: JsonPropertyName("reason")] string? Reason = null);
 
 public sealed record ExecRequest(
     [property: JsonPropertyName("token")] string Token,
@@ -60,6 +62,29 @@ public sealed record DaemonStatusResponse(
     [property: JsonPropertyName("port")] int Port = 0,
     [property: JsonPropertyName("version")] string Version = "",
     [property: JsonPropertyName("paired_sessions")] int PairedSessions = 0);
+
+// ── Admin surface (host-side CLI only; authenticated by the pair secret) ──
+public sealed record InviteRequest(
+    [property: JsonPropertyName("session_id")] string SessionId);
+
+public sealed record InviteResponse(
+    [property: JsonPropertyName("ok")] bool Ok,
+    [property: JsonPropertyName("invite")] string? Invite = null,
+    [property: JsonPropertyName("error")] string? Error = null);
+
+public sealed record ApproveRequest(
+    [property: JsonPropertyName("session_id")] string SessionId);
+
+public sealed record PairedSessionInfo(
+    [property: JsonPropertyName("session_id")] string SessionId,
+    [property: JsonPropertyName("workdir")] string WorkDir,
+    [property: JsonPropertyName("token_hint")] string TokenHint,
+    [property: JsonPropertyName("since")] string Since);
+
+public sealed record AdminListResponse(
+    [property: JsonPropertyName("ok")] bool Ok,
+    [property: JsonPropertyName("items")] List<PairedSessionInfo>? Items = null,
+    [property: JsonPropertyName("error")] string? Error = null);
 
 /// <summary>
 /// Thin HTTP client for a host-bridge daemon. Used by the sandbox agent's host
@@ -144,6 +169,69 @@ public sealed class HostDaemonClient : IDisposable
     public Task<StatusResponse> RevokeAsync(RevokeRequest request, CancellationToken ct) =>
         PostJsonAsync<RevokeRequest, StatusResponse>("/revoke", request, ct,
             new StatusResponse(false, Error: "daemon unreachable"));
+
+    // ── Admin surface (host-side CLI; pair secret in a header) ──
+    // Pair requests wait on the operator for up to 2 daemon minutes, so the
+    // admin HTTP timeout is longer than the exec timeout.
+    private readonly Lazy<HttpClient> _admin = new(() =>
+        new HttpClient { Timeout = TimeSpan.FromMinutes(4) });
+
+    private HttpRequestMessage AdminRequest(HttpMethod method, string path, string pairSecret)
+    {
+        var req = NewRequest(method, path);
+        req.Headers.Remove("Host");
+        req.Headers.TryAddWithoutValidation("X-Pair-Secret", pairSecret);
+        return req;
+    }
+
+    public async Task<InviteResponse> CreateInviteAsync(string pairSecret, string sessionId, CancellationToken ct)
+    {
+        try
+        {
+            using var req = AdminRequest(HttpMethod.Post, "/admin/invite", pairSecret);
+            req.Content = new StringContent(
+                JsonSerializer.Serialize(new InviteRequest(sessionId)), Encoding.UTF8, "application/json");
+            using var resp = await _admin.Value.SendAsync(req, ct);
+            return await ReadJsonAsync<InviteResponse>(resp, ct)
+                ?? new InviteResponse(false, Error: "daemon unreachable");
+        }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or JsonException)
+        {
+            return new InviteResponse(false, Error: "daemon unreachable");
+        }
+    }
+
+    public async Task<AdminListResponse> AdminListAsync(string pairSecret, string path, CancellationToken ct)
+    {
+        try
+        {
+            using var req = AdminRequest(HttpMethod.Get, path, pairSecret);
+            using var resp = await _admin.Value.SendAsync(req, ct);
+            return await ReadJsonAsync<AdminListResponse>(resp, ct)
+                ?? new AdminListResponse(false, Error: "daemon unreachable");
+        }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or JsonException)
+        {
+            return new AdminListResponse(false, Error: "daemon unreachable");
+        }
+    }
+
+    public async Task<StatusResponse> AdminActionAsync(string pairSecret, string path, string sessionId, CancellationToken ct)
+    {
+        try
+        {
+            using var req = AdminRequest(HttpMethod.Post, path, pairSecret);
+            req.Content = new StringContent(
+                JsonSerializer.Serialize(new ApproveRequest(sessionId)), Encoding.UTF8, "application/json");
+            using var resp = await _admin.Value.SendAsync(req, ct);
+            return await ReadJsonAsync<StatusResponse>(resp, ct)
+                ?? new StatusResponse(false, Error: "daemon unreachable");
+        }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or JsonException)
+        {
+            return new StatusResponse(false, Error: "daemon unreachable");
+        }
+    }
 
     private async Task<TResp> PostJsonAsync<TReq, TResp>(string path, TReq body, CancellationToken ct, TResp fallback)
         where TResp : class

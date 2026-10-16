@@ -40,6 +40,13 @@ public sealed class HostDaemon : IAsyncDisposable
     private readonly CancellationTokenSource _cts = new();
     private readonly Dictionary<string, SessionLock> _sessions = [];
     private readonly object _sessionsLock = new();
+    private readonly Dictionary<string, DateTime> _invites = [];
+    private readonly object _invitesLock = new();
+    private readonly Dictionary<string, PairRequest> _pairRequests = [];
+    private readonly Dictionary<string, TaskCompletionSource<string?>> _pairWaiters = [];
+    private static readonly TimeSpan DefaultPairRequestWait = TimeSpan.FromMinutes(2);
+    private readonly TimeSpan _pairRequestWait;
+    private readonly HashSet<string> _everPaired = new(StringComparer.Ordinal);
     private readonly TimeSpan _idleTimeout;
     private readonly string[] _extraBindAddresses;
 
@@ -49,7 +56,7 @@ public sealed class HostDaemon : IAsyncDisposable
     /// <summary>Default idle window after which a session token expires.</summary>
     public static readonly TimeSpan DefaultIdleTimeout = TimeSpan.FromHours(2);
 
-    private sealed record SessionLock(string Token, string WorkDir, DateTime LastSeenUtc);
+    private sealed record SessionLock(string Token, string WorkDir, DateTime LastSeenUtc, DateTime PairedUtc);
 
     public int Port { get; }
 
@@ -60,7 +67,8 @@ public sealed class HostDaemon : IAsyncDisposable
     /// docker bridge gateway IPs detected automatically, or explicit
     /// operator-supplied ones. Never 0.0.0.0/"+"; wildcards are rejected.</param>
     public HostDaemon(BridgeConfig config, HostIdentity identity, string workDir, int port,
-        TimeSpan? idleTimeout = null, IEnumerable<string>? extraBindAddresses = null)
+        TimeSpan? idleTimeout = null, IEnumerable<string>? extraBindAddresses = null,
+        TimeSpan? pairRequestWait = null)
     {
         _config = config;
         _identity = identity;
@@ -69,6 +77,10 @@ public sealed class HostDaemon : IAsyncDisposable
         Port = port;
         _pairSecret = config.PairSecret;
         _idleTimeout = idleTimeout ?? DefaultIdleTimeout;
+        _pairRequestWait = pairRequestWait ??
+            (config.PairRequestWaitSeconds > 0
+                ? TimeSpan.FromSeconds(config.PairRequestWaitSeconds)
+                : DefaultPairRequestWait);
         _extraBindAddresses = (extraBindAddresses ?? [])
             .Where(a => a is { Length: > 0 })
             .Where(a => a is not ("+" or "*") && a != "0.0.0.0")
@@ -211,6 +223,141 @@ public sealed class HostDaemon : IAsyncDisposable
             return;
         }
 
+        if (path.StartsWith("/admin/", StringComparison.Ordinal))
+        {
+            await HandleAdminAsync(ctx, method, path);
+            return;
+        }
+
+        WriteJson(ctx, 404, new StatusResponse(false, "not found"));
+    }
+
+    /// <summary>Raised when a pair request starts waiting for the operator
+    /// (foreground daemon: the console approver listens and prompts [y/N]).</summary>
+    public event Action<PairRequest>? PairRequested;
+
+    /// <summary>Approve (or deny) a pending pair request by session id.
+    /// Returns false when no request is pending for that id.</summary>
+    public bool ResolvePairRequest(string sessionId, bool approve)
+    {
+        TaskCompletionSource<string?>? tcs;
+        lock (_sessionsLock)
+        {
+            _pairWaiters.TryGetValue(sessionId, out tcs);
+            _pairRequests.Remove(sessionId);
+            _pairWaiters.Remove(sessionId);
+        }
+        if (tcs is null) return false;
+        tcs.TrySetResult(approve ? "approved on host" : null);
+        AuditLog.WriteNote($"pair request {(approve ? "approved" : "denied")} session={LogRedactor.Redact(sessionId)}");
+        return true;
+    }
+
+    public bool RevokeSession(string sessionId)
+    {
+        bool removed;
+        lock (_sessionsLock)
+            removed = _sessions.Remove(sessionId);
+        AuditLog.WriteNote($"admin revoke session={LogRedactor.Redact(sessionId)} removed={removed}");
+        return removed;
+    }
+
+    public List<(string SessionId, string WorkDir)> ListPendingRequests()
+    {
+        lock (_sessionsLock)
+            return _pairRequests.Values.Select(r => (r.SessionId, r.WorkDir)).ToList();
+    }
+
+    public List<(string SessionId, string WorkDir, string TokenHint, DateTime PairedUtc)> ListSessions()
+    {
+        lock (_sessionsLock)
+            return _sessions.Select(kv => (kv.Key, kv.Value.WorkDir, kv.Value.Token[..6], kv.Value.PairedUtc)).ToList();
+    }
+
+    private async Task HandleAdminAsync(HttpListenerContext ctx, string method, string path)
+    {
+        // Admin surface = the pair secret (host-side CLI only; the sandbox
+        // never sees the secret once compose stops mounting it). Everything
+        // here is loopback/bridge-bound like the rest of the daemon.
+        if (string.IsNullOrEmpty(_pairSecret) || ctx.Request.Headers["X-Pair-Secret"] != _pairSecret)
+        {
+            AuditLog.WriteNote($"admin refused (bad/missing pair secret) path={path}");
+            WriteJson(ctx, 403, new StatusResponse(false, "bad_secret"));
+            return;
+        }
+
+        if (method == "POST" && path == "/admin/invite")
+        {
+            var invite = CreateInvite();
+            WriteJson(ctx, 200, new InviteResponse(true, invite));
+            return;
+        }
+
+        if (method == "GET" && path == "/admin/requests")
+        {
+            List<PairedSessionInfo> reqs;
+            lock (_sessionsLock)
+                reqs = _pairRequests.Values
+                    .Select(r => new PairedSessionInfo(r.SessionId, r.WorkDir, "", "pending"))
+                    .ToList();
+            WriteJson(ctx, 200, new AdminListResponse(true, reqs));
+            return;
+        }
+
+        if (method == "GET" && path == "/admin/sessions")
+        {
+            List<PairedSessionInfo> list;
+            lock (_sessionsLock)
+                list = _sessions.Select(kv => new PairedSessionInfo(
+                        kv.Key, kv.Value.WorkDir, kv.Value.Token[..6],
+                        kv.Value.PairedUtc.ToString("u")))
+                    .ToList();
+            WriteJson(ctx, 200, new AdminListResponse(true, list));
+            return;
+        }
+
+        if (method == "POST" && (path == "/admin/approve" || path == "/admin/deny"))
+        {
+            var req = await ReadJsonAsync<ApproveRequest>(ctx);
+            if (req is null || string.IsNullOrWhiteSpace(req.SessionId))
+            {
+                WriteJson(ctx, 400, new StatusResponse(false, "missing_session_id"));
+                return;
+            }
+            TaskCompletionSource<string?>? tcs;
+            lock (_sessionsLock)
+            {
+                _pairWaiters.TryGetValue(req.SessionId, out tcs);
+                _pairRequests.Remove(req.SessionId);
+                _pairWaiters.Remove(req.SessionId);
+            }
+            if (tcs is null)
+            {
+                WriteJson(ctx, 404, new StatusResponse(false, "no_pending_request"));
+                return;
+            }
+            var approve = path == "/admin/approve";
+            tcs.TrySetResult(approve ? "approved on host" : null);
+            AuditLog.WriteNote($"pair request {(approve ? "approved" : "denied")} session={LogRedactor.Redact(req.SessionId)}");
+            WriteJson(ctx, 200, new StatusResponse(true));
+            return;
+        }
+
+        if (method == "POST" && path == "/admin/revoke")
+        {
+            // Host-side revoke: kills the session no matter what the agent
+            // thinks; the agent's next exec fails closed with a clear reason.
+            var req = await ReadJsonAsync<RevokeRequest>(ctx);
+            if (req is null || string.IsNullOrWhiteSpace(req.SessionId))
+            {
+                WriteJson(ctx, 400, new StatusResponse(false, "missing_session_id"));
+                return;
+            }
+            var removed = RevokeSession(req.SessionId);
+            WriteJson(ctx, 200, new StatusResponse(removed, removed ? null : "no_such_session"));
+            return;
+        }
+
         WriteJson(ctx, 404, new StatusResponse(false, "not found"));
     }
 
@@ -222,30 +369,87 @@ public sealed class HostDaemon : IAsyncDisposable
             return;
         }
 
-        // Fail closed: no configured secret means pairing is disabled entirely
-        // (the caller is expected to guarantee one exists before Start()).
-        if (string.IsNullOrEmpty(_pairSecret) || req.Secret != _pairSecret)
-        {
-            AuditLog.WriteNote($"pair refused (bad/missing secret) session={LogRedactor.Redact(req.SessionId)}");
-            WriteJson(ctx, 403, new PairResponse(false, Error: "bad_secret"));
-            return;
-        }
-
         if (string.IsNullOrWhiteSpace(req.SessionId))
         {
             WriteJson(ctx, 400, new PairResponse(false, Error: "missing_session_id"));
             return;
         }
 
+        // Path 1: permanent pair secret (host-side admin + launcher back-compat).
+        var viaSecret = !string.IsNullOrEmpty(_pairSecret) && req.Secret == _pairSecret;
+
+        // Path 2: one-shot launcher invite (single-use, TTL'd). Preferred over
+        // the secret: leaking it grants exactly one pairing, then it is dead.
+        var viaInvite = !viaSecret && ConsumeInvite(req.Invite);
+
+        // A wrong non-empty secret is an explicit refusal — never fall through
+        // to the approval lane (an attacker guessing secrets must not be able
+        // to queue operator prompts).
+        if (!viaSecret && !viaInvite && !string.IsNullOrWhiteSpace(req.Secret))
+        {
+            AuditLog.WriteNote($"pair refused (bad secret) session={LogRedactor.Redact(req.SessionId)}");
+            WriteJson(ctx, 403, new PairResponse(false, Error: "bad_secret"));
+            return;
+        }
+
+        // Path 3: approval request. The agent waits; the operator approves on
+        // the host (openmono host approve) — unless the auto-approve lane
+        // applies: this daemon run already paired this exact session id, and
+        // pair_auto allows it (default: this_session).
+        string? viaRequest = null;
+        if (!viaSecret && !viaInvite)
+        {
+            bool auto;
+            lock (_sessionsLock)
+                auto = _config.PairAuto.Equals("this_session", StringComparison.OrdinalIgnoreCase) &&
+                       _everPaired.Contains(req.SessionId);
+            if (auto)
+            {
+                viaRequest = "auto-approved (pair_auto=this_session, seen before)";
+                AuditLog.WriteNote($"pair auto-approved session={LogRedactor.Redact(req.SessionId)}");
+            }
+            else
+            {
+                var tcs = new TaskCompletionSource<string?>(TaskCreationOptions.RunContinuationsAsynchronously);
+                lock (_sessionsLock)
+                {
+                    _pairRequests[req.SessionId] = req;
+                    _pairWaiters[req.SessionId] = tcs;
+                }
+                AuditLog.WriteNote($"pair request pending session={LogRedactor.Redact(req.SessionId)} workdir={req.WorkDir}");
+                PairRequested?.Invoke(req);
+                var completed = await Task.WhenAny(tcs.Task, Task.Delay(_pairRequestWait));
+                lock (_sessionsLock)
+                {
+                    _pairRequests.Remove(req.SessionId);
+                    _pairWaiters.Remove(req.SessionId);
+                }
+                if (completed == tcs.Task)
+                    viaRequest = await tcs.Task;
+                else
+                {
+                    AuditLog.WriteNote($"pair request timed out session={LogRedactor.Redact(req.SessionId)}");
+                    WriteJson(ctx, 403, new PairResponse(false, Error: "pair_timeout"));
+                    return;
+                }
+                if (viaRequest is null)
+                {
+                    WriteJson(ctx, 403, new PairResponse(false, Error: "pair_denied"));
+                    return;
+                }
+            }
+        }
+
         var token = NewToken();
         lock (_sessionsLock)
         {
             // Re-pair rotates the token: a stale token can never keep working.
-            _sessions[req.SessionId] = new SessionLock(token, string.IsNullOrWhiteSpace(req.WorkDir) ? _workDir : req.WorkDir, DateTime.UtcNow);
+            _sessions[req.SessionId] = new SessionLock(token, string.IsNullOrWhiteSpace(req.WorkDir) ? _workDir : req.WorkDir, DateTime.UtcNow, DateTime.UtcNow);
+            _everPaired.Add(req.SessionId);
         }
 
-        AuditLog.WriteNote($"pair ok session={LogRedactor.Redact(req.SessionId)} workdir={req.WorkDir} run_as={_identity.RunAsUser} sudo={_identity.Sudo.ToString().ToLowerInvariant()}");
-        WriteJson(ctx, 200, new PairResponse(true, token, _identity.RunAsUser, _identity.Sudo.ToString().ToLowerInvariant(), _config.ResolvedLogDir));
+        AuditLog.WriteNote($"pair ok session={LogRedactor.Redact(req.SessionId)} workdir={req.WorkDir} run_as={_identity.RunAsUser} sudo={_identity.Sudo.ToString().ToLowerInvariant()} via={(viaSecret ? "secret" : viaInvite ? "invite" : "request")}");
+        WriteJson(ctx, 200, new PairResponse(true, token, _identity.RunAsUser, _identity.Sudo.ToString().ToLowerInvariant(), _config.ResolvedLogDir, Reason: viaRequest));
     }
 
     private async Task HandleExecAsync(HttpListenerContext ctx, ExecRequest? req)
@@ -347,6 +551,16 @@ public sealed class HostDaemon : IAsyncDisposable
                 AuditLog.WriteNote($"session token expired after idle session={LogRedactor.Redact(sessionId)}");
                 return false;
             }
+            // Hard cap since pairing (0 = no cap): forces the agent back
+            // through the approval lane even if it never goes idle.
+            var maxHours = _config.TokenMaxHours;
+            if (maxHours > 0 &&
+                DateTime.UtcNow - s.PairedUtc > TimeSpan.FromHours(maxHours))
+            {
+                _sessions.Remove(sessionId);
+                AuditLog.WriteNote($"session token expired (max {maxHours}h) session={LogRedactor.Redact(sessionId)}");
+                return false;
+            }
             _sessions[sessionId] = s with { LastSeenUtc = DateTime.UtcNow };
             workDir = s.WorkDir;
             return true;
@@ -358,6 +572,39 @@ public sealed class HostDaemon : IAsyncDisposable
         var bytes = new byte[24];
         System.Security.Cryptography.RandomNumberGenerator.Fill(bytes);
         return Convert.ToHexString(bytes);
+    }
+
+    /// <summary>Mint a one-shot pairing invite (launcher path). Single-use:
+    /// the first pair that presents it consumes it; TTL caps the rest.</summary>
+    public string CreateInvite()
+    {
+        var invite = NewToken();
+        var ttl = TimeSpan.FromSeconds(Math.Clamp(_config.InviteTtlSeconds, 30, 86_400));
+        lock (_invitesLock)
+        {
+            PruneInvites();
+            _invites[invite] = DateTime.UtcNow.Add(ttl);
+        }
+        AuditLog.WriteNote($"invite issued ttl_s={(int)ttl.TotalSeconds}");
+        return invite;
+    }
+
+    private bool ConsumeInvite(string? invite)
+    {
+        if (string.IsNullOrWhiteSpace(invite)) return false;
+        lock (_invitesLock)
+        {
+            if (!_invites.TryGetValue(invite, out var expires)) return false;
+            _invites.Remove(invite);
+            return expires >= DateTime.UtcNow;
+        }
+    }
+
+    private void PruneInvites()
+    {
+        var now = DateTime.UtcNow;
+        foreach (var kv in _invites.Where(kv => kv.Value < now).ToList())
+            _invites.Remove(kv.Key);
     }
 
     private static async Task<T?> ReadJsonAsync<T>(HttpListenerContext ctx)

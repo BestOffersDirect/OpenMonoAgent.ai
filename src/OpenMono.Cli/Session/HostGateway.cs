@@ -22,7 +22,8 @@ public sealed class HostGateway
     private readonly string _sessionId;
 
     private string? _token;
-    private bool _allowAll;
+    private readonly string? _invite;
+    private DateTime? _grantUntilUtc; // null = no blanket grant; DateTime.MaxValue = whole session
     private bool _denyAll;
     private SudoPolicy _sudo = SudoPolicy.Ask;
 
@@ -31,18 +32,19 @@ public sealed class HostGateway
     public string? HostLogDir { get; private set; }
     public string WorkDir { get; }
     public bool IsPaired => _token is not null;
-    public bool SessionAllowsAll => _allowAll;
+    public bool SessionAllowsAll => _grantUntilUtc is { } until && DateTime.UtcNow < until;
     public bool SessionDeniesAll => _denyAll;
     public SudoPolicy Sudo => _sudo;
     public string? PairSecret { get; }
 
-    public HostGateway(string baseUrl, string sessionId, string workDir, string? pairSecret = null)
+    public HostGateway(string baseUrl, string sessionId, string workDir, string? pairSecret = null, string? invite = null)
     {
         BaseUrl = baseUrl.TrimEnd('/');
         _client = new HostDaemonClient(BaseUrl);
         _sessionId = sessionId;
         WorkDir = workDir;
         PairSecret = pairSecret;
+        _invite = invite;
     }
 
     /// <summary>
@@ -53,18 +55,21 @@ public sealed class HostGateway
     public async Task<string?> PairAsync(string? secretOverride = null, CancellationToken ct = default)
     {
         var secret = secretOverride ?? PairSecret;
-        if (string.IsNullOrWhiteSpace(secret))
-            return "no pair secret — set OPENMONO_HOST_PAIR_SECRET (or pair from the host side first: openmono host)";
+        // No secret and no invite is not an error: the daemon treats it as a
+        // pair *request* the operator approves on the host (openmono host
+        // approve, or the [y/N] prompt on a foreground daemon).
 
         var ping = await _client.PingAsync(ct);
         if (!ping.Daemon)
             return $"host daemon not reachable at {BaseUrl} — start it on the host machine: openmono host";
 
-        var resp = await _client.PairAsync(new PairRequest(secret, _sessionId, WorkDir), ct);
+        var resp = await _client.PairAsync(new PairRequest(secret ?? "", _sessionId, WorkDir, _invite), ct);
         if (!resp.Ok || string.IsNullOrEmpty(resp.Token))
             return resp.Error switch
             {
                 "bad_secret" => "pairing was refused (bad pair secret) — check ~/.openmono/host-bridge.json on the host",
+                "pair_denied" => "the operator on the host denied the pairing request",
+                "pair_timeout" => "the operator on the host did not approve the pairing request in time — ask them to run: openmono host requests",
                 "daemon unreachable" => $"host daemon went down at {BaseUrl}",
                 _ => resp.Error ?? "pairing failed",
             };
@@ -78,7 +83,7 @@ public sealed class HostGateway
             "deny" => SudoPolicy.Deny,
             _ => SudoPolicy.Ask,
         };
-        _allowAll = false;
+        _grantUntilUtc = null;
         _denyAll = false;
         return null;
     }
@@ -94,7 +99,7 @@ public sealed class HostGateway
         _token = null;
         RunAs = null;
         HostLogDir = null;
-        _allowAll = false;
+        _grantUntilUtc = null;
         _denyAll = false;
     }
 
@@ -119,13 +124,19 @@ public sealed class HostGateway
         var decision = HostConsentDecision.AllowOnce;
         if (_denyAll)
             decision = HostConsentDecision.DenyAll;
-        else if (!(_allowAll && !request.AsRoot))
+        else if (!(_grantUntilUtc is { } until && DateTime.UtcNow < until && !request.AsRoot))
             decision = await consent(request.Command, request.AsRoot, ct);
 
         switch (decision)
         {
             case HostConsentDecision.AllowAll:
-                _allowAll = true;
+                _grantUntilUtc = DateTime.MaxValue;
+                break;
+            case HostConsentDecision.Allow30m:
+                _grantUntilUtc = DateTime.UtcNow.AddMinutes(30);
+                break;
+            case HostConsentDecision.AllowToday:
+                _grantUntilUtc = DateTime.UtcNow.Date.AddDays(1);
                 break;
             case HostConsentDecision.DenyAll:
                 _denyAll = true;

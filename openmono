@@ -1233,14 +1233,108 @@ cmd_host() {
                 else
                     head -c 200 <<<"$status_json"; echo ""
                 fi
+                if [[ "${2:-}" == "--show" ]]; then
+                    if command -v jq &>/dev/null; then
+                        info "pair secret: $(jq -r '.pair_secret // "(none)"' "$HOME/.openmono/host-bridge.json" 2>/dev/null)"
+                    else
+                        info "pair secret: (jq not installed — see ~/.openmono/host-bridge.json)"
+                    fi
+                fi
             elif _host_daemon_alive; then
                 ok "host-bridge daemon is up on 127.0.0.1:${HOST_DAEMON_PORT} (no /status support - upgrade for details)"
             else
                 info "host-bridge daemon is not running (start with: openmono host daemon)"
             fi
             ;;
+        invite)
+            # Mint a one-shot pairing invite for a manual sandbox launch:
+            #   export OPENMONO_HOST_INVITE=$(openmono host invite)
+            if ! _host_daemon_alive; then err "no daemon running on port $HOST_DAEMON_PORT"; return 1; fi
+            local secret inv
+            secret="$(_host_daemon_pair_secret)"
+            [[ -z "$secret" ]] && { err "no pair_secret in ~/.openmono/host-bridge.json"; return 1; }
+            inv="$(curl -sf --max-time 3 -X POST -d '' -H "X-Pair-Secret: $secret" \
+                "http://127.0.0.1:${HOST_DAEMON_PORT}/admin/invite" 2>/dev/null \
+                | jq -r '.invite // empty' 2>/dev/null)"
+            if [[ -z "$inv" ]]; then err "daemon did not issue an invite (old daemon version?)"; return 1; fi
+            printf '%s\n' "$inv"
+            info "single-use invite (TTL-limited) — launch with: OPENMONO_HOST_INVITE=<above> docker compose run ..."
+            ;;
+        approve|deny)
+            local sid="${2:-}"
+            if [[ -z "$sid" ]] || ! _host_daemon_alive; then
+                [[ -z "$sid" ]] && err "Usage: openmono host $sub <session-id> (list with: openmono host requests)"
+                _host_daemon_alive || err "no daemon running on port $HOST_DAEMON_PORT"
+                return 1
+            fi
+            local secret body rc
+            secret="$(_host_daemon_pair_secret)"
+            [[ -z "$secret" ]] && { err "no pair_secret in ~/.openmono/host-bridge.json"; return 1; }
+            body="{\"session_id\":\"$sid\"}"
+            rc="$(curl -sf --max-time 3 -X POST -H "X-Pair-Secret: $secret" \
+                -H "Content-Type: application/json" -d "$body" \
+                "http://127.0.0.1:${HOST_DAEMON_PORT}/admin/$sub" 2>/dev/null \
+                | jq -r '.ok' 2>/dev/null)"
+            if [[ "$rc" == "true" ]]; then
+                ok "pair request $sub: $sid"
+            else
+                err "no pending pair request for '$sid' (or daemon error) — list with: openmono host requests"
+                return 1
+            fi
+            ;;
+        requests)
+            if ! _host_daemon_alive; then info "no daemon running on port $HOST_DAEMON_PORT"; return 0; fi
+            local secret reqs
+            secret="$(_host_daemon_pair_secret)"
+            [[ -z "$secret" ]] && { err "no pair_secret in ~/.openmono/host-bridge.json"; return 1; }
+            reqs="$(curl -sf --max-time 3 -H "X-Pair-Secret: $secret" \
+                "http://127.0.0.1:${HOST_DAEMON_PORT}/admin/requests" 2>/dev/null)"
+            if command -v jq &>/dev/null; then
+                local n
+                n="$(jq -r '.items | length' <<<"$reqs" 2>/dev/null)"
+                if [[ "${n:-0}" == "0" ]]; then
+                    info "no pending pair requests"
+                else
+                    jq -r '.items[] | "  session \(.session_id)\n    workdir \(.workdir)\n    approve: openmono host approve \(.session_id)"' <<<"$reqs"
+                fi
+            else
+                head -c 300 <<<"$reqs"; echo ""
+            fi
+            ;;
+        sessions|revoke)
+            if ! _host_daemon_alive; then info "no daemon running on port $HOST_DAEMON_PORT"; return 0; fi
+            local secret
+            secret="$(_host_daemon_pair_secret)"
+            [[ -z "$secret" ]] && { err "no pair_secret in ~/.openmono/host-bridge.json"; return 1; }
+            if [[ "$sub" == "sessions" ]]; then
+                local list
+                list="$(curl -sf --max-time 3 -H "X-Pair-Secret: $secret" \
+                    "http://127.0.0.1:${HOST_DAEMON_PORT}/admin/sessions" 2>/dev/null)"
+                if command -v jq &>/dev/null; then
+                    local n
+                    n="$(jq -r '.items | length' <<<"$list" 2>/dev/null)"
+                    if [[ "${n:-0}" == "0" ]]; then
+                        info "no paired sessions"
+                    else
+                        jq -r '.items[] | "  session \(.session_id) · since \(.since) · token \(.token_hint)*** · workdir \(.workdir)"' <<<"$list"
+                        info "revoke with: openmono host revoke <session-id>"
+                    fi
+                else
+                    head -c 300 <<<"$list"; echo ""
+                fi
+            else
+                local sid="${2:-}"
+                [[ -z "$sid" ]] && { err "Usage: openmono host revoke <session-id> (list with: openmono host sessions)"; return 1; }
+                local r
+                r="$(curl -sf --max-time 3 -X POST -H "X-Pair-Secret: $secret" \
+                    -H "Content-Type: application/json" -d "{\"session_id\":\"$sid\"}" \
+                    "http://127.0.0.1:${HOST_DAEMON_PORT}/admin/revoke" 2>/dev/null \
+                    | jq -r '.ok' 2>/dev/null)"
+                if [[ "$r" == "true" ]]; then ok "revoked session $sid"; else err "no such session: $sid"; return 1; fi
+            fi
+            ;;
         *)
-            err "Usage: openmono host [daemon|stop|status]"
+            err "Usage: openmono host [daemon|start|stop|status|invite|requests|approve|deny|sessions|revoke]"
             return 1
             ;;
     esac
@@ -1308,16 +1402,26 @@ cmd_agent_host() {
         trap '_host_daemon_stop_owned' EXIT INT TERM
     fi
 
-    local secret
+    local secret invite
     secret="$(_host_daemon_pair_secret)"
     if [[ -z "$secret" ]]; then
         err "No pair_secret in ~/.openmono/host-bridge.json — the daemon failed to generate one."
         err "Check $HOST_DAEMON_LOG"
         exit 1
     fi
+    # Preferred path: a one-shot invite (single-use, TTL'd). If the daemon is
+    # too old to have /admin/invite, fall back to the shared secret.
+    invite="$(curl -sf --max-time 3 -X POST -d '' \
+        -H "X-Pair-Secret: $secret" \
+        "http://127.0.0.1:${HOST_DAEMON_PORT}/admin/invite" 2>/dev/null \
+        | jq -r '.invite // empty' 2>/dev/null)"
     export OPENMONO_HOST_MODE=1
     export OPENMONO_HOST_DAEMON_URL="http://host.docker.internal:${HOST_DAEMON_PORT}"
-    export OPENMONO_HOST_PAIR_SECRET="$secret"
+    if [[ -n "$invite" ]]; then
+        export OPENMONO_HOST_INVITE="$invite"
+    else
+        export OPENMONO_HOST_PAIR_SECRET="$secret"
+    fi
     export OPENMONO_HOST_WORKSPACE="$(pwd)"
 
     cmd_agent_sandbox "$@"
@@ -1354,10 +1458,11 @@ cmd_agent_sandbox() {
     export WORKSPACE
 
     mkdir -p "${HOME}/.openmono"
-    # The compose file bind-mounts host-bridge.json read-only into the sandbox.
-    # A missing bind source makes Docker create a DIRECTORY at that host path,
-    # which then blocks the daemon from writing its config there. Ensure the
-    # file exists (empty = daemon generates defaults on first host-mode run).
+    # Defensive: keep host-bridge.json a file. The main compose shadows it with
+    # /dev/null inside the sandbox, but any variant that bind-mounts the file
+    # directly would have Docker create a DIRECTORY at that host path when the
+    # source is missing — which then blocks the daemon from writing its config.
+    # Empty file = daemon generates defaults + pair secret on first run.
     [[ -e "${HOME}/.openmono/host-bridge.json" ]] || : > "${HOME}/.openmono/host-bridge.json"
 
     cd "$DOCKER_DIR"
@@ -1496,8 +1601,14 @@ cmd_agent_sandbox() {
         extra_env+=(
             -e "OPENMONO_HOST_MODE=1"
             -e "OPENMONO_HOST_DAEMON_URL=${OPENMONO_HOST_DAEMON_URL:-}"
-            -e "OPENMONO_HOST_PAIR_SECRET=${OPENMONO_HOST_PAIR_SECRET:-}"
             -e "OPENMONO_HOST_WORKSPACE=${OPENMONO_HOST_WORKSPACE:-$WORKSPACE}")
+        # The invite (one-shot) is preferred; the pair secret never enters the
+        # sandbox when the daemon supports /admin/invite.
+        if [[ -n "${OPENMONO_HOST_INVITE:-}" ]]; then
+            extra_env+=(-e "OPENMONO_HOST_INVITE=${OPENMONO_HOST_INVITE}")
+        elif [[ -n "${OPENMONO_HOST_PAIR_SECRET:-}" ]]; then
+            extra_env+=(-e "OPENMONO_HOST_PAIR_SECRET=${OPENMONO_HOST_PAIR_SECRET}")
+        fi
     fi
 
     _clipboard_bridge_start

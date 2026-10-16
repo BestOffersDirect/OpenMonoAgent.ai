@@ -10,6 +10,8 @@ public enum HostConsentDecision
 {
     AllowOnce,
     AllowAll,
+    Allow30m,
+    AllowToday,
     DenyOnce,
     DenyAll,
 }
@@ -26,6 +28,11 @@ public static class HostConsent
             "a" or "always" or "always allow" or "allow all"
                 or "allow all (this session)" or "allow all for session" or "session"
                 => HostConsentDecision.AllowAll,
+            "30m" or "30 min" or "30 minutes" or "allow 30m" or "allow 30 minutes"
+                or "allow all (30 minutes)" or "allow all (30m)"
+                => HostConsentDecision.Allow30m,
+            "today" or "allow today" or "for today" or "allow all (today)"
+                => HostConsentDecision.AllowToday,
             "n" or "no" or "deny" or "deny once"
                 => HostConsentDecision.DenyOnce,
             "!" or "never" or "deny all" or "deny all (stop host mode)"

@@ -73,10 +73,10 @@ public sealed class AskUserTool : ToolBase
             var prompt = $"Run on the host as {gateway.RunAs}: {cmd}";
             var options = isRoot
                 ? new[] { "allow once", "allow all", "deny", "deny all" }
-                : new[] { "allow once", "allow all (this session)", "deny", "deny all (stop host mode)" };
+                : new[] { "allow once", "allow all (this session)", "allow all (30 minutes)", "allow all (today)", "deny", "deny all (stop host mode)" };
             var reply = context.AskUserWithOptions is not null
                 ? await context.AskUserWithOptions($"⚠ {label}\n{prompt}", options, innerCt)
-                : await context.AskUser($"⚠ {label}\n{prompt}\nReply: allow once / allow all / deny / deny all", innerCt);
+                : await context.AskUser($"⚠ {label}\n{prompt}\nReply: allow once / allow all / allow all (30 minutes) / allow all (today) / deny / deny all", innerCt);
             return HostConsent.Map(reply);
         }, ct);
 

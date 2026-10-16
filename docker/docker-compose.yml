@@ -111,11 +111,14 @@ services:
     volumes:
       - ${WORKSPACE:-.}:/workspace
       - ${HOME}/.openmono:/home/agent/.openmono
-      # Host-bridge authority stays host-side: the pair secret is read-only
-      # inside the sandbox (manual /host on can read it; the sandbox can never
-      # flip sudo_policy or edit the deny-list), and the daemon's command-audit
-      # dir is shadowed by tmpfs so the sandbox cannot see or tamper it.
-      - ${HOME}/.openmono/host-bridge.json:/home/agent/.openmono/host-bridge.json:ro
+      # Host-bridge authority stays host-side. The pair secret file is
+      # shadowed by /dev/null so the sandbox can never read, copy, flip
+      # sudo_policy, or gut the deny-list. Pairing therefore runs on the
+      # one-shot launcher invite (OPENMONO_HOST_INVITE, single-use + TTL'd)
+      # or the operator approval lane (openmono host approve). The daemon's
+      # command-audit dirs are shadowed by tmpfs so the sandbox cannot see
+      # or tamper them.
+      - /dev/null:/home/agent/.openmono/host-bridge.json
       - type: tmpfs
         target: /home/agent/.openmono/host-bridge/logs
       - type: tmpfs
