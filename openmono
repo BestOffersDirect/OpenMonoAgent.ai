@@ -131,6 +131,19 @@ _env_set() {
     chmod 0600 "$env_file"
 }
 
+# Mirror the LLAMA_API_KEY into ~/.openmono/settings.json (llm.api_key) so the
+# local agent's config never drifts from the backend's live key: docker/.env is
+# what llama-server/gateway start with, settings.json is what the agent dials
+# with. Only touches an existing settings file (a missing one means setup has
+# not run yet — the setup flow writes the key itself).
+_sync_api_key_to_settings() {
+    local key="$1"
+    local settings="$HOME/.openmono/settings.json"
+    [[ -n "$key" && -f "$settings" ]] || return 0
+    command -v jq &>/dev/null || return 0
+    cmd_config set llm.api_key "$key" >/dev/null 2>&1 || true
+}
+
 # ── Inference backend selection (Linux) ─────────────────────────────────────
 # Strata (Qwen3.8-Flash-Next, host-native :8080/v1) is the default for fresh
 # installs on this branch; pre-existing installs without the marker keep the
@@ -161,6 +174,7 @@ _ensure_llama_key() {
     if [[ -z "$key" ]]; then
         key="$(openssl rand -hex 24)"
         _env_set LLAMA_API_KEY "$key"
+        _sync_api_key_to_settings "$key"
         _LLAMA_KEY_GENERATED=1
         info "Generated LLAMA_API_KEY (shared gateway bearer)" >&2
     fi
@@ -1125,6 +1139,23 @@ HOST_DAEMON_PORT="${OPENMONO_HOST_DAEMON_PORT:-7476}"
 HOST_DAEMON_PIDFILE="$HOME/.openmono/host-daemon.pid"
 HOST_DAEMON_LOG="$HOME/.openmono/logs/host-daemon.log"
 
+_host_daemon_container_url() {
+    # Linux: containers reach the host at the docker bridge gateway; the request
+    # lands on the socket bound to that bridge IP, so the URL must name it (the
+    # daemon binds its bridge IPs too). host.docker.internal + a forced
+    # Host: 127.0.0.1 header mismatches the bound prefix -> HttpListener 404.
+    # macOS (Docker Desktop vpnkit) lands on host loopback, so keep the name.
+    if [[ "$(uname -s)" == Linux ]]; then
+        local gw
+        gw="$(docker network inspect bridge -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}' 2>/dev/null)"
+        if [[ "$gw" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "http://${gw}:${HOST_DAEMON_PORT}"
+            return
+        fi
+    fi
+    echo "http://host.docker.internal:${HOST_DAEMON_PORT}"
+}
+
 _host_daemon_bin() {
     local bin proj
     if bin="$(cmd_agent_host_bin)"; then
@@ -1466,7 +1497,7 @@ cmd_agent_host() {
         "http://127.0.0.1:${HOST_DAEMON_PORT}/admin/invite" 2>/dev/null \
         | jq -r '.invite // empty' 2>/dev/null)"
     export OPENMONO_HOST_MODE=1
-    export OPENMONO_HOST_DAEMON_URL="http://host.docker.internal:${HOST_DAEMON_PORT}"
+    export OPENMONO_HOST_DAEMON_URL="$(_host_daemon_container_url)"
     # The sandbox needs the HOST's OS, not the container's: the daemon-URL
     # rewrite (host.docker.internal -> bridge IPv4) is a Linux-host behavior,
     # and macOS routing (Docker Desktop vpnkit vs Colima vmnet) differs.
@@ -1613,12 +1644,15 @@ cmd_agent_sandbox() {
         fi
     fi
 
-     if [[ "$is_local" == "true" && "$NATIVE_INFERENCE" != "true" ]]; then
+     if [[ "$is_local" == "true" ]]; then
         # The configured endpoint points at loopback / the host gateway, which
         # the agent container cannot reach by that name. Rewrite the HOST only,
         # preserving the port and any base path from the config, so a custom
         # STRATA_PORT/LLAMA_PORT or an endpoint like ...:8081/v1 keeps working:
         #   - Strata serves host-native → reach it via the host gateway.
+        #   - Native Metal llama.cpp also runs on the HOST (not in compose) →
+        #     same host-gateway rewrite; leaving localhost in place makes the
+        #     container dial itself and every chat request connection-refuses.
         #   - llama.cpp runs in its own container → reach it by service name.
         local _ep _host_port _port _path
         _ep="${cfg_endpoint#*://}"          # host[:port][/path]
@@ -1629,6 +1663,12 @@ cmd_agent_sandbox() {
         [[ "$_port" == "$_host_port" ]] && _port=""   # no explicit port
         if [[ "$(_inference_backend)" == "strata" ]]; then
             _port="${_port:-$(_strata_port)}"
+            export OPENMONO_ENDPOINT="http://host.docker.internal:${_port}${_path}"
+        elif [[ "$NATIVE_INFERENCE" == "true" ]]; then
+            # Apple-Silicon native Metal: llama-server is a host process bound
+            # to the host's loopback/port. The sandbox reaches host loopback via
+            # the docker desktop / colima host gateway under the same port.
+            _port="${_port:-7474}"
             export OPENMONO_ENDPOINT="http://host.docker.internal:${_port}${_path}"
         else
             _port="${_port:-7474}"
@@ -1718,7 +1758,7 @@ cmd_agent_sandbox() {
             if [[ -n "$_auto_invite" ]]; then
                 extra_env+=(
                     -e "OPENMONO_HOST_INVITE=${_auto_invite}"
-                    -e "OPENMONO_HOST_DAEMON_URL=http://host.docker.internal:${HOST_DAEMON_PORT}"
+                    -e "OPENMONO_HOST_DAEMON_URL=$(_host_daemon_container_url)"
                     -e "OPENMONO_HOST_WORKSPACE=${OPENMONO_HOST_WORKSPACE:-$WORKSPACE}")
             fi
         fi
@@ -2348,7 +2388,8 @@ cmd_tunnel() {
                 echo "LLAMA_API_KEY=$new_key" >> "$tmp"
                 mv "$tmp" "$env_file"
                 chmod 0600 "$env_file"
-                ok "LLAMA_API_KEY rotated in docker/.env"
+                _sync_api_key_to_settings "$new_key"
+                ok "LLAMA_API_KEY rotated in docker/.env (docker/.env + settings.json)"
                 if [[ "$(_inference_backend)" == "strata" ]]; then
                     # Strata backend: the rotated key guards the Caddy gateway.
                     # Restart it when present; Strata itself keeps its own key.
@@ -2386,11 +2427,13 @@ cmd_tunnel() {
                 printf "${BLUE}${BOLD}  API Key Rotated${NC}\n"
                 printf "${BLUE}%s${NC}\n" "$(printf '─%.0s' $(seq 1 60))"
                 echo ""
-                echo "  Run the following on the agent box to apply the new key:"
+                echo "  Run the following on REMOTE agent boxes to apply the new key:"
                 echo ""
                 [[ -n "$endpoint" ]] && \
                     printf "    ${BOLD}openmono config set llm.endpoint  %s${NC}\n" "$endpoint"
                 printf "    ${BOLD}openmono config set llm.api_key   %s${NC}\n" "$new_key"
+                [[ -f "$HOME/.openmono/settings.json" ]] && \
+                    echo "  (this machine's settings.json was updated automatically; the lines above are for other agent boxes)"
                 echo ""
             fi
             ;;
