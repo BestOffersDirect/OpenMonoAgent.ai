@@ -69,7 +69,10 @@ public sealed record DaemonStatusResponse(
 
 // ── Admin surface (host-side CLI only; authenticated by the pair secret) ──
 public sealed record InviteRequest(
-    [property: JsonPropertyName("session_id")] string SessionId);
+    [property: JsonPropertyName("session_id")] string SessionId,
+    // Optional per-invite TTL override (the daemon clamps it to 30s..24h).
+    // The launcher uses a long TTL for manual /host on sessions.
+    [property: JsonPropertyName("ttl_seconds")] int? TtlSeconds = null);
 
 public sealed record InviteResponse(
     [property: JsonPropertyName("ok")] bool Ok,
@@ -202,13 +205,13 @@ public sealed class HostDaemonClient : IDisposable
         return req;
     }
 
-    public async Task<InviteResponse> CreateInviteAsync(string pairSecret, string sessionId, CancellationToken ct)
+    public async Task<InviteResponse> CreateInviteAsync(string pairSecret, string sessionId, CancellationToken ct, int? ttlSeconds = null)
     {
         try
         {
             using var req = AdminRequest(HttpMethod.Post, "/admin/invite", pairSecret);
             req.Content = new StringContent(
-                JsonSerializer.Serialize(new InviteRequest(sessionId)), Encoding.UTF8, "application/json");
+                JsonSerializer.Serialize(new InviteRequest(sessionId, ttlSeconds)), Encoding.UTF8, "application/json");
             using var resp = await _admin.Value.SendAsync(req, ct);
             return await ReadJsonAsync<InviteResponse>(resp, ct)
                 ?? new InviteResponse(false, Error: "daemon unreachable");

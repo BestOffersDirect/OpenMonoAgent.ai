@@ -295,7 +295,25 @@ public sealed class HostDaemon : IAsyncDisposable
 
         if (method == "POST" && path == "/admin/invite")
         {
-            var invite = CreateInvite();
+            // Optional body {"ttl_seconds":N}: the launcher mints long-lived
+            // invites for manual /host on sessions; the boot-pair path keeps
+            // the short config default. Clamped exactly like the config value.
+            TimeSpan? ttl = null;
+            if (ctx.Request.HasEntityBody)
+            {
+                try
+                {
+                    using var doc = await JsonDocument.ParseAsync(ctx.Request.InputStream);
+                    // TryGetInt32 THROWS on non-number kinds (null included),
+                    // so gate on ValueKind first.
+                    if (doc.RootElement.TryGetProperty("ttl_seconds", out var t)
+                        && t.ValueKind == JsonValueKind.Number && t.TryGetInt32(out var secs))
+                        ttl = TimeSpan.FromSeconds(Math.Clamp(secs, 30, 86_400));
+                }
+                catch (Exception ex) when (ex is JsonException or InvalidOperationException)
+                { /* body optional: fall back to config TTL */ }
+            }
+            var invite = CreateInvite(ttl);
             WriteJson(ctx, 200, new InviteResponse(true, invite));
             return;
         }
@@ -583,10 +601,11 @@ public sealed class HostDaemon : IAsyncDisposable
 
     /// <summary>Mint a one-shot pairing invite (launcher path). Single-use:
     /// the first pair that presents it consumes it; TTL caps the rest.</summary>
-    public string CreateInvite()
+    public string CreateInvite(TimeSpan? ttlOverride = null)
     {
         var invite = NewToken();
-        var ttl = TimeSpan.FromSeconds(Math.Clamp(_config.InviteTtlSeconds, 30, 86_400));
+        var ttl = ttlOverride ?? TimeSpan.FromSeconds(Math.Clamp(_config.InviteTtlSeconds, 30, 86_400));
+        ttl = TimeSpan.FromSeconds(Math.Clamp((int)ttl.TotalSeconds, 30, 86_400));
         lock (_invitesLock)
         {
             PruneInvites();

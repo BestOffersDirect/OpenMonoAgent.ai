@@ -1679,6 +1679,33 @@ cmd_agent_sandbox() {
         elif [[ -n "${OPENMONO_HOST_PAIR_SECRET:-}" ]]; then
             extra_env+=(-e "OPENMONO_HOST_PAIR_SECRET=${OPENMONO_HOST_PAIR_SECRET}")
         fi
+    elif [[ "${OPENMONO_HOST_AUTO_INVITE:-1}" == "1" ]] \
+        && curl -sf --max-time 2 "http://127.0.0.1:${HOST_DAEMON_PORT}/ping" &>/dev/null; then
+        # Plain `openmono agent` with a daemon already running: mint a
+        # long-TTL one-shot invite (host-side, pair secret never leaves) and
+        # inject it WITHOUT OPENMONO_HOST_MODE. Nothing pairs on boot — the
+        # invite is consumed only when the user runs /host on or clicks the
+        # extension button, which then pairs silently (no approve step).
+        # Opt out: OPENMONO_HOST_AUTO_INVITE=0 (keeps the approval lane).
+        # Trade-off, by design: the invite sits in the container env until
+        # used, so sandbox code could consume it; the daemon's deny-list,
+        # sudo=ask and command audit still apply.
+        local _auto_secret _auto_invite
+        _auto_secret="$(_host_daemon_pair_secret)"
+        if [[ -n "$_auto_secret" ]]; then
+            _auto_invite="$(curl -sf --max-time 3 -X POST \
+                -H "X-Pair-Secret: $_auto_secret" \
+                -H "content-type: application/json" \
+                -d '{"ttl_seconds":43200}' \
+                "http://127.0.0.1:${HOST_DAEMON_PORT}/admin/invite" 2>/dev/null \
+                | jq -r '.invite // empty' 2>/dev/null)"
+            if [[ -n "$_auto_invite" ]]; then
+                extra_env+=(
+                    -e "OPENMONO_HOST_INVITE=${_auto_invite}"
+                    -e "OPENMONO_HOST_DAEMON_URL=http://host.docker.internal:${HOST_DAEMON_PORT}"
+                    -e "OPENMONO_HOST_WORKSPACE=${OPENMONO_HOST_WORKSPACE:-$WORKSPACE}")
+            fi
+        fi
     fi
 
     _clipboard_bridge_start

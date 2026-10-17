@@ -1,4 +1,6 @@
 using System.Net.Sockets;
+using System.Text;
+using System.Text.Json;
 using FluentAssertions;
 using OpenMono.HostBridge;
 using OpenMono.Session;
@@ -61,6 +63,30 @@ public class PairSecurityTests
         var error = await gw2.PairAsync();
         error.Should().NotBeNull();
         gw2.IsPaired.Should().BeFalse();
+    }
+
+    [Fact]
+    public async Task Invite_AdminEndpointHonorsTtlOverride()
+    {
+        // The launcher mints long-TTL invites for manual /host on sessions via
+        // {"ttl_seconds":N}. The override must produce a working invite, and
+        // the clamped floor (30s) must still be usable immediately.
+        await using var daemon = new HostDaemon(Config(), new HostIdentity("", SudoPolicy.Ask, null),
+            TempWorkDir(), GetFreePort());
+        daemon.Start();
+
+        using var http = new HttpClient();
+        using var req = new HttpRequestMessage(HttpMethod.Post, $"http://127.0.0.1:{daemon.Port}/admin/invite");
+        req.Headers.TryAddWithoutValidation("X-Pair-Secret", Secret);
+        req.Content = new StringContent("""{"session_id":"x","ttl_seconds":43200}""", Encoding.UTF8, "application/json");
+        using var resp = await http.SendAsync(req);
+        resp.StatusCode.Should().Be(System.Net.HttpStatusCode.OK);
+        using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync());
+        var invite = doc.RootElement.GetProperty("invite").GetString();
+        invite.Should().NotBeNullOrWhiteSpace();
+
+        var gw = new HostGateway($"http://127.0.0.1:{daemon.Port}", "ttl-invite", TempWorkDir(), invite: invite);
+        (await gw.PairAsync()).Should().BeNull("the TTL-overridden invite is live");
     }
 
     [Fact]
@@ -227,7 +253,7 @@ public class PairSecurityTests
         var client = new HostDaemonClient($"http://127.0.0.1:{daemon.Port}");
 
         var invite = await client.CreateInviteAsync(Secret, "ignored", CancellationToken.None);
-        invite.Ok.Should().BeTrue();
+        invite.Ok.Should().BeTrue(because: $"daemon said: {invite.Error}");
         invite.Invite.Should().NotBeNullOrWhiteSpace();
 
         // Pair with the invite, then manage the session over the admin lane.
