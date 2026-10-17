@@ -576,9 +576,32 @@ PYEOF
     fi
 fi
 
-# ── Step 7: Build Docker images (skipped for inference) ──────────────────────
+# ── Step 7: Build Docker images ──────────────────────────────────────────────
 
-if [ "$OPENMONO_ROLE" != "inference" ]; then
+# Inference-only boxes don't need the agent image — ask instead of silently
+# skipping. Non-interactive defaults to No (preset OPENMONO_BUILD_AGENT=1).
+_build_agent=1
+if [ "$OPENMONO_ROLE" = "inference" ]; then
+    _build_agent="${OPENMONO_BUILD_AGENT:-}"
+    if [ -z "$_build_agent" ]; then
+        if [ ! -t 0 ]; then
+            _build_agent=0
+        else
+            echo ""
+            printf "  Build the agent Docker image on this inference box? Default No [y/N]: "
+            read -r _ba || _ba=""
+            echo ""
+            case "${_ba:-}" in
+                [Yy]|[Yy]es) _build_agent=1 ;;
+                *) _build_agent=0 ;;
+            esac
+        fi
+    fi
+fi
+
+if [ "$OPENMONO_ROLE" != "inference" ] || [ "$_build_agent" = "1" ]; then
+    # The inference role only counts this step when the build is actually run.
+    [ "$OPENMONO_ROLE" = "inference" ] && TOTAL_STEPS=7
     next_step "Building Docker images"
 
     cd "$INSTALL_DIR/docker"
@@ -601,6 +624,8 @@ if [ "$OPENMONO_ROLE" != "inference" ]; then
     fi
 
     ok "Docker images built"
+else
+    detail "Skipping agent image (inference-only box). Add later: docker compose build agent"
 fi
 
 # ── Step 8: Start llama-server (inference + full only) ──────────────────────

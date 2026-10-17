@@ -1069,6 +1069,30 @@ fi
 
 fi  # End of Step 6 (skipped on agent role)
 
+# ── Write llm.endpoint to ~/.openmono/settings.json (full + inference) ──
+# The agent container and host-side readers resolve llm.endpoint from this
+# file; the launcher rewrites loopback per-network (to the compose service
+# name on Linux), so storing 127.0.0.1 works everywhere. Only fill it in when
+# missing/empty — never clobber a relay endpoint the user configured.
+if [ "$OPENMONO_ROLE" != "agent" ]; then
+    SETTINGS_FILE="$HOME/.openmono/settings.json"
+    mkdir -p "$(dirname "$SETTINGS_FILE")"
+    [ -f "$SETTINGS_FILE" ] || echo '{}' > "$SETTINGS_FILE"
+    if [ "${INFERENCE_BACKEND:-llama}" = "strata" ]; then
+        _ep="http://127.0.0.1:${STRATA_PORT:-8080}/v1"
+    else
+        _ep="http://127.0.0.1:${LLAMA_PORT:-7474}"
+    fi
+    if [ -z "$(jq -r '.llm.endpoint // empty' "$SETTINGS_FILE" 2>/dev/null)" ]; then
+        jq --arg e "$_ep" '.llm = ((.llm // {}) + {endpoint: $e})' "$SETTINGS_FILE" > "$SETTINGS_FILE.tmp" \
+            && mv "$SETTINGS_FILE.tmp" "$SETTINGS_FILE"
+        chmod 0600 "$SETTINGS_FILE" 2>/dev/null || true
+        ok "llm.endpoint written to $SETTINGS_FILE ($_ep)"
+    else
+        detail "llm.endpoint already set in $SETTINGS_FILE — left untouched"
+    fi
+fi
+
 # ── Step 7: Build Docker images (role-specific) ───────────────────────────────
 
 next_step "Building Docker images"
@@ -1100,12 +1124,36 @@ if [ "$OPENMONO_ROLE" != "agent" ] && [ "$INFERENCE_BACKEND" != "strata" ]; then
     fi
 fi
 
-if [ "$OPENMONO_ROLE" != "inference" ]; then
+# Inference-only boxes don't need the agent image — ask instead of silently
+# skipping. Non-interactive defaults to No (preset OPENMONO_BUILD_AGENT=1).
+_build_agent=1
+if [ "$OPENMONO_ROLE" = "inference" ]; then
+    _build_agent="${OPENMONO_BUILD_AGENT:-}"
+    if [ -z "$_build_agent" ]; then
+        if [ ! -t 0 ]; then
+            _build_agent=0
+        else
+            echo ""
+            printf "  Build the agent Docker image on this inference box? Default No [y/N]: "
+            read -r _ba || _ba=""
+            echo ""
+            case "${_ba:-}" in
+                [Yy]|[Yy]es) _build_agent=1 ;;
+                *) _build_agent=0 ;;
+            esac
+        fi
+    fi
+fi
+if [ "$_build_agent" = "1" ]; then
     info "Building agent image..."
     if ! run docker compose build agent; then
         die "agent build failed"
     fi
+elif [ "$OPENMONO_ROLE" = "inference" ]; then
+    detail "Skipping agent image (inference-only box). Add later: docker compose build agent"
+fi
 
+if [ "$OPENMONO_ROLE" != "inference" ]; then
     # Optional add-on (agent roles only — never inference): the bare-metal host
     # sub-agent. It drives this box's in-container agent over ACP and executes
     # host commands (pull, build, install, redeploy, troubleshoot). Default is
