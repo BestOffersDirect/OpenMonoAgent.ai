@@ -114,7 +114,8 @@ services:
       # Host-bridge authority stays host-side. The pair secret file is
       # shadowed by /dev/null so the sandbox can never read, copy, flip
       # sudo_policy, or gut the deny-list. Pairing therefore runs on the
-      # one-shot launcher invite (OPENMONO_HOST_INVITE, single-use + TTL'd)
+      # launcher invite (OPENMONO_HOST_INVITE, TTL-bounded: every session in
+      # the run may pair with it until it expires)
       # or the operator approval lane (openmono host approve). The daemon's
       # command-audit dirs are shadowed by tmpfs so the sandbox cannot see
       # or tamper them.

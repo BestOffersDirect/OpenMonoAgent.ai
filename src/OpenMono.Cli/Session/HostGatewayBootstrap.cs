@@ -11,7 +11,8 @@ namespace OpenMono.Session;
 ///  - OPENMONO_HOST_MODE=1       host mode intended for this run
 ///  - OPENMONO_HOST_DAEMON_URL   e.g. http://host.docker.internal:7476
 ///  - OPENMONO_HOST_PAIR_SECRET  shared secret (host ~/.openmono/host-bridge.json)
-///  - OPENMONO_HOST_INVITE       one-shot pairing invite (single-use, TTL'd);
+///  - OPENMONO_HOST_INVITE       pairing invite (TTL-bounded; every session
+///                               in the run may pair with it until it expires);
 ///                               preferred over the secret when both are set
 ///  - OPENMONO_HOST_WORKSPACE    host directory bind-mounted at /workspace
 /// </summary>
