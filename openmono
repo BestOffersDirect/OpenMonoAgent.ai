@@ -115,6 +115,12 @@ _env_get() {
     [[ -n "$line" ]] && printf '%s' "${line#*=}"
 }
 
+# Re-resolve LLAMA_PORT now that _env_get exists: the installer persists the
+# actual bind port to docker/.env (it may differ from 7474), so every health
+# probe in this script must use the same port compose binds, not a hardcoded 7474.
+LLAMA_PORT="${LLAMA_PORT:-$(_env_get LLAMA_PORT)}"
+LLAMA_PORT="${LLAMA_PORT:-7474}"
+
 _env_set() {
     local key="$1" val="$2" env_file="$DOCKER_DIR/.env"
     mkdir -p "$(dirname "$env_file")"; touch "$env_file"
@@ -1548,13 +1554,32 @@ cmd_agent_sandbox() {
             # scripts/strata.sh) already handled this. Nothing llama to do here.
             true
         else
-            if ! curl -sf "http://localhost:7474/health" &>/dev/null; then
-                info "llama-server not running — starting it now..."
+            # Probe the port compose actually binds (resolved from docker/.env
+            # above) — a hardcoded 7474 declares a running server dead when a
+            # previous install moved the host mapping.
+            local _hport="$LLAMA_PORT"
+            if curl -sf "http://localhost:${_hport}/health" &>/dev/null; then
+                # If settings.json points at a different port than the live
+                # server, the config is stale — say so instead of silently
+                # waiting on the wrong door.
+                local _ep _eport
+                _ep="${cfg_endpoint#*://}"; _ep="${_ep%%/*}"
+                _eport="${_ep##*:}"
+                if [[ "$_eport" =~ ^[0-9]+$ && "$_eport" != "$_hport" ]]; then
+                    warn "llama-server is healthy on port ${_hport} but llm.endpoint says :${_eport} — updating settings"
+                    if command -v jq &>/dev/null && [[ -f "$settings" ]]; then
+                        jq --arg e "http://127.0.0.1:${_hport}" '.llm.endpoint = $e' "$settings" > "$settings.tmp" && mv "$settings.tmp" "$settings"
+                        cfg_endpoint="http://127.0.0.1:${_hport}"
+                    fi
+                fi
+            fi
+            if ! curl -sf "http://localhost:${_hport}/health" &>/dev/null; then
+                info "llama-server not responding on port ${_hport} — restarting..."
                 docker compose up -d llama-server
                 info "Waiting for llama-server to be healthy (model load can take 1-2 min)..."
                 for i in $(seq 1 36); do
-                    if curl -sf "http://localhost:7474/health" &>/dev/null; then
-                        ok "llama-server is healthy"
+                    if curl -sf "http://localhost:${_hport}/health" &>/dev/null; then
+                        ok "llama-server is healthy on port ${_hport}"
                         break
                     fi
                     sleep 5
@@ -1584,6 +1609,12 @@ cmd_agent_sandbox() {
             export OPENMONO_ENDPOINT="http://host.docker.internal:${_port}${_path}"
         else
             _port="${_port:-7474}"
+            # llama.cpp listens on 7474 INSIDE the container regardless of the
+            # host mapping (compose maps LLAMA_PORT->7474). If the endpoint
+            # names the host-side port, translate it to the internal one.
+            if [[ "$_port" == "$LLAMA_PORT" && "$LLAMA_PORT" != "7474" ]]; then
+                _port=7474
+            fi
             export OPENMONO_ENDPOINT="http://llama-server:${_port}${_path}"
         fi
     else

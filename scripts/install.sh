@@ -1293,17 +1293,34 @@ if [ "$OPENMONO_ROLE" != "agent" ] && [ "$INFERENCE_BACKEND" != "strata" ]; then
     }
 
     if port_in_use "$LLAMA_PORT"; then
-        warn "Port ${LLAMA_PORT} is in use"
-        if command -v ss &>/dev/null; then
-            ss -tlnp 2>/dev/null | grep ":${LLAMA_PORT} " | head -1 | sed 's/^/     /' || true
+        # If the port is held by our own llama-server container (this or a
+        # previous install), stop it and restart on the SAME port — switching
+        # ports to dodge the very service we are about to start is pointless.
+        _port_holder=""
+        if command -v docker &>/dev/null; then
+            _port_holder="$(docker ps --filter 'name=llama-server' --format '{{.Names}}' 2>/dev/null | head -1 || true)"
         fi
-        for try in 8081 8082 8083 8084 8085 9080; do
-            if ! port_in_use "$try"; then
-                LLAMA_PORT="$try"
-                info "Using port $LLAMA_PORT instead"
-                break
+        if [ -n "$_port_holder" ]; then
+            info "Port ${LLAMA_PORT} is held by an existing llama-server container — restarting on the same port"
+            docker stop "$_port_holder" >/dev/null 2>&1 || true
+            for _i in $(seq 1 10); do
+                port_in_use "$LLAMA_PORT" || break
+                sleep 1
+            done
+        fi
+        if port_in_use "$LLAMA_PORT"; then
+            warn "Port ${LLAMA_PORT} is in use by another process"
+            if command -v ss &>/dev/null; then
+                ss -tlnp 2>/dev/null | grep ":${LLAMA_PORT} " | head -1 | sed 's/^/     /' || true
             fi
-        done
+            for try in 8081 8082 8083 8084 8085 9080; do
+                if ! port_in_use "$try"; then
+                    LLAMA_PORT="$try"
+                    info "Using port $LLAMA_PORT instead"
+                    break
+                fi
+            done
+        fi
     fi
 
     export LLAMA_PORT
