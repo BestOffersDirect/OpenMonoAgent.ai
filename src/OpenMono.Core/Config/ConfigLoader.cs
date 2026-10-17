@@ -35,6 +35,15 @@ public static class ConfigLoader
         };
 
         var userConfigPath = Path.Combine(config.DataDirectory, "settings.json");
+        // OPENMONO_DATA_DIR must be applied BEFORE the merge below, otherwise a
+        // relocated (or test-isolated) data directory is ignored for the user
+        // settings file and the machine-global ~/.openmono/settings.json is
+        // merged unconditionally. ApplyEnvironmentOverrides re-applies it later
+        // for consumers that read config.DataDirectory post-load.
+        var dataDirOverride = Environment.GetEnvironmentVariable("OPENMONO_DATA_DIR");
+        if (!string.IsNullOrEmpty(dataDirOverride))
+            config.DataDirectory = dataDirOverride;
+        userConfigPath = Path.Combine(config.DataDirectory, "settings.json");
         MergeFromFile(config, userConfigPath, warn);
 
         var projectConfigPath = Path.Combine(cwd, ".openmono", "settings.json");

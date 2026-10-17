@@ -193,6 +193,29 @@ public class ConfigLoaderTests : IDisposable
     }
 
     [Fact]
+    public void Load_WebSearchScrapeAsBooleans_MergesWithoutWarning()
+    {
+        // 'openmono config set web.search true' writes a JSON boolean, but
+        // WebConfig.Search/Scrape are strings. A bool must not throw and skip
+        // the whole file (which previously dropped llm.endpoint as well).
+        WriteProjectSettings("""
+        {
+            "llm": { "endpoint": "http://relay.example.ai:11910" },
+            "web": { "gateway": "http://host.docker.internal:7480", "search": true, "scrape": false }
+        }
+        """);
+
+        var warnings = new List<string>();
+        var config = ConfigLoader.Load(_tempDir, warn: w => warnings.Add(w));
+
+        warnings.Should().NotContain(w => w.Contains("Malformed"));
+        config.Llm.Endpoint.Should().Be("http://relay.example.ai:11910");
+        config.Web.Gateway.Should().Be("http://host.docker.internal:7480");
+        config.Web.SearchEnabled.Should().BeTrue();
+        config.Web.ScrapeEnabled.Should().BeFalse();
+    }
+
+    [Fact]
     public void Load_MergesPermissions_Additively()
     {
         var projectDir = Path.Combine(_tempDir, ".openmono");

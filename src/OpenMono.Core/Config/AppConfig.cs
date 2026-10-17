@@ -1,3 +1,5 @@
+using System;
+using System.Globalization;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using OpenMono.Acp;
@@ -118,7 +120,14 @@ public class LlmConfig
 public sealed class WebConfig
 {
     public string? Gateway { get; set; }
+
+    // The launcher (openmono config set web.search true) writes JSON booleans,
+    // but this model is string-based (Truthy()). Read either form so a boolean
+    // never throws and skips the whole settings file.
+    [JsonConverter(typeof(FlexibleBoolToStringConverter))]
     public string? Search { get; set; }
+
+    [JsonConverter(typeof(FlexibleBoolToStringConverter))]
     public string? Scrape { get; set; }
 
     public bool? SearchEnabled => Truthy(Search);
@@ -135,6 +144,29 @@ public sealed class WebConfig
         string.IsNullOrWhiteSpace(value)
             ? null
             : value.Trim().ToLowerInvariant() is "1" or "true" or "yes" or "on";
+}
+
+// Accepts a JSON string, boolean, or number and stores it as a string, so a
+// boolean written by 'openmono config set web.search true' deserializes cleanly
+// instead of throwing (which would skip the entire settings file).
+public sealed class FlexibleBoolToStringConverter : JsonConverter<string?>
+{
+    public override string? Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+        => reader.TokenType switch
+        {
+            JsonTokenType.True  => "true",
+            JsonTokenType.False => "false",
+            JsonTokenType.Number => reader.TryGetInt64(out var l) ? l.ToString(CultureInfo.InvariantCulture) : reader.GetDouble().ToString(CultureInfo.InvariantCulture),
+            JsonTokenType.String => reader.GetString(),
+            JsonTokenType.Null   => null,
+            _ => throw new JsonException($"Expected string, boolean, or number for web setting (got {reader.TokenType})."),
+        };
+
+    public override void Write(Utf8JsonWriter writer, string? value, JsonSerializerOptions options)
+    {
+        if (value is null) writer.WriteNullValue();
+        else writer.WriteStringValue(value);
+    }
 }
 
 public sealed class PermissionConfig
