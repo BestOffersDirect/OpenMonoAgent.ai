@@ -12,10 +12,11 @@ namespace OpenMono.HostBridge;
 /// <c>pair</c> — without a live token the daemon fails closed.
 ///
 /// Shapes (one record each, so client and server can never drift):
-///   POST /pair   { secret, session_id, workdir }      -> PairResponse
-///   POST /exec   { token, session_id, request }       -> ExecResponse
-///   POST /revoke { token, session_id }                -> StatusResponse
-///   GET  /ping                                       -> PingResponse
+///   POST /pair    { secret, session_id, workdir }      -> PairResponse
+///   POST /exec    { token, session_id, request }       -> ExecResponse
+///   POST /revoke  { token, session_id }                -> StatusResponse
+///   POST /verify  { token, session_id }                -> VerifyResponse
+///   GET  /ping                                         -> PingResponse
 /// </summary>
 public sealed record PairRequest(
     [property: JsonPropertyName("secret")] string Secret,
@@ -50,6 +51,14 @@ public sealed record RevokeRequest(
 public sealed record StatusResponse(
     [property: JsonPropertyName("ok")] bool Ok,
     [property: JsonPropertyName("error")] string? Error = null);
+
+public sealed record VerifyResponse(
+    [property: JsonPropertyName("ok")] bool Ok,
+    [property: JsonPropertyName("daemon")] bool Daemon,
+    // True only when THIS session+token pair still matches a live pairing.
+    // The global /status paired-count cannot say that: a dead token next to
+    // another session's live pairing reads "paired" there and lies here.
+    [property: JsonPropertyName("live")] bool Live = false);
 
 public sealed record PingResponse(
     [property: JsonPropertyName("ok")] bool Ok,
@@ -190,6 +199,14 @@ public sealed class HostDaemonClient : IDisposable
     public Task<StatusResponse> RevokeAsync(RevokeRequest request, CancellationToken ct) =>
         PostJsonAsync<RevokeRequest, StatusResponse>("/revoke", request, ct,
             new StatusResponse(false, Error: "daemon unreachable"));
+
+    /// <summary>Ask the daemon whether this exact session+token is still a
+    /// live pairing. Old daemons answer 404 (not found), which deserializes to
+    /// Live=false with Daemon=false — callers must treat "daemon answered but
+    /// no /verify route" as unknown, not dead.</summary>
+    public Task<VerifyResponse> VerifyAsync(RevokeRequest request, CancellationToken ct) =>
+        PostJsonAsync<RevokeRequest, VerifyResponse>("/verify", request, ct,
+            new VerifyResponse(false, Daemon: false));
 
     // ── Admin surface (host-side CLI; pair secret in a header) ──
     // Pair requests wait on the operator for up to 2 daemon minutes, so the

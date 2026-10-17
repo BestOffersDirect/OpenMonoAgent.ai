@@ -1256,7 +1256,7 @@ cmd_host() {
             _host_daemon_start || return 1
             ok "host-bridge daemon is running on 127.0.0.1:${HOST_DAEMON_PORT}"
             info "Pair secret: ~/.openmono/host-bridge.json (0600) · audit: ~/.openmono/logs/"
-            info "In the sandbox agent, connect with: /host on (pairs silently — agents started while this daemon is up get a one-shot invite automatically)"
+            info "In the sandbox agent, connect with: /host on (pairs silently — agents started while this daemon is up get an invite automatically)"
             info "Approval is only needed for agents started BEFORE this daemon: openmono host requests && openmono host approve <id>"
             info "Stop with: openmono host stop"
             ;;
@@ -1322,7 +1322,7 @@ cmd_host() {
             fi
             ;;
         invite)
-            # Mint a one-shot pairing invite for a manual sandbox launch:
+            # Mint a pairing invite for a manual sandbox launch (TTL-bounded):
             #   export OPENMONO_HOST_INVITE=$(openmono host invite)
             if ! _host_daemon_alive; then err "no daemon running on port $HOST_DAEMON_PORT"; return 1; fi
             local secret inv
@@ -1333,7 +1333,7 @@ cmd_host() {
                 | jq -r '.invite // empty' 2>/dev/null)"
             if [[ -z "$inv" ]]; then err "daemon did not issue an invite (old daemon version?)"; return 1; fi
             printf '%s\n' "$inv"
-            info "single-use invite (TTL-limited) — launch with: OPENMONO_HOST_INVITE=<above> docker compose run ..."
+            info "TTL-bounded invite (every session in the run may pair with it) — launch with: OPENMONO_HOST_INVITE=<above> docker compose run ..."
             ;;
         approve|deny)
             local sid="${2:-}"
@@ -1490,7 +1490,8 @@ cmd_agent_host() {
         err "Check $HOST_DAEMON_LOG"
         exit 1
     fi
-    # Preferred path: a one-shot invite (single-use, TTL'd). If the daemon is
+    # Preferred path: a TTL-bounded invite (every session in the run may pair
+    # with it). If the daemon is
     # too old to have /admin/invite, fall back to the shared secret.
     invite="$(curl -sf --max-time 3 -X POST -d '' \
         -H "X-Pair-Secret: $secret" \
@@ -1728,7 +1729,7 @@ cmd_agent_sandbox() {
             -e "OPENMONO_HOST_DAEMON_URL=${OPENMONO_HOST_DAEMON_URL:-}"
             -e "OPENMONO_HOST_OS=${OPENMONO_HOST_OS:-}"
             -e "OPENMONO_HOST_WORKSPACE=${OPENMONO_HOST_WORKSPACE:-$WORKSPACE}")
-        # The invite (one-shot) is preferred; the pair secret never enters the
+        # The invite (TTL-bounded) is preferred; the pair secret never enters the
         # sandbox when the daemon supports /admin/invite.
         if [[ -n "${OPENMONO_HOST_INVITE:-}" ]]; then
             extra_env+=(-e "OPENMONO_HOST_INVITE=${OPENMONO_HOST_INVITE}")
@@ -1738,7 +1739,7 @@ cmd_agent_sandbox() {
     elif [[ "${OPENMONO_HOST_AUTO_INVITE:-1}" == "1" ]] \
         && curl -sf --max-time 2 "http://127.0.0.1:${HOST_DAEMON_PORT}/ping" &>/dev/null; then
         # Plain `openmono agent` with a daemon already running: mint a
-        # long-TTL one-shot invite (host-side, pair secret never leaves) and
+        # long-TTL invite (host-side, pair secret never leaves) and
         # inject it WITHOUT OPENMONO_HOST_MODE. Nothing pairs on boot — the
         # invite is consumed only when the user runs /host on or clicks the
         # extension button, which then pairs silently (no approve step).

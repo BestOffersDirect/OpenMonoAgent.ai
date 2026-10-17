@@ -98,21 +98,25 @@ public sealed class HostGateway
     }
 
     /// <summary>
-    /// True when the daemon side of this pairing is still alive. Tokens live
-    /// only in the daemon's memory, so a daemon restart silently invalidates
-    /// every pairing while IsPaired (a local flag) stays true — the chip then
-    /// reads HOST:ON and /host on would no-op against a dead token. Unreachable
-    /// daemon counts as live: exec fails closed with its own clear error, and
-    /// we do not revoke a pairing just because the network blipped.
+    /// True when the daemon side of THIS session's pairing is still alive.
+    /// Tokens live only in the daemon's memory, so a daemon restart silently
+    /// invalidates every pairing while IsPaired (a local flag) stays true —
+    /// the chip then reads HOST:ON and /host on would no-op against a dead
+    /// token. The check is per-token (/verify): the old global paired-count
+    /// lied when another session was still paired — this session's dead token
+    /// read "live" and every exec came back unpaired_or_bad_token. Two cases
+    /// still count as live so we never revoke a pairing on a network blip or
+    /// an old daemon without /verify: unreachable daemon, and daemon that
+    /// answered without the route. Exec fails closed either way.
     /// </summary>
     public async Task<bool> IsPairingLiveAsync(CancellationToken ct = default)
     {
         if (_token is null)
             return false;
-        var status = await _client.StatusAsync(ct);
-        if (!status.Daemon)
+        var verify = await _client.VerifyAsync(new RevokeRequest(_token, _sessionId), ct);
+        if (!verify.Daemon)
             return true;
-        return status.PairedSessions > 0;
+        return verify.Live;
     }
 
     /// <summary>Drop the pairing on the daemon and locally. Idempotent.</summary>

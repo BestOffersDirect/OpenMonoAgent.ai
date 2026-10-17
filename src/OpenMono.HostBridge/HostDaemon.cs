@@ -230,6 +230,13 @@ public sealed class HostDaemon : IAsyncDisposable
             return;
         }
 
+        if (method == "POST" && path == "/verify")
+        {
+            var req = await ReadJsonAsync<RevokeRequest>(ctx);
+            await HandleVerifyAsync(ctx, req);
+            return;
+        }
+
         if (path.StartsWith("/admin/", StringComparison.Ordinal))
         {
             await HandleAdminAsync(ctx, method, path);
@@ -403,8 +410,10 @@ public sealed class HostDaemon : IAsyncDisposable
         // Path 1: permanent pair secret (host-side admin + launcher back-compat).
         var viaSecret = !string.IsNullOrEmpty(_pairSecret) && req.Secret == _pairSecret;
 
-        // Path 2: one-shot launcher invite (single-use, TTL'd). Preferred over
-        // the secret: leaking it grants exactly one pairing, then it is dead.
+        // Path 2: launcher invite (TTL-bounded; valid for every pair from the
+        // run that received it, including re-pairs). Preferred over the secret:
+        // leaking it grants pairings only for the life of the invite, then it
+        // is dead.
         var viaInvite = !viaSecret && ConsumeInvite(req.Invite);
 
         // A wrong non-empty secret is an explicit refusal — never fall through
@@ -557,6 +566,33 @@ public sealed class HostDaemon : IAsyncDisposable
         WriteJson(ctx, 200, new StatusResponse(removed, removed ? null : "no_such_session_or_token"));
     }
 
+    /// <summary>
+    /// Liveness check for one session's own token (POST /verify). Unlike the
+    /// global /status paired-count, this validates the exact pairing the caller
+    /// holds: a dead or rotated token answers live=false even while other
+    /// sessions remain paired. A successful verify counts as activity and
+    /// refreshes the idle clock, like exec does.
+    /// </summary>
+    private async Task HandleVerifyAsync(HttpListenerContext ctx, RevokeRequest? req)
+    {
+        if (req is null || string.IsNullOrWhiteSpace(req.SessionId) || string.IsNullOrWhiteSpace(req.Token))
+        {
+            WriteJson(ctx, 200, new VerifyResponse(true, Daemon: true, Live: false));
+            return;
+        }
+        var live = VerifyToken(req.SessionId, req.Token);
+        WriteJson(ctx, 200, new VerifyResponse(true, Daemon: true, Live: live));
+    }
+
+    /// <summary>Same session+token match as exec (so liveness never lies when
+    /// exec would still fail), but WITHOUT the idle/hard-cap expiry side
+    /// effects: expiry must stay exec's decision, fail closed.</summary>
+    private bool VerifyToken(string sessionId, string token)
+    {
+        lock (_sessionsLock)
+            return _sessions.TryGetValue(sessionId, out var s) && s.Token == token;
+    }
+
     private bool ValidateToken(string? sessionId, string? token, out string workDir)
     {
         workDir = _workDir;
@@ -599,8 +635,10 @@ public sealed class HostDaemon : IAsyncDisposable
         return Convert.ToHexString(bytes);
     }
 
-    /// <summary>Mint a one-shot pairing invite (launcher path). Single-use:
-    /// the first pair that presents it consumes it; TTL caps the rest.</summary>
+    /// <summary>Mint a pairing invite (launcher path). The invite is
+    /// TTL-bounded: it stays valid for every pair from the run that received
+    /// it (re-pairs after a daemon restart included), and dies at its TTL.
+    /// It never grants pairing past the TTL, whatever its use count.</summary>
     public string CreateInvite(TimeSpan? ttlOverride = null)
     {
         var invite = NewToken();
@@ -620,8 +658,12 @@ public sealed class HostDaemon : IAsyncDisposable
         if (string.IsNullOrWhiteSpace(invite)) return false;
         lock (_invitesLock)
         {
+            // TTL-bounded, not single-use: a launcher invite is handed to one
+            // container run, and every session in that run may pair with it
+            // until it expires. Consuming it after first use made every later
+            // session in the same container fall into the approval lane with
+            // no credential — pair_timeout, host mode stuck "off".
             if (!_invites.TryGetValue(invite, out var expires)) return false;
-            _invites.Remove(invite);
             return expires >= DateTime.UtcNow;
         }
     }

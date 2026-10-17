@@ -8,7 +8,7 @@ using OpenMono.Session;
 namespace OpenMono.Tests.HostBridge;
 
 /// <summary>
-/// Pairing security: one-shot invites, operator-approval pair requests, the
+/// Pairing security: TTL-bounded invites, operator-approval pair requests, the
 /// pair_auto lane, admin endpoints, and hard token lifetimes. Same real-daemon
 /// harness as HostGatewayTests.
 /// </summary>
@@ -41,11 +41,14 @@ public class PairSecurityTests
     // ── One-shot invites ────────────────────────────────────────────
 
     [Fact]
-    public async Task Invite_PairsOnceAndDiesAfterUse()
+    public async Task Invite_PairsEverySessionInRunWhileLive()
     {
-        // Single-use: the same invite never opens a second pairing, for any
-        // session id — the second pair request falls into the approval lane
-        // and times out (tiny wait) denied.
+        // The live bug this guards: a launcher hands ONE invite to one container
+        // run, and every session in that run pairs with it. Consuming the invite
+        // on first use left every later session in the same container with no
+        // credential — the daemon sent them to the approval lane (pair_timeout)
+        // and host mode read "off" until the daemon was restarted. The invite is
+        // now TTL-bounded, not single-use: it keeps pairing until it expires.
         var config = Config();
         config.PairRequestWaitSeconds = 1;
         await using var daemon = new HostDaemon(config, new HostIdentity("", SudoPolicy.Ask, null),
@@ -56,13 +59,29 @@ public class PairSecurityTests
         var gw1 = new HostGateway($"http://127.0.0.1:{daemon.Port}", "inv-a", TempWorkDir(), invite: invite);
         (await gw1.PairAsync()).Should().BeNull();
 
-        // Single-use: the same invite never opens a second pairing, for any
-        // session id — the second pair request falls into the approval lane
-        // and times out (tiny wait) denied.
+        // Second session, same invite, still live: pairs silently (no approval
+        // lane, no timeout) — this is what the single-use behavior broke.
         var gw2 = new HostGateway($"http://127.0.0.1:{daemon.Port}", "inv-b", TempWorkDir(), invite: invite);
-        var error = await gw2.PairAsync();
+        (await gw2.PairAsync()).Should().BeNull();
+        gw2.IsPaired.Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task Invite_BogusValueFallsToApprovalLane()
+    {
+        // A TTL-bounded invite is only valid when the daemon issued it. A made-up
+        // value is not a credential: with no secret it falls into the approval
+        // lane, which (tiny wait) times out fail-closed — it never pairs.
+        var config = Config();
+        config.PairRequestWaitSeconds = 1;
+        await using var daemon = new HostDaemon(config, new HostIdentity("", SudoPolicy.Ask, null),
+            TempWorkDir(), GetFreePort());
+        daemon.Start();
+
+        var gw = new HostGateway($"http://127.0.0.1:{daemon.Port}", "bogus", TempWorkDir(), invite: "not-a-real-invite");
+        var error = await gw.PairAsync();
         error.Should().NotBeNull();
-        gw2.IsPaired.Should().BeFalse();
+        gw.IsPaired.Should().BeFalse();
     }
 
     [Fact]

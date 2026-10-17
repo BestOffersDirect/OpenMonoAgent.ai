@@ -324,7 +324,48 @@ public class HostGatewayTests : IAsyncLifetime
         answer.Should().Contain("pairing is stale");
     }
 
-    // ── Daemon status + idle-token expiry ───────────────────────────
+    [Fact]
+    public async Task IsPairingLive_DeadTokenReadsStaleEvenWithAnotherSessionPaired()
+    {
+        // The global paired-count liveness bug: session A is paired, session B
+        // is paired then revoked. The old IsPairingLiveAsync asked the daemon
+        // "any paired sessions?" (yes — A), so B's dead token read "live" and
+        // /host on no-opped while every exec failed unpaired_or_bad_token. The
+        // per-token /verify check must report B stale while A stays live.
+        var a = NewGateway("live-a");
+        var b = NewGateway("dead-b");
+        (await a.PairAsync()).Should().BeNull();
+        (await b.PairAsync()).Should().BeNull();
+
+        // Kill B's daemon-side pairing, leaving A paired.
+        _daemon.RevokeSession("dead-b");
+
+        (await b.IsPairingLiveAsync()).Should().BeFalse("B's token is dead even though A is still paired");
+        (await a.IsPairingLiveAsync()).Should().BeTrue("A's pairing is untouched");
+    }
+
+    [Fact]
+    public async Task IsPairingLive_VerifyRoundTripAfterRestartReadsStale()
+    {
+        // A fresh gateway pair is live; after the daemon behind it is disposed
+        // (a restart drops every in-memory token), a re-verify of the same
+        // gateway must read stale — the chip and /host on then offer to re-pair
+        // instead of no-opping on a dead token.
+        await using var daemon = new HostDaemon(
+            new BridgeConfig { PairSecret = Secret, HostExec = new HostExecPolicy { Default = "allow", Deny = [.. HostExecPolicy.SampleDeny] } },
+            new HostIdentity("", SudoPolicy.Ask, null), _workDir, GetFreePort());
+        daemon.Start();
+        var gw = new HostGateway($"http://127.0.0.1:{daemon.Port}", "restart-me", _workDir, Secret);
+        (await gw.PairAsync()).Should().BeNull();
+        (await gw.IsPairingLiveAsync()).Should().BeTrue();
+
+        // Simulate a daemon restart: revoke the session (new daemon = empty
+        // session table; revoke is the closest in-process stand-in).
+        daemon.RevokeSession("restart-me");
+        (await gw.IsPairingLiveAsync()).Should().BeFalse();
+    }
+
+    // ── Daemon status + idle-token expiry ───────────────────────
 
     [Fact]
     public async Task Status_Endpoint_ReportsDaemonWithoutLeakingTokens()
