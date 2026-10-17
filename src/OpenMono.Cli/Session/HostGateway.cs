@@ -61,7 +61,16 @@ public sealed class HostGateway
 
         var ping = await _client.PingAsync(ct);
         if (!ping.Daemon)
-            return $"host daemon not reachable at {BaseUrl} — start it on the host machine: openmono host";
+        {
+            // Three distinct failures hide behind "daemon not here": nothing
+            // listening, a route that answers but is not the daemon (404
+            // prefix mismatch, port collision), and a daemon that is down.
+            // Saying which one we see is what makes the error actionable.
+            return ping.Reachable
+                ? $"something answers HTTP at {BaseUrl} but it is not the host-bridge daemon " +
+                  "(wrong port, or the request is being answered by another service)"
+                : $"host daemon not reachable at {BaseUrl} — start it on the host machine: openmono host";
+        }
 
         var resp = await _client.PairAsync(new PairRequest(secret ?? "", _sessionId, WorkDir, _invite), ct);
         if (!resp.Ok || string.IsNullOrEmpty(resp.Token))
@@ -86,6 +95,24 @@ public sealed class HostGateway
         _grantUntilUtc = null;
         _denyAll = false;
         return null;
+    }
+
+    /// <summary>
+    /// True when the daemon side of this pairing is still alive. Tokens live
+    /// only in the daemon's memory, so a daemon restart silently invalidates
+    /// every pairing while IsPaired (a local flag) stays true — the chip then
+    /// reads HOST:ON and /host on would no-op against a dead token. Unreachable
+    /// daemon counts as live: exec fails closed with its own clear error, and
+    /// we do not revoke a pairing just because the network blipped.
+    /// </summary>
+    public async Task<bool> IsPairingLiveAsync(CancellationToken ct = default)
+    {
+        if (_token is null)
+            return false;
+        var status = await _client.StatusAsync(ct);
+        if (!status.Daemon)
+            return true;
+        return status.PairedSessions > 0;
     }
 
     /// <summary>Drop the pairing on the daemon and locally. Idempotent.</summary>

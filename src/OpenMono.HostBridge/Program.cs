@@ -184,8 +184,11 @@ if (options.Daemon)
             "(set openmono config host.sudo_policy allow to enable them for unattended host mode).");
 
     using var daemonCts = new CancellationTokenSource();
-    Console.CancelKeyPress += (_, e) => { e.Cancel = true; daemonCts.Cancel(); };
-    AppDomain.CurrentDomain.ProcessExit += (_, _) => daemonCts.Cancel();
+    Console.CancelKeyPress += (_, e) => { e.Cancel = true; try { daemonCts.Cancel(); } catch (ObjectDisposedException) { } };
+    // ProcessExit can fire during shutdown after the CTS is already disposed
+    // (e.g. the port-busy early return) — an unguarded Cancel() crashed the
+    // daemon with an unhandled ObjectDisposedException in the past.
+    AppDomain.CurrentDomain.ProcessExit += (_, _) => { try { daemonCts.Cancel(); } catch (ObjectDisposedException) { } };
 
     var daemonBinds = options.DaemonBinds.Count > 0
         ? options.DaemonBinds.ToArray()

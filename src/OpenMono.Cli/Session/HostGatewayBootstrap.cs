@@ -78,6 +78,14 @@ public static class HostGatewayBootstrap
     public static string ResolveInvite() =>
         (Environment.GetEnvironmentVariable(InviteEnv) ?? "").Trim();
 
+    /// <summary>
+    /// True when the launcher handed this sandbox a pairing credential (invite
+    /// or secret). Without one, pairing enters request mode: the daemon parks
+    /// the request until an operator runs `openmono host approve`.
+    /// </summary>
+    public static bool HasCredential() =>
+        !string.IsNullOrWhiteSpace(ResolveSecret()) || !string.IsNullOrWhiteSpace(ResolveInvite());
+
     public static string ResolveWorkDir()
     {
         var wd = Environment.GetEnvironmentVariable(WorkDirEnv);
@@ -144,11 +152,13 @@ public static class HostGatewayBootstrap
     private static async Task<(HostGateway? Gateway, string? Error)> PairCoreAsync(SessionState session, CancellationToken ct)
     {
         var existing = HostGatewayRegistry.Get(session.Id);
-        if (existing is { IsPaired: true })
+        if (existing is { IsPaired: true } && await existing.IsPairingLiveAsync(ct))
             return (existing, null);
 
         if (existing is not null)
         {
+            // Unpaired or stale (daemon restarted — tokens are in-memory):
+            // unregister so the fresh pairing below replaces the dead one.
             HostGatewayRegistry.Unregister(session.Id);
         }
 
@@ -159,6 +169,14 @@ public static class HostGatewayBootstrap
         // (openmono host approve). This is the request-mode entry point.
 
         var gateway = new HostGateway(ResolveBaseUrl(), session.Id, ResolveWorkDir(), secret, invite);
+        if (string.IsNullOrWhiteSpace(secret) && string.IsNullOrWhiteSpace(invite))
+        {
+            // Request mode: PairAsync now blocks up to the daemon's approval
+            // timeout. Say so up front, with the exact approve command, so
+            // the wait is never mistaken for a hang.
+            Utils.Log.Info($"[HOSTGATEWAY] pair request (no credential) for session {session.Id} — " +
+                $"operator must run: openmono host approve {session.Id}");
+        }
         var error = await gateway.PairAsync(ct: ct);
         if (error is not null)
             return (null, error);

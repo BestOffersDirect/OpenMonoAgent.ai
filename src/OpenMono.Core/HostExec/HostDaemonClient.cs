@@ -54,7 +54,11 @@ public sealed record StatusResponse(
 public sealed record PingResponse(
     [property: JsonPropertyName("ok")] bool Ok,
     [property: JsonPropertyName("daemon")] bool Daemon,
-    [property: JsonPropertyName("version")] string Version = "");
+    [property: JsonPropertyName("version")] string Version = "",
+    // True when something answered over HTTP, even with the wrong body. Lets
+    // the caller tell "no route to the daemon" (404 prefix mismatch, a proxy,
+    // a port collision) apart from "nothing is listening".
+    [property: JsonPropertyName("reachable")] bool Reachable = false);
 
 public sealed record DaemonStatusResponse(
     [property: JsonPropertyName("ok")] bool Ok,
@@ -140,11 +144,22 @@ public sealed class HostDaemonClient : IDisposable
         try
         {
             using var resp = await _http.SendAsync(NewRequest(HttpMethod.Get, "/ping"), HttpCompletionOption.ResponseContentRead, ct);
-            return await ReadJsonAsync<PingResponse>(resp, ct) ?? new PingResponse(false, Daemon: false);
+            // Any HTTP answer means the port is served, even a 404 from an
+            // HttpListener prefix mismatch or a different service entirely.
+            // That is a broken route, not a dead daemon; callers need to say
+            // which one they are looking at.
+            if (!resp.IsSuccessStatusCode)
+                return new PingResponse(false, Daemon: false, Reachable: true);
+            var ping = await ReadJsonAsync<PingResponse>(resp, ct);
+            if (ping is null || !ping.Daemon)
+                return new PingResponse(false, Daemon: false, Reachable: true);
+            return ping with { Reachable = true };
         }
-        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or JsonException)
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
         {
-            return new PingResponse(false, Daemon: false);
+            // Nothing answered at the TCP/HTTP level: refused, no route, or
+            // the connect timed out.
+            return new PingResponse(false, Daemon: false, Reachable: false);
         }
     }
 

@@ -434,6 +434,58 @@ public class HostGatewayTests : IAsyncLifetime
         gw.BuildStandingOrders().Should().BeNull();
     }
 
+    // ── Daemon restart = stale pairing (the /host on deadlock) ───────
+
+    [Fact]
+    public async Task DaemonRestart_PairingIsStale_AndRePairRecovers()
+    {
+        // Session tokens live only in daemon memory: a restart invalidates the
+        // agent's token while IsPaired (a local flag) stays true. The gateway
+        // must report the pairing as not live, and re-pairing must recover —
+        // otherwise /host on no-ops on the dead token forever.
+        var port = GetFreePort();
+        var gw = new HostGateway($"http://127.0.0.1:{port}", "gw-restart", _workDir, Secret);
+        await using (var daemon = new HostDaemon(
+            new BridgeConfig { PairSecret = Secret, HostExec = new HostExecPolicy { Default = "allow", Deny = [.. HostExecPolicy.SampleDeny] } },
+            new HostIdentity("", SudoPolicy.Ask, null), _workDir, port))
+        {
+            daemon.Start();
+            (await gw.PairAsync()).Should().BeNull();
+            (await gw.IsPairingLiveAsync()).Should().BeTrue();
+
+            await gw.RunAsync(
+                new HostExecRequest("echo before-restart", null, false, false),
+                (_, _, _) => Task.FromResult(HostConsentDecision.AllowOnce),
+                CancellationToken.None);
+        }
+
+        // Daemon went down and came back on the same port: the old token died
+        // with it, but the gateway's local IsPaired flag never noticed.
+        // While the daemon is unreachable we do NOT call the pairing dead
+        // (a network blip must not revoke it) — exec fails closed anyway.
+        (await gw.IsPairingLiveAsync()).Should().BeTrue();
+
+        await using (var daemon = new HostDaemon(
+            new BridgeConfig { PairSecret = Secret, HostExec = new HostExecPolicy { Default = "allow", Deny = [.. HostExecPolicy.SampleDeny] } },
+            new HostIdentity("", SudoPolicy.Ask, null), _workDir, port))
+        {
+            daemon.Start();
+            // The restarted daemon answers /status but knows zero sessions:
+            // the pairing is stale even though IsPaired is still true.
+            gw.IsPaired.Should().BeTrue();
+            (await gw.IsPairingLiveAsync()).Should().BeFalse();
+
+            // /host on's recovery path: drop the stale gateway, pair fresh.
+            (await gw.PairAsync()).Should().BeNull();
+            (await gw.IsPairingLiveAsync()).Should().BeTrue();
+            var answer = await gw.RunAsync(
+                new HostExecRequest("echo after-restart", null, false, false),
+                (_, _, _) => Task.FromResult(HostConsentDecision.AllowOnce),
+                CancellationToken.None);
+            answer.Should().Contain("after-restart");
+        }
+    }
+
     // ── Container → loopback daemon Host-header routing ─────────────
 
     [Theory]

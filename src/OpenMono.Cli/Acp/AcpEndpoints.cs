@@ -166,6 +166,14 @@ public static class AcpEndpoints
         if (action == "on")
         {
             var gateway = HostGatewayRegistry.Get(session.Id);
+            if (gateway is { IsPaired: true } && !await gateway.IsPairingLiveAsync(ct))
+            {
+                // Stale token (daemon restarted): the local flag says ON but
+                // the daemon would reject every exec. Drop it and re-pair
+                // below instead of no-opping on the dead pairing.
+                HostGatewayRegistry.Unregister(session.Id);
+                gateway = null;
+            }
             if (gateway is not { IsPaired: true })
             {
                 var (paired, error) = await HostGatewayBootstrap.TryPairAsync(session.State, ct);

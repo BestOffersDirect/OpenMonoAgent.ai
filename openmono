@@ -1202,6 +1202,13 @@ _host_daemon_stop_owned() {
     # daemon the user started deliberately with `openmono host daemon`.
     [[ "${_HOST_DAEMON_OWNED:-}" == "1" ]] || return 0
     _HOST_DAEMON_OWNED=0
+    # Daemon session tokens live in memory: killing it silently invalidates the
+    # pairing of every OTHER running sandbox (their agent then reads HOST:ON
+    # against a dead token). If other agent containers are still up, leave the
+    # shared daemon running; it idles harmlessly.
+    if [[ "$(docker ps --filter 'label=com.docker.compose.service=agent' --filter status=running -q 2>/dev/null | wc -l | tr -d ' ')" != "0" ]]; then
+        return 0
+    fi
     if [[ -f "$HOST_DAEMON_PIDFILE" ]]; then
         local pid
         pid="$(cat "$HOST_DAEMON_PIDFILE" 2>/dev/null)" || true
