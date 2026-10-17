@@ -1225,9 +1225,8 @@ cmd_host() {
             _host_daemon_start || return 1
             ok "host-bridge daemon is running on 127.0.0.1:${HOST_DAEMON_PORT}"
             info "Pair secret: ~/.openmono/host-bridge.json (0600) · audit: ~/.openmono/logs/"
-            info "In the sandbox agent, connect with: /host on"
-            info "Then approve the pairing request on the host: openmono host requests && openmono host approve <id>"
-            info "(Or launch with an invite — no approval step: OPENMONO_HOST_INVITE=\$(openmono host invite) openmono agent)"
+            info "In the sandbox agent, connect with: /host on (pairs silently — agents started while this daemon is up get a one-shot invite automatically)"
+            info "Approval is only needed for agents started BEFORE this daemon: openmono host requests && openmono host approve <id>"
             info "Stop with: openmono host stop"
             ;;
         stop)
@@ -1242,8 +1241,25 @@ cmd_host() {
                     err "pidfile exists but process $pid is not running (cleaned up)"
                 fi
             elif _host_daemon_alive; then
-                err "a daemon is reachable on port $HOST_DAEMON_PORT but has no pidfile — stop it manually (find/pkill host-bridge)"
-                return 1
+                # Daemon was started outside the launcher (no pidfile): find it
+                # by port. Safe to kill the listener only after /status proves
+                # a real host-bridge daemon answers there (a squatter on the
+                # port must never get killed by us).
+                if curl -sf --max-time 2 "http://127.0.0.1:${HOST_DAEMON_PORT}/status" 2>/dev/null \
+                    | jq -e '.daemon == true' &>/dev/null; then
+                    local pid
+                    pid="$(lsof -ti "tcp:${HOST_DAEMON_PORT}" -sTCP:LISTEN 2>/dev/null | head -1)" || true
+                    if [[ -n "$pid" ]] && kill "$pid" &>/dev/null; then
+                        sleep 1
+                        ok "host-bridge daemon stopped (pid $pid — it had no pidfile, started outside the launcher)"
+                    else
+                        err "daemon confirmed on port $HOST_DAEMON_PORT but its process could not be killed — stop it manually (pkill -f host-bridge)"
+                        return 1
+                    fi
+                else
+                    err "something answers on port $HOST_DAEMON_PORT but it is not the host-bridge daemon — not killing anything"
+                    return 1
+                fi
             else
                 info "no host-bridge daemon running"
             fi
