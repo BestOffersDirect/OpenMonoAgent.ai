@@ -1165,6 +1165,12 @@ _host_daemon_start() {
         err "Fix ownership with:  sudo chown -R \"$USER\" ~/.openmono/host-bridge"
     fi
     info "Starting host-bridge daemon on 127.0.0.1:${HOST_DAEMON_PORT} (log: $HOST_DAEMON_LOG)"
+    # The prereqs installer puts .NET under ~/.dotnet and wires it into rc
+    # files; a non-interactive shell never sources those, and the published
+    # apphost needs DOTNET_ROOT to find the runtime then.
+    if [[ -z "${DOTNET_ROOT:-}" && -x "$HOME/.dotnet/dotnet" ]]; then
+        export DOTNET_ROOT="$HOME/.dotnet"
+    fi
     if [[ "$kind" == "bin" ]]; then
         nohup "$target" --daemon --daemon-port "$HOST_DAEMON_PORT" --workdir "$(pwd)" \
             >>"$HOST_DAEMON_LOG" 2>&1 &
