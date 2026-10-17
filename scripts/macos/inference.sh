@@ -289,6 +289,22 @@ native_cmd_tunnel_rotate_key() {
     chmod 0600 "$docker_env"
     ok "LLAMA_API_KEY rotated in docker/.env"
 
+    # Mirror the key into settings.json so this machine's agent never dials
+    # with a stale key after a rotation (native llama-server starts from
+    # docker/.env; the agent reads llm.api_key from settings.json).
+    local settings="$HOME/.openmono/settings.json"
+    if [[ -f "$settings" ]] && command -v jq &>/dev/null; then
+        local stmp
+        stmp="$(mktemp)"
+        if jq --arg k "$new_key" '.llm = (.llm // {}) | .llm.api_key = $k' "$settings" > "$stmp" 2>/dev/null; then
+            mv "$stmp" "$settings"
+            ok "llm.api_key updated in settings.json"
+        else
+            rm -f "$stmp"
+            warn "Could not update settings.json — run: openmono config set llm.api_key $new_key"
+        fi
+    fi
+
     # Stop and restart llama-server with new key
     local pid proc_name
     pid=$(lsof -ti ":${port}" 2>/dev/null | head -1 || true)
@@ -324,10 +340,12 @@ native_cmd_tunnel_rotate_key() {
     printf "${BLUE}${BOLD}  API Key Rotated${NC}\n"
     printf "${BLUE}%s${NC}\n" "$(printf '─%.0s' $(seq 1 60))"
     echo ""
-    echo "  Run the following on the agent box to apply the new key:"
+    echo "  Run the following on REMOTE agent boxes to apply the new key:"
     echo ""
     [[ -n "$endpoint" ]] && \
         printf "    ${BOLD}openmono config set llm.endpoint  %s${NC}\n" "$endpoint"
     printf "    ${BOLD}openmono config set llm.api_key   %s${NC}\n" "$new_key"
+    [[ -f "$HOME/.openmono/settings.json" ]] && \
+        echo "  (this machine's settings.json was updated automatically; the lines above are for other agent boxes)"
     echo ""
 }
