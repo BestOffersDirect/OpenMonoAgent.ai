@@ -41,41 +41,16 @@ public static class HostGatewayBootstrap
         var host = parsed?.Host is { Length: > 0 } h ? h : (File.Exists("/.dockerenv") ? "host.docker.internal" : "127.0.0.1");
         var port = parsed is not null && parsed.Port > 0 ? parsed.Port : int.Parse(DefaultPort);
 
-        // On Linux hosts the daemon binds the docker bridge gateway IPs
-        // (docker0 / br-*), and managed HttpListener matches the Host: header
-        // against bound prefixes — so dialing the literal name
-        // host.docker.internal 404s even when routing works. Dial its resolved
-        // IPv4 instead; the Host header then matches the bridge the daemon
-        // bound. Only that well-known name is rewritten: any other explicit
-        // URL is used exactly as configured (an operator pointing at a dead
-        // URL must get the error they configured for, not a silent fallback).
-        //
-        // Gate on the HOST's OS, not the container's — the container is always
-        // Linux, so OperatingSystem.IsLinux() here is true on macOS hosts too
-        // and the rewrite silently misroutes them: Colima/Lima resolve
-        // host.docker.internal to the vmnet gateway (192.168.5.2), which
-        // dials a host address the loopback-bound daemon never accepts. On
-        // macOS leave the literal name alone: Docker Desktop's vpnkit and
-        // Lima's vmnet both route it to the host, and the client's
-        // Host-header override (HostDaemonClient) matches a bound prefix on
-        // either path.
-        var hostOs = (Environment.GetEnvironmentVariable(HostOsEnv) ?? "").Trim();
-        var hostIsLinux = hostOs.Length > 0
-            ? hostOs.Equals("Linux", StringComparison.OrdinalIgnoreCase)
-            : OperatingSystem.IsLinux(); // pre-OPENMONO_HOST_OS launcher: best guess
-        if (hostIsLinux && File.Exists("/.dockerenv") && host == "host.docker.internal")
-        {
-            try
-            {
-                var v4 = System.Net.Dns.GetHostAddresses("host.docker.internal")
-                    .FirstOrDefault(a => a.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork);
-                if (v4 is not null) host = v4.ToString();
-            }
-            catch
-            {
-                // Name unresolvable: pair will fail with a clear connect error.
-            }
-        }
+        // Keep the literal host.docker.internal on every runtime. Managed
+        // HttpListener dispatches by the Host: header, not by interface, and
+        // HostDaemonClient rewrites that header to 127.0.0.1:<port> — a bound
+        // prefix wherever the daemon runs. DNS handles the routing: the name
+        // resolves to host-gateway on Linux docker, vpnkit on Docker Desktop,
+        // vmnet on Colima/Lima. An earlier attempt to dial the resolved IPv4
+        // (gated on the host's OS) regressed this: when OPENMONO_HOST_OS was
+        // unset, the Linux best-guess fired on macOS too, dialing the vpnkit
+        // gateway with no header override — a 404 that reads as "daemon not
+        // reachable". Any explicit OPENMONO_HOST_DAEMON_URL stays verbatim.
         return $"http://{host}:{port}";
     }
 
