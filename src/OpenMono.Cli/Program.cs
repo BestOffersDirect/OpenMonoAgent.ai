@@ -101,7 +101,7 @@ for (var i = 0; i < args.Length; i++)
             Console.WriteLine("  PgUp / PgDn        Scroll conversation");
             return 0;
         case "--version":
-            Console.WriteLine("OpenMono.ai v1.8.2");
+            Console.WriteLine("OpenMono.ai v1.9.0");
             return 0;
     }
 }
