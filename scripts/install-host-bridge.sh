@@ -35,6 +35,14 @@ dotnet10_present() {
     [[ "$major" =~ ^[0-9]+$ && "$major" -ge 10 ]]
 }
 
+# A .NET installed under ~/.dotnet (our prereqs path) is only on PATH via rc
+# files, which this non-interactive shell never sourced — pick it up first so
+# an already-installed SDK is found without re-running prerequisites.
+if ! dotnet10_present && [[ -x "$HOME/.dotnet/dotnet" ]]; then
+    export DOTNET_ROOT="${DOTNET_ROOT:-$HOME/.dotnet}"
+    export PATH="$DOTNET_ROOT:$PATH"
+fi
+
 if ! dotnet10_present; then
     echo "[host-bridge] .NET 10 SDK not found — running the existing prerequisites installer..."
     if [[ "$(uname -s)" == "Darwin" ]]; then

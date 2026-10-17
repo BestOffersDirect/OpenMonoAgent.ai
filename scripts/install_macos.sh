@@ -770,7 +770,13 @@ if [ "${OPENMONO_ROLE}" != "agent" ] && [ -n "${MODEL_MMPROJ:-}" ]; then
     echo ""
     printf "${BOLD}${CYAN}Vision (LLaVA) — Enabled${NC}\n"
     printf "  ${DIM}Vision encoder (mmproj) loaded with the model (~1-2 GB unified memory)${NC}\n"
-    printf "  ${DIM}Context: reduced $((_CTX_ORIG/1024))k → $((_CTX_SIZE/1024))k to fit encoder burst${NC}\n"
+    # Bonsai sizes ctx conservatively up front — no reduction step ran, so
+    # _CTX_ORIG only exists on the Qwen path.
+    if [ -n "${_CTX_ORIG:-}" ] && [ "${_CTX_ORIG}" != "${_CTX_SIZE}" ]; then
+        printf "  ${DIM}Context: reduced $((_CTX_ORIG/1024))k → $((_CTX_SIZE/1024))k to fit encoder burst${NC}\n"
+    else
+        printf "  ${DIM}Context: $_CTX_SIZE tokens (unchanged — sized for the encoder burst)${NC}\n"
+    fi
     printf "\n"
     printf "  ${DIM}Usage: type @image.png or @screenshot.png in chat${NC}\n"
     printf "  ${DIM}  Examples:${NC}\n"
