@@ -77,14 +77,14 @@ internal sealed class LocalLlamaProvider : IProvider
 
 /// <summary>
 /// Strata backend (Linux): Qwen3.8-Flash-Next served host-native by upstream
-/// Strata (https://github.com/Niko1221/Strata, MIT) at :8080/v1. Strata
+/// Strata (https://github.com/Niko1221/Strata, MIT) at :7474/v1. Strata
 /// accepts any API key (unless --api-key was set at its setup) and any model
 /// name. Managed via scripts/strata.sh; see docs/STRATA.md.
 /// </summary>
 internal sealed class StrataProvider : IProvider
 {
     // Root URL (no /v1): OpenAiCompatClient appends "/v1/chat/completions".
-    public const string DefaultEndpoint = "http://localhost:8080";
+    public const string DefaultEndpoint = "http://localhost:7474";
 
     public string Name => "strata";
     public string[] SupportedModels => ["Qwen3.8-Flash-Next"];

@@ -23,18 +23,20 @@ RELAY_PUBLIC_HOST="relay.openmonoagent.ai"
 # scrape via path routing.
 GATEWAY_PORT="$(grep '^GATEWAY_PORT=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]' || true)"
 GATEWAY_PORT="${GATEWAY_PORT:-47480}"
-# Backend-aware direct port: Strata serves host-native :8080/v1 (Linux
-# default, see docs/STRATA.md); the legacy llama.cpp path serves :7474.
+# Backend-aware direct port: Strata serves host-native :7474/v1 (Linux
+# default, see docs/STRATA.md); the legacy llama.cpp path also serves :7474.
+# settings.json inference.port is desired state and wins when present.
 INFERENCE_BACKEND="$(grep '^INFERENCE_BACKEND=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]' || true)"
-STRATA_PORT="$(grep '^STRATA_PORT=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]' || true)"
-STRATA_PORT="${STRATA_PORT:-8080}"
-LLAMA_PORT_DIRECT="$(grep '^LLAMA_PORT=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]' || true)"
-LLAMA_PORT_DIRECT="${LLAMA_PORT_DIRECT:-7474}"
-if [ "$INFERENCE_BACKEND" = "strata" ]; then
-    DIRECT_PORT="$STRATA_PORT"
-else
-    DIRECT_PORT="$LLAMA_PORT_DIRECT"
+SETTINGS="$HOME/.openmono/settings.json"
+SETTINGS_PORT=""
+if command -v jq &>/dev/null && [[ -f "$SETTINGS" ]]; then
+    SETTINGS_PORT="$(jq -r '.inference.port // empty' "$SETTINGS" 2>/dev/null || true)"
 fi
+INFERENCE_PORT="$(grep '^INFERENCE_PORT=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]' || true)"
+[[ -n "$INFERENCE_PORT" ]] || INFERENCE_PORT="$(grep '^STRATA_PORT=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]' || true)"
+[[ -n "$INFERENCE_PORT" ]] || INFERENCE_PORT="$(grep '^LLAMA_PORT=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]' || true)"
+INFERENCE_PORT="${SETTINGS_PORT:-${INFERENCE_PORT:-7474}}"
+DIRECT_PORT="$INFERENCE_PORT"
 # Tunnel the gateway (which fronts the inference backend + any web services)
 # whenever it's installed; otherwise fall back to tunneling the backend directly.
 if grep -q '^GATEWAY_ENABLED=true' "$ENV_FILE" 2>/dev/null || grep -qE '^WEB_(SEARCH|SCRAPE)_ENABLED=true' "$ENV_FILE" 2>/dev/null; then
@@ -470,7 +472,7 @@ if [[ "${INFERENCE_BACKEND:-}" == "strata" && "$NATIVE_INFERENCE" != "true" ]]; 
     # tunnel points at Strata directly (no gateway), the agent-box key must be
     # the Strata server's own --api-key instead (set at Strata setup time;
     # see docs/STRATA.md). Restart Strata only if it is running.
-    if curl -sf "http://127.0.0.1:${STRATA_PORT}/health" &>/dev/null; then
+    if curl -sf "http://127.0.0.1:${INFERENCE_PORT}/health" &>/dev/null; then
         info "Restarting Strata so a server-side key change (if any) applies..."
         bash "$REPO_DIR/scripts/strata.sh" start || \
             warn "Strata restart hit an issue — run manually: bash scripts/strata.sh start"
@@ -496,8 +498,8 @@ else
             (cd "$REPO_DIR/docker" && docker compose up -d llama-server) || \
                 warn "Restart failed — run manually: cd ${REPO_DIR}/docker && docker compose up -d llama-server"
             sleep 2
-            LLAMA_PORT="$(grep '^LLAMA_PORT=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]' || true)"
-            _probe_code=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:${LLAMA_PORT:-7474}/v1/models" 2>/dev/null || echo "000")
+            _probe_port="$(grep '^INFERENCE_PORT=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]' || true)"
+            _probe_code=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:${_probe_port:-${INFERENCE_PORT:-7474}}/v1/models" 2>/dev/null || echo "000")
             if [[ "$_probe_code" == "200" ]]; then
                 warn "llama-server answered without an API key (HTTP 200) — auth is NOT applied. Check $OVERRIDE_FILE"
             elif [[ "$_probe_code" == "401" ]]; then

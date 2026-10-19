@@ -3,7 +3,7 @@
 On Linux, OpenMono runs inference through **[Strata](https://github.com/Niko1221/Strata)**
 instead of the legacy bundled llama.cpp Docker path. Strata serves the
 **Qwen3.8-Flash-Next** model through an OpenAI-compatible API at
-`http://127.0.0.1:8080/v1` (plus `/v1/messages` for Anthropic-style clients and
+`http://127.0.0.1:7474/v1` (plus `/v1/messages` for Anthropic-style clients and
 `/v1/responses`). The .NET agent talks to it exactly like any other
 OpenAI-compatible provider — any API key and any model name work.
 
@@ -47,8 +47,8 @@ What that does (roles `full` / `inference`):
 3. `scripts/strata.sh start` — launches Strata's `run-<model>.sh` detached and
    waits for `/health`. First boot loads 35–55 GB into RAM; the PC may feel
    slow for 1–3 minutes. That is normal — don't kill it.
-4. Writes `INFERENCE_BACKEND=strata` + `STRATA_PORT=8080` to `docker/.env` and
-   `~/.openmono/settings.json` gets `llm.endpoint = http://localhost:8080/v1`.
+4. Writes `INFERENCE_BACKEND=strata` + `INFERENCE_PORT=7474` to `docker/.env` and
+   `~/.openmono/settings.json` gets `llm.endpoint = http://localhost:7474`.
 
 Daily commands are unchanged — they detect the backend from `docker/.env`:
 
@@ -62,6 +62,35 @@ Daily commands are unchanged — they detect the backend from `docker/.env`:
 Manual equivalents: `bash scripts/strata.sh {check,install,start,stop,status,logs,update}`.
 `scripts/strata.sh update` pulls upstream Strata + runs `./update.sh` (no start).
 
+### Single source of truth: `~/.openmono/settings.json`
+
+Port, API key, parallel slots, context, and vision are runtime settings. Edit
+them once in `~/.openmono/settings.json` (or with `openmono config set`), then
+restart; `openmono start` / `restart` run `scripts/apply_settings.sh --apply`,
+which materializes only those shared knobs into the files each backend reads:
+
+- `docker/.env` — `INFERENCE_PORT`, `INFERENCE_PARALLEL`, `LLAMA_API_KEY`,
+  Caddy's `LLAMA_UPSTREAM`
+- `~/.openmono/strata.env` — `INFERENCE_PORT`, `INFERENCE_PARALLEL`, context
+- the generated `~/strata/strata-*.json` + `run-*.sh` — port, parallel, API key
+
+Those files are **applied state**; don't hand-edit them. Install details
+(`STRATA_DIR`, family, model, data dir) stay in `strata.env` and are never
+copied into settings.json.
+
+```bash
+openmono stop                                  # stop with the old applied state
+openmono config set inference.port 7474
+openmono config set inference.parallel_slots 2
+openmono config set llm.api_key "$(openssl rand -hex 24)"
+openmono start                                 # apply + start
+```
+
+`openmono status` shows desired vs applied values. To check without changing
+anything: `bash scripts/apply_settings.sh --check` (exit 2 = drift).
+Parallel slots are asked during install for every backend; each slot reserves
+a full context of KV cache, so raise it only for concurrent sessions.
+
 ### Switching backends
 
 ```bash
@@ -74,7 +103,7 @@ verbatim, e.g. `bash scripts/strata.sh install --yes --family coder`. Model,
 context, vision, port, and data dir can also be preset:
 
 ```bash
-STRATA_FAMILY=qwen STRATA_MODEL=IQ2_XS STRATA_VISION=yes STRATA_PORT=8080 \
+STRATA_FAMILY=qwen STRATA_MODEL=IQ2_XS STRATA_VISION=yes INFERENCE_PORT=7474 \
   bash scripts/strata.sh install
 ```
 
@@ -93,7 +122,7 @@ STRATA_FAMILY=qwen STRATA_MODEL=IQ2_XS STRATA_VISION=yes STRATA_PORT=8080 \
 Single-box (`config-examples/strata-single-box.settings.json`):
 
 ```bash
-openmono config set llm.endpoint http://localhost:8080/v1
+openmono config set llm.endpoint http://localhost:7474
 openmono config set llm.model Qwen3.8-Flash-Next
 # api_key: anything (or the --api-key from Strata setup, if one was set)
 ```
@@ -122,7 +151,7 @@ openmono tunnel setup        # tunnels the gateway, else Strata's port directly
 ```
 
 `scripts/setup-tunnel-inference.sh` picks the local port automatically:
-gateway port when the gateway is installed, otherwise `STRATA_PORT` (8080).
+gateway port when the gateway is installed, otherwise `INFERENCE_PORT` (7474).
 When tunneling Strata *directly* (no gateway), the agent-box `llm.api_key` must
 be the Strata server's own `--api-key` (set at Strata setup time) — the printed
 `LLAMA_API_KEY` guards the Caddy gateway path. `openmono tunnel rotate-key`
@@ -147,7 +176,7 @@ inference box exposes: gateway target → same relay URL serves `/v1/*`,
 Unaffected. The host bridge (`OpenMono.HostBridge`) spawns the same `agent`
 container; its endpoint mapping now understands Strata-style endpoints:
 a loopback endpoint carrying the `/v1` base path (e.g.
-`http://localhost:8080/v1`) is rewritten to `host.docker.internal` with port
+`http://localhost:7474/v1`) is rewritten to `host.docker.internal` with port
 and path preserved, while plain `:7474`-style endpoints keep the legacy
 `llama-server:7474` mapping. No bridge config changes needed.
 
@@ -156,7 +185,7 @@ and path preserved, while plain `:7474`-style endpoints keep the legacy
 | Symptom | Fix |
 |---|---|
 | `openmono start` says Strata isn't installed | `bash scripts/strata.sh install` (see log + `docs/STRATA.md` requirements) |
-| Port 8080 already in use | Strata is already running — check `curl 127.0.0.1:8080/health`, or `STRATA_PORT=8081` at install |
+| Port 7474 already in use | Strata is already running — check `curl 127.0.0.1:7474/health`, or choose another port with `openmono config set inference.port 7475` then `openmono restart` |
 | Very slow / "engine stopped unexpectedly" | Not enough free RAM: close programs or install a smaller size (`strata.sh install --yes --family qwen --model Q2_0`) |
 | Download/install interrupted | Re-run the same command — Strata resumes |
 | `prompt exceeds the context` | Re-run setup with a bigger context (`--setup --context N` in Strata terms) |

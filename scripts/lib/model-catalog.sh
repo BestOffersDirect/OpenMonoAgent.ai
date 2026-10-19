@@ -73,7 +73,7 @@ cat <<'JSON'
  {"id":"flash-next","backend":"strata","prism":false,"aliases":["flash-next"],"requires":"CAN_STRATA",
   "deny":"Qwen3.8-Flash-Next (Strata) needs Linux + an NVIDIA GPU (CUDA 13, auto-installed by scripts/strata.sh) and a 48GB-class box (~70GB weights, streamed from disk). Not available on this box — re-run with --model=qwen.",
   "menu":{"label":"Qwen3.8-Flash-Next via Strata (~70GB)","tag":"NVIDIA / CUDA 13","line":"Qwen3.8-Flash-Next via Strata (~70GB, NVIDIA / CUDA 13)"},
- "script":"scripts/strata.sh","port_env":"STRATA_PORT","port_default":8080}],
+ "script":"scripts/strata.sh","port_env":"INFERENCE_PORT","port_default":7474}],
  "context":{"linux":{"vision":172032,"vision_16g":98304,"cpu":196608},"macos":{"vision":172032,"vision_32g":49152,"vision_16g":12288}}}
 JSON
 }

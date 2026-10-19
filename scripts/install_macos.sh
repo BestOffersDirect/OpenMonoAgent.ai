@@ -11,7 +11,7 @@ set -euo pipefail
 # Options (via env or openmono CLI flags):
 #   OPENMONO_ROLE         Install role: full (default), inference, or agent
 #   OPENMONO_VERBOSE=1    Show detailed command output
-#   LLAMA_PORT=7474       llama-server host port (default 7474)
+#   INFERENCE_PORT=7474   llama-server host port (default 7474)
 # ──────────────────────────────────────────────────────────────────────────────
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -24,6 +24,8 @@ source "$SCRIPT_DIR/lib/prism.sh"
 source "$SCRIPT_DIR/lib/model-catalog.sh"
 # shellcheck source=/dev/null
 source "$SCRIPT_DIR/lib/vision.sh"
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR/lib/inference-settings.sh"
 
 # ── Context size presets (tokens) — edit here to change globally ──────────────
 CTX_48G=196608       # >=48 GB Metal  q8_0 KV
@@ -515,6 +517,15 @@ if [ "$OPENMONO_ROLE" != "agent" ]; then
     mkdir -p "$(dirname "$SETTINGS_FILE")"
     [ ! -f "$SETTINGS_FILE" ] && echo '{}' > "$SETTINGS_FILE"
 
+    # Preserve an existing port when re-running setup; default 7474.
+    INFERENCE_PORT="${INFERENCE_PORT:-${LLAMA_PORT:-}}"
+    if [ -z "${INFERENCE_PORT:-}" ] && command -v jq &>/dev/null; then
+        INFERENCE_PORT="$(jq -r '.inference.port // empty' "$SETTINGS_FILE" 2>/dev/null || true)"
+    fi
+    [ "${INFERENCE_PORT:-}" = "8080" ] && INFERENCE_PORT=7474
+    INFERENCE_PORT="${INFERENCE_PORT:-7474}"
+    export INFERENCE_PORT
+
     # Generate a new API key for this install (stored in docker/.env — single source of truth)
     LLAMA_API_KEY="$(openssl rand -hex 24)"
     ENV_FILE="$INSTALL_DIR/docker/.env"
@@ -528,17 +539,21 @@ if [ "$OPENMONO_ROLE" != "agent" ]; then
     mv /tmp/env.tmp "$ENV_FILE"
     chmod 0600 "$ENV_FILE"
 
+    PARALLEL_SLOTS="$(om_choose_parallel_slots 1)"
+    export PARALLEL_SLOTS
+
     python3 - "$SETTINGS_FILE" \
-        "${LLAMA_PORT:-7474}" \
+        "${INFERENCE_PORT:-7474}" \
         "$MODEL_NAME" \
         "$MODEL_ALIAS" \
         "$_CTX_SIZE" \
         "$INSTALL_DIR" \
         "$LLAMA_API_KEY" \
         "${MMPROJ_FILE:-}" \
-        "${PRISM_BINARY:-}" <<'PYEOF'
+        "${PRISM_BINARY:-}" \
+        "$PARALLEL_SLOTS" <<'PYEOF'
 import json, sys
-path, port, model_name, model_alias, ctx_size, install_dir, api_key, mmproj_path, binary = sys.argv[1:10]
+path, port, model_name, model_alias, ctx_size, install_dir, api_key, mmproj_path, binary, parallel_slots = sys.argv[1:11]
 with open(path) as f:
     cfg = json.load(f)
 cfg.setdefault("llm", {})["endpoint"] = f"http://127.0.0.1:{port}"
@@ -549,6 +564,7 @@ cfg["inference"] = {
     "model_alias": model_alias,
     "ctx_size": int(ctx_size),
     "port": int(port),
+    "parallel_slots": int(parallel_slots),
     "install_dir": install_dir,
     "mmproj_path": mmproj_path if mmproj_path else "",
     "binary": binary if binary else ""
@@ -560,13 +576,15 @@ PYEOF
     detail "  model     : $MODEL_NAME"
     detail "  binary    : ${PRISM_BINARY:-$(command -v llama-server)}"
     detail "  ctx_size  : $_CTX_SIZE"
-    detail "  endpoint  : http://127.0.0.1:${LLAMA_PORT:-7474}"
+    detail "  slots     : $PARALLEL_SLOTS"
+    detail "  endpoint  : http://127.0.0.1:${INFERENCE_PORT:-7474}"
     detail "  api_key   : [generated, stored in docker/.env]"
 
     # Update docker/.env with model and vision state
-    grep -v -E "^MODEL_MMPROJ=|^OPENMONO_VISION_ENABLED=" "$ENV_FILE" > /tmp/env.tmp 2>/dev/null || true
+    grep -v -E "^MODEL_MMPROJ=|^OPENMONO_VISION_ENABLED=|^INFERENCE_PARALLEL=|^LLAMA_PARALLEL=|^STRATA_PARALLEL=" "$ENV_FILE" > /tmp/env.tmp 2>/dev/null || true
     mv /tmp/env.tmp "$ENV_FILE"
     printf "MODEL_MMPROJ=%s\n" "${MODEL_MMPROJ:-}" >> "$ENV_FILE"
+    printf "INFERENCE_PARALLEL=%s\n" "$PARALLEL_SLOTS" >> "$ENV_FILE"
     if [ -n "${MODEL_MMPROJ:-}" ]; then
         printf "OPENMONO_VISION_ENABLED=1\n" >> "$ENV_FILE"
         om_persist_vision true
@@ -635,7 +653,7 @@ if [ "$OPENMONO_ROLE" != "agent" ]; then
 
     # Use openmono start to launch llama-server via scripts/macos/inference.sh
     # This ensures consistency between install and runtime startup paths.
-    export LLAMA_PORT="${LLAMA_PORT:-7474}"
+    export INFERENCE_PORT="${INFERENCE_PORT:-7474}"
     if ! "$INSTALL_DIR/openmono" start; then
         warn "llama-server startup did not complete cleanly"
         warn "Check the log: openmono logs"
@@ -768,7 +786,7 @@ echo ""
 
 case "$OPENMONO_ROLE" in
     full)
-        echo "  llama-server port : ${LLAMA_PORT:-7474}"
+        echo "  llama-server port : ${INFERENCE_PORT:-7474}"
         echo "  mode              : Metal GPU (native llama.cpp)"
         echo "  model             : ${MODEL_NAME:-}"
         if [ -n "${MODEL_MMPROJ:-}" ]; then
@@ -776,7 +794,7 @@ case "$OPENMONO_ROLE" in
         fi
         ;;
     inference)
-        echo "  llama-server port : ${LLAMA_PORT:-7474}"
+        echo "  llama-server port : ${INFERENCE_PORT:-7474}"
         echo "  mode              : Metal GPU (native llama.cpp)"
         echo "  model             : ${MODEL_NAME:-}"
         if [ -n "${MODEL_MMPROJ:-}" ]; then
@@ -827,7 +845,8 @@ fi
 if [[ -n "${OPENMONO_ENV_FILE:-}" ]]; then
     cat > "$OPENMONO_ENV_FILE" <<ENVEOF
 export INSTALL_DIR="$INSTALL_DIR"
-export LLAMA_PORT="${LLAMA_PORT:-7474}"
+export INFERENCE_PORT="${INFERENCE_PORT:-7474}"
+export INFERENCE_PARALLEL="${INFERENCE_PARALLEL:-${PARALLEL_SLOTS:-1}}"
 export OPENMONO_ROLE="$OPENMONO_ROLE"
 export OPENMONO_HOST_BRIDGE="${OPENMONO_HOST_BRIDGE:-0}"
 export MODEL_NAME="${MODEL_NAME:-}"

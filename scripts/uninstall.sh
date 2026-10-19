@@ -623,8 +623,9 @@ fi
 # (~/strata) and its model data are left in place — removal is a manual,
 # explicit `rm -rf` so a ~70 GB re-download is never a surprise.
 if [ -f "$INSTALL_DIR/scripts/strata.sh" ]; then
-    STRATA_PORT="$(grep '^STRATA_PORT=' "$INSTALL_DIR/docker/.env" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]' || true)"
-    if curl -sf "http://127.0.0.1:${STRATA_PORT:-8080}/health" &>/dev/null; then
+    _inf_port="$(grep '^INFERENCE_PORT=' "$INSTALL_DIR/docker/.env" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]' || true)"
+    [[ -n "$_inf_port" ]] || _inf_port="$(grep '^STRATA_PORT=' "$INSTALL_DIR/docker/.env" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]' || true)"
+    if curl -sf "http://127.0.0.1:${_inf_port:-7474}/health" &>/dev/null; then
         info "Stopping Strata inference server..."
         bash "$INSTALL_DIR/scripts/strata.sh" stop || warn "Strata stop hit an issue — stop it manually (see docs/STRATA.md)"
     fi

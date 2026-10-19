@@ -8,20 +8,26 @@ NC='\033[0m'
 echo "OpenMono.ai Health Check"
 echo "========================"
 
-# Backend-aware endpoints: Strata serves host-native :8080/v1 (Linux default),
-# the legacy llama.cpp path serves :7474. Marker lives in docker/.env.
+# Backend-aware endpoints: Strata serves host-native :7474/v1 (Linux default),
+# the legacy llama.cpp path also serves :7474. Marker lives in docker/.env;
+# settings.json inference.port is the desired state and wins when present.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="$SCRIPT_DIR/../docker/.env"
+SETTINGS="$HOME/.openmono/settings.json"
+SETTINGS_PORT=""
+if command -v jq &>/dev/null && [[ -f "$SETTINGS" ]]; then
+    SETTINGS_PORT="$(jq -r '.inference.port // empty' "$SETTINGS" 2>/dev/null || true)"
+fi
 BACKEND="$(grep '^INFERENCE_BACKEND=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]' || true)"
+PORT="$(grep '^INFERENCE_PORT=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]' || true)"
+[[ -n "$PORT" ]] || PORT="$(grep '^STRATA_PORT=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]' || true)"
+[[ -n "$PORT" ]] || PORT="$(grep '^LLAMA_PORT=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]' || true)"
+PORT="${SETTINGS_PORT:-${PORT:-7474}}"
 if [[ "$BACKEND" == "strata" ]] || [[ -z "$BACKEND" && -f "$HOME/.openmono/strata.env" ]]; then
     BACKEND="strata"
-    PORT="$(grep '^STRATA_PORT=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]' || true)"
-    PORT="${PORT:-8080}"
     LABEL="strata"
 else
     BACKEND="llama"
-    PORT="$(grep '^LLAMA_PORT=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]' || true)"
-    PORT="${PORT:-7474}"
     LABEL="llama-server"
 fi
 

@@ -22,6 +22,8 @@ native_load_config() {
     MODEL_ALIAS=$(jq -r '.inference.model_alias // empty' "$settings" 2>/dev/null)
     LLAMA_CTX_SIZE=$(jq -r '.inference.ctx_size // 65536' "$settings" 2>/dev/null)
     LLAMA_NATIVE_PORT=$(jq -r '.inference.port // "7474"' "$settings" 2>/dev/null)
+    INFERENCE_PARALLEL=$(jq -r '.inference.parallel_slots // 1' "$settings" 2>/dev/null)
+    [[ "$INFERENCE_PARALLEL" =~ ^[0-9]+$ ]] && (( INFERENCE_PARALLEL >= 1 )) || INFERENCE_PARALLEL=1
     LLAMA_INSTALL_DIR=$(jq -r '.inference.install_dir // empty' "$settings" 2>/dev/null)
     LLAMA_MMPROJ_PATH=$(jq -r '.inference.mmproj_path // empty' "$settings" 2>/dev/null)
     LLAMA_BINARY=$(jq -r '.inference.binary // empty' "$settings" 2>/dev/null)
@@ -84,7 +86,7 @@ native_start_llama() {
         --threads "$cpu_threads" --batch-size 2048 --ubatch-size 512 \
         --flash-attn on \
         --cache-type-k q8_0 --cache-type-v q8_0 \
-        --parallel 1 --jinja --reasoning off --metrics \
+        --parallel "${INFERENCE_PARALLEL:-1}" --jinja --reasoning off --metrics \
         ${api_key:+--api-key "${api_key}"} \
         ${LLAMA_MMPROJ_PATH:+--mmproj "${LLAMA_MMPROJ_PATH}" --image-min-tokens 1024 --image-max-tokens 1280} \
         > "$log_file" 2>&1 &
@@ -102,7 +104,7 @@ native_start_llama() {
 }
 
 # Stop native llama-server by port with safety check (verify it's really llama-server).
-# Args: $1 = port (optional, defaults to LLAMA_PORT)
+# Args: $1 = port (optional, defaults to settings.json inference.port)
 native_stop_llama() {
     local port="${1:-${LLAMA_NATIVE_PORT:-7474}}"
 
@@ -159,13 +161,14 @@ native_cmd_start() {
 
 native_cmd_stop() {
     native_load_config || return 1
-    native_stop_llama "${LLAMA_NATIVE_PORT:-7474}" || return 1
+    local port="${OPENMONO_APPLIED_PORT:-${LLAMA_NATIVE_PORT:-7474}}"
+    native_stop_llama "$port" || return 1
     ok "llama-server stopped"
 }
 
 native_cmd_restart() {
     native_load_config || return 1
-    local port="${LLAMA_NATIVE_PORT:-7474}"
+    local port="${OPENMONO_APPLIED_PORT:-${LLAMA_NATIVE_PORT:-7474}}"
     native_stop_llama "$port" || true
     sleep 1
     native_start_llama || return 1

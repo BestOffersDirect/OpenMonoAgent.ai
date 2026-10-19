@@ -25,7 +25,7 @@ services:
       --flash-attn on
       --cache-type-k q8_0
       --cache-type-v q8_0
-      --parallel 1
+      --parallel ${INFERENCE_PARALLEL:-1}
       --jinja
       --reasoning off
       --metrics
@@ -33,7 +33,7 @@ services:
     volumes:
       - ../models:/models:ro
     ports:
-      - "${LLAMA_PORT:-7474}:7474"
+      - "${INFERENCE_PORT:-7474}:7474"
     restart: always
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:7474/health"]
@@ -50,8 +50,8 @@ services:
   # profile is active.
   #
   # Strata backend (Linux default, see docs/STRATA.md): Strata serves
-  # host-native on 127.0.0.1:8080, so apply docker-compose.strata.yml to
-  # repoint LLAMA_UPSTREAM at host.docker.internal:8080. No llama-server
+  # host-native on 127.0.0.1:7474, so apply docker-compose.strata.yml to
+  # repoint LLAMA_UPSTREAM at host.docker.internal:7474. No llama-server
   # container is started in that mode.
   caddy:
     image: caddy:2-alpine

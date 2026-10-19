@@ -22,7 +22,7 @@ while [[ -L "$OPENMONO_SCRIPT" ]]; do
 done
 REPO_DIR="$(cd "$(dirname "$OPENMONO_SCRIPT")" && pwd)"
 DOCKER_DIR="$REPO_DIR/docker"
-LLAMA_PORT="${LLAMA_PORT:-7474}"
+INFERENCE_PORT="${INFERENCE_PORT:-7474}"
 OPENMONO_VERSION="$(cat "$REPO_DIR/VERSION" 2>/dev/null | tr -d '[:space:]' || echo "unknown")"
 
 # On macOS Apple Silicon, llama-server runs natively via Homebrew (Metal GPU).
@@ -112,14 +112,16 @@ _env_get() {
     [[ -f "$env_file" ]] || return 0
     local line
     line="$(grep "^${key}=" "$env_file" 2>/dev/null | head -1 || true)"
-    [[ -n "$line" ]] && printf '%s' "${line#*=}"
+    if [[ -n "$line" ]]; then printf '%s' "${line#*=}"; fi
+    return 0
 }
 
-# Re-resolve LLAMA_PORT now that _env_get exists: the installer persists the
-# actual bind port to docker/.env (it may differ from 7474), so every health
-# probe in this script must use the same port compose binds, not a hardcoded 7474.
-LLAMA_PORT="${LLAMA_PORT:-$(_env_get LLAMA_PORT)}"
-LLAMA_PORT="${LLAMA_PORT:-7474}"
+# Resolve the applied bind port once docker/.env helpers exist. INFERENCE_PORT is
+# the single applied key; LLAMA_PORT/STRATA_PORT are only read from old installs.
+INFERENCE_PORT="${INFERENCE_PORT:-$(_env_get INFERENCE_PORT)}"
+[[ -n "$INFERENCE_PORT" ]] || INFERENCE_PORT="$(_env_get LLAMA_PORT)"
+[[ -n "$INFERENCE_PORT" ]] || INFERENCE_PORT="$(_env_get STRATA_PORT)"
+INFERENCE_PORT="${INFERENCE_PORT:-7474}"
 
 _env_set() {
     local key="$1" val="$2" env_file="$DOCKER_DIR/.env"
@@ -144,8 +146,79 @@ _sync_api_key_to_settings() {
     cmd_config set llm.api_key "$key" >/dev/null 2>&1 || true
 }
 
+# ── Settings -> applied inference state ──────────────────────────────────────
+# settings.json is desired state; scripts/apply_settings.sh writes the shared
+# runtime knobs (port, parallel slots, API key, Caddy upstream) into the files
+# the backends actually read. These helpers wire that into start/stop/restart.
+APPLY_SETTINGS="$REPO_DIR/scripts/apply_settings.sh"
+
+_settings_file() { printf '%s' "$HOME/.openmono/settings.json"; }
+
+_refresh_inference_env() {
+    INFERENCE_PORT="$(_env_get INFERENCE_PORT)"
+    [[ -n "$INFERENCE_PORT" ]] || INFERENCE_PORT="$(_env_get LLAMA_PORT)"
+    [[ -n "$INFERENCE_PORT" ]] || INFERENCE_PORT="$(_env_get STRATA_PORT)"
+    INFERENCE_PORT="${INFERENCE_PORT:-7474}"
+}
+
+_apply_inference_settings() {
+    [[ -f "$APPLY_SETTINGS" ]] || return 0
+    bash "$APPLY_SETTINGS" --apply --quiet || warn "Could not apply inference settings."
+    _refresh_inference_env
+}
+
+# 0 = in sync, 2 = drift, 1/other = could not check.
+_inference_settings_drift() {
+    [[ -f "$APPLY_SETTINGS" ]] || return 0
+    bash "$APPLY_SETTINGS" --check --quiet >/dev/null 2>&1
+    return $?
+}
+
+# The port currently written to the applied state (old value, before apply).
+_applied_inference_port() {
+    local p
+    p="$(_env_get INFERENCE_PORT)"
+    [[ -n "$p" ]] || p="$(_env_get LLAMA_PORT)"
+    [[ -n "$p" ]] || p="$(_env_get STRATA_PORT)"
+    printf '%s' "${p:-7474}"
+}
+
+# Whether this box runs inference locally (vs agent-only pointing at a relay).
+_has_local_inference() {
+    if [[ "$NATIVE_INFERENCE" == "true" ]]; then
+        command -v jq &>/dev/null && [[ -f "$(_settings_file)" ]] && \
+            jq -e '.inference.model_name // empty' "$(_settings_file)" >/dev/null 2>&1
+        return
+    fi
+    [[ -f "$HOME/.openmono/strata.env" ]] && return 0
+    [[ -n "$(_env_get INFERENCE_BACKEND)" ]] && return 0
+    [[ -n "$(_env_get MODEL_NAME)" ]] && return 0
+    [[ -n "$(_env_get INFERENCE_PORT)" ]] && return 0
+    [[ -n "$(_env_get LLAMA_PORT)" ]] && return 0
+    [[ -n "$(_env_get STRATA_PORT)" ]] && return 0
+    return 1
+}
+
+# Stop whatever backend is currently running, using applied state — not the
+# possibly-edited settings.json — so a changed port still stops the old server.
+_stop_inference_backend_applied() {
+    local applied
+    applied="$(_applied_inference_port)"
+    if [[ "$NATIVE_INFERENCE" == "true" ]]; then
+        if command -v native_cmd_stop &>/dev/null; then
+            OPENMONO_APPLIED_PORT="$applied" native_cmd_stop || true
+        fi
+    elif [[ "$(_inference_backend)" == "strata" ]]; then
+        bash "$REPO_DIR/scripts/strata.sh" stop || true
+    else
+        if docker info &>/dev/null 2>&1; then
+            (cd "$DOCKER_DIR" && docker compose stop llama-server) || true
+        fi
+    fi
+}
+
 # ── Inference backend selection (Linux) ─────────────────────────────────────
-# Strata (Qwen3.8-Flash-Next, host-native :8080/v1) is the default for fresh
+# Strata (Qwen3.8-Flash-Next, host-native :7474/v1) is the default for fresh
 # installs on this branch; pre-existing installs without the marker keep the
 # legacy llama.cpp Docker path. macOS Apple Silicon always uses NATIVE_INFERENCE.
 _inference_backend() {
@@ -160,11 +233,22 @@ _inference_backend() {
     fi
 }
 
-_strata_port() {
-    local p
-    p="$(_env_get STRATA_PORT)"
-    printf '%s' "${p:-8080}"
+# Port resolution: settings.json wins, then applied env, then 7474.
+_inference_port() {
+    local p=""
+    if command -v jq &>/dev/null && [[ -f "$(_settings_file)" ]]; then
+        p="$(jq -r '.inference.port // empty' "$(_settings_file)" 2>/dev/null || true)"
+    fi
+    if [[ ! "$p" =~ ^[0-9]+$ ]]; then
+        p="$(_env_get INFERENCE_PORT)"
+        [[ -n "$p" ]] || p="$(_env_get LLAMA_PORT)"
+        [[ -n "$p" ]] || p="$(_env_get STRATA_PORT)"
+    fi
+    printf '%s' "${p:-7474}"
 }
+
+# Kept as a named alias for call sites that talk to Strata; there is one port.
+_strata_port() { _inference_port; }
 
 # Reuse the existing LLAMA_API_KEY as the gateway's shared bearer; generate one
 # if absent. Sets _LLAMA_KEY_GENERATED so callers can restart the inference
@@ -185,25 +269,33 @@ _apply_llama_key_restart() {
     [[ "${_LLAMA_KEY_GENERATED:-0}" == "1" ]] || return 0
     info "Restarting inference backend to apply the new API key..."
     if [[ "$NATIVE_INFERENCE" == "true" ]]; then
-        command -v native_cmd_restart &>/dev/null && native_cmd_restart || \
+        command -v native_cmd_restart &>/dev/null && OPENMONO_APPLIED_PORT="$(_applied_inference_port)" native_cmd_restart || \
             warn "Restart inference backend manually: openmono restart"
     elif [[ "$(_inference_backend)" == "strata" ]]; then
-        # Gateway picks up Caddy env on restart; Strata itself keeps running.
-        if (cd "$DOCKER_DIR" && docker compose ps --services 2>/dev/null | grep -q '^openmono-gateway$'); then
-            (cd "$DOCKER_DIR" && docker compose up -d caddy) || \
+        # Strata enforces its own --api-key, so restart it with the same key
+        # the gateway/agent use; then recreate Caddy to pick up the env.
+        _apply_inference_settings
+        if [[ -f "$HOME/.openmono/strata.env" ]]; then
+            bash "$REPO_DIR/scripts/strata.sh" stop || true
+            bash "$REPO_DIR/scripts/strata.sh" start || \
+                warn "Restart Strata manually: openmono restart"
+        fi
+        if (cd "$DOCKER_DIR" && _compose ps --services 2>/dev/null | grep -q '^caddy$'); then
+            (cd "$DOCKER_DIR" && _compose up -d caddy) || \
                 warn "Restart gateway manually: openmono restart"
         fi
     else
+        _apply_inference_settings
         if (cd "$DOCKER_DIR" && docker compose ps --services 2>/dev/null | grep -q '^llama-server$'); then
-            (cd "$DOCKER_DIR" && docker compose up -d llama-server) || \
-                warn "Restart manually: cd $DOCKER_DIR && docker compose up -d llama-server"
+            (cd "$DOCKER_DIR" && docker compose up -d --force-recreate llama-server) || \
+                warn "Restart manually: cd $DOCKER_DIR && docker compose up -d --force-recreate llama-server"
         fi
     fi
 }
 
 # docker compose wrapper: on the Strata backend, layer
 # docker-compose.strata.yml so the Caddy gateway fronts the host's Strata
-# (host.docker.internal:8080) instead of the llama-server container.
+# (host.docker.internal:7474) instead of the llama-server container.
 _compose() {
     if [[ "$(_inference_backend)" == "strata" && -f "$DOCKER_DIR/docker-compose.strata.yml" ]]; then
         docker compose -f docker-compose.yml -f docker-compose.strata.yml "$@"
@@ -234,7 +326,7 @@ _setup_gateway() {
     _ensure_docker
     info "Setting up the Caddy gateway..."
     _ensure_llama_key >/dev/null
-    [[ "$NATIVE_INFERENCE" == "true" ]] && _env_set LLAMA_UPSTREAM "host.docker.internal:7474"
+    _apply_inference_settings
     _env_set GATEWAY_ENABLED true
     (cd "$DOCKER_DIR" && _compose --profile server up -d caddy) || {
         err "Failed to start the gateway. Check: docker compose ps"; return 1
@@ -297,7 +389,7 @@ cmd_setup_search() {
     info "Installing SearXNG (private web search)..."
     local key; key="$(_ensure_llama_key)"
     [[ -z "$(_env_get SEARXNG_SECRET)" ]] && _env_set SEARXNG_SECRET "$(openssl rand -hex 32)"
-    [[ "$NATIVE_INFERENCE" == "true" ]] && _env_set LLAMA_UPSTREAM "host.docker.internal:7474"
+    _apply_inference_settings
     _env_set WEB_SEARCH_ENABLED true
 
     info "Starting SearXNG + gateway..."
@@ -318,7 +410,7 @@ cmd_setup_scraper() {
     _ensure_docker
     info "Installing Scrapling (web scraper). First build downloads a browser — this can take a few minutes."
     local key; key="$(_ensure_llama_key)"
-    [[ "$NATIVE_INFERENCE" == "true" ]] && _env_set LLAMA_UPSTREAM "host.docker.internal:7474"
+    _apply_inference_settings
     _env_set WEB_SCRAPE_ENABLED true
 
     (cd "$DOCKER_DIR" && docker compose --profile scraper build scrapling) || {
@@ -605,7 +697,7 @@ cmd_setup() {
     fi
 
     INSTALL_DIR="${INSTALL_DIR:-$HOME/openmono.ai}"
-    LLAMA_PORT="${LLAMA_PORT:-7474}"
+    INFERENCE_PORT="${INFERENCE_PORT:-${LLAMA_PORT:-${STRATA_PORT:-7474}}}"
     local settings_dir="$HOME/.openmono"
     local settings_file="$settings_dir/settings.json"
     mkdir -p "$settings_dir"
@@ -621,10 +713,7 @@ cmd_setup() {
 EOF
             detail "Created $settings_file for agent-only role (configure endpoint with: openmono config set llm.endpoint <url>)"
         else
-            _default_endpoint="http://localhost:7474"
-            if [[ "${OPENMONO_INFERENCE_BACKEND:-}" == "strata" ]]; then
-                _default_endpoint="http://localhost:${STRATA_PORT:-8080}/v1"
-            fi
+            _default_endpoint="http://localhost:${INFERENCE_PORT}"
             cat > "$settings_file" <<EOF
 {
   "llm": {
@@ -649,10 +738,10 @@ EOF
     case "$OPENMONO_ROLE" in
         full|inference)
             if [[ "${OPENMONO_INFERENCE_BACKEND:-}" == "strata" && "$NATIVE_INFERENCE" != "true" ]]; then
-                echo "  strata endpoint : http://localhost:${STRATA_PORT:-8080}/v1"
+                echo "  strata endpoint : http://localhost:${INFERENCE_PORT}"
                 echo "  mode            : Strata (Qwen3.8-Flash-Next, host-native)"
             else
-                echo "  llama-server port : ${LLAMA_PORT}"
+                echo "  llama-server port : ${INFERENCE_PORT}"
                 if [[ "$NATIVE_INFERENCE" == "true" ]]; then
                     echo "  mode              : Metal GPU (native llama.cpp)"
                 else
@@ -741,12 +830,22 @@ EOF
 
     unset OPENMONO_GPU OPENMONO_CPU OPENMONO_ROLE OPENMONO_VERBOSE OPENMONO_LOG_DIR \
           OPENMONO_LOG_FILE OPENMONO_ENV_FILE GPU_MODE AMD_IGPU_MODE AMD_IGPU_REBOOT_PENDING \
-          INSTALL_DIR LLAMA_PORT OPENMONO_VERBOSE OPENMONO_HOST_BRIDGE
+          INSTALL_DIR INFERENCE_PORT LLAMA_PORT STRATA_PORT OPENMONO_VERBOSE OPENMONO_HOST_BRIDGE
     export PATH="$INSTALL_DIR:$PATH"
     exec -l "$SHELL"
 }
 
 cmd_start() {
+    # Materialize settings.json into the backend files. If the running backend
+    # is out of sync (port/slots/key changed), stop it first using applied state.
+    local _drift=0
+    _inference_settings_drift || _drift=$?
+    if [[ "$_drift" == "2" ]]; then
+        info "Inference settings changed — restarting the backend to apply them."
+        _stop_inference_backend_applied
+    fi
+    _apply_inference_settings
+
     if [[ "$NATIVE_INFERENCE" == "true" ]]; then
         native_cmd_start || return $?
         _start_web_services || true
@@ -766,25 +865,25 @@ cmd_start() {
 
     _ensure_docker
     cd "$DOCKER_DIR"
-    export LLAMA_PORT
-    if ss -tlnp 2>/dev/null | grep -q ":${LLAMA_PORT} "; then
-        if curl -sf "http://localhost:${LLAMA_PORT}/health" &>/dev/null; then
-            ok "llama-server already running on port ${LLAMA_PORT}"
+    export INFERENCE_PORT
+    if ss -tlnp 2>/dev/null | grep -q ":${INFERENCE_PORT} "; then
+        if curl -sf "http://localhost:${INFERENCE_PORT}/health" &>/dev/null; then
+            ok "llama-server already running on port ${INFERENCE_PORT}"
             echo "  Run the agent: openmono agent"
             return
         fi
-        err "Port ${LLAMA_PORT} is in use by another process. Use LLAMA_PORT=<port> openmono start"
+        err "Port ${INFERENCE_PORT} is in use by another process. Change it with: openmono config set inference.port <port>"
         exit 1
     fi
-    info "Starting llama-server on port ${LLAMA_PORT}..."
+    info "Starting llama-server on port ${INFERENCE_PORT}..."
     docker compose up -d llama-server
 
     info "Waiting for llama-server to be healthy (model load can take 1-3 min)..."
     HEALTHY=false
     for i in $(seq 1 36); do
-        if curl -sf "http://localhost:${LLAMA_PORT}/health" &>/dev/null; then
+        if curl -sf "http://localhost:${INFERENCE_PORT}/health" &>/dev/null; then
             echo ""
-            ok "llama-server is healthy on port ${LLAMA_PORT}"
+            ok "llama-server is healthy on port ${INFERENCE_PORT}"
             HEALTHY=true
             break
         fi
@@ -816,21 +915,16 @@ _stop_inventory() {
             echo "  - Strata inference server: not running"
         fi
     elif [[ "$NATIVE_INFERENCE" == "true" ]]; then
-        # Native port lives in settings (inference.port), not LLAMA_PORT.
-        local nport="$LLAMA_PORT"
-        if command -v jq &>/dev/null && [[ -f "$HOME/.openmono/settings.json" ]]; then
-            local cfg_port
-            cfg_port="$(jq -r '.inference.port // empty' "$HOME/.openmono/settings.json" 2>/dev/null || true)"
-            [[ "$cfg_port" =~ ^[0-9]+$ ]] && nport="$cfg_port"
-        fi
+        # Show the applied port (not a freshly edited settings.json value).
+        local nport; nport="$(_applied_inference_port)"
         if curl -sf "http://localhost:${nport}/health" &>/dev/null; then
             echo "  - llama-server (native, Metal) on port ${nport}"
         else
             echo "  - llama-server (native): not responding on port ${nport}"
         fi
     else
-        if curl -sf "http://localhost:${LLAMA_PORT}/health" &>/dev/null; then
-            echo "  - llama-server (docker) healthy on port ${LLAMA_PORT}"
+        if curl -sf "http://localhost:${INFERENCE_PORT}/health" &>/dev/null; then
+            echo "  - llama-server (docker) healthy on port ${INFERENCE_PORT}"
         else
             echo "  - llama-server (docker): not responding"
         fi
@@ -930,7 +1024,7 @@ cmd_stop() {
 
     if [[ "$NATIVE_INFERENCE" == "true" ]]; then
         if [[ "$sel_llama" == "true" ]]; then
-            native_cmd_stop || { warn "native llama-server stop failed — continuing with containers."; rc=1; }
+            OPENMONO_APPLIED_PORT="$(_applied_inference_port)" native_cmd_stop || { warn "native llama-server stop failed — continuing with containers."; rc=1; }
         fi
     elif [[ "$backend" == "strata" ]]; then
         # Strata serves host-native (it is not a compose service): stop it via its
@@ -941,15 +1035,15 @@ cmd_stop() {
     else
         _ensure_docker
         if [[ "$sel_llama" == "true" ]]; then
-            if ! curl -sf "http://localhost:${LLAMA_PORT}/health" &>/dev/null; then
-                warn "llama-server is not responding on port ${LLAMA_PORT}"
+            if ! curl -sf "http://localhost:${INFERENCE_PORT}/health" &>/dev/null; then
+                warn "llama-server is not responding on port ${INFERENCE_PORT}"
             fi
         fi
     fi
 
     if docker info &>/dev/null 2>&1; then
         cd "$DOCKER_DIR"
-        export LLAMA_PORT
+        export INFERENCE_PORT
         # Explicit service names bypass compose profile filtering, so every
         # selected service is stopped regardless of which profiles started it.
         local svcs=()
@@ -1007,25 +1101,11 @@ cmd_stop() {
 }
 
 cmd_restart() {
-    if [[ "$NATIVE_INFERENCE" == "true" ]]; then
-        native_cmd_restart || return $?
-        return 0
-    fi
-
-    # Strata backend: stop + start the host server (start is a no-op if healthy).
-    if [[ "$(_inference_backend)" == "strata" ]]; then
-        info "Restarting Strata..."
-        bash "$REPO_DIR/scripts/strata.sh" stop || true
-        bash "$REPO_DIR/scripts/strata.sh" start
-        return $?
-    fi
-
-    _ensure_docker
-    cd "$DOCKER_DIR"
-    export LLAMA_PORT
-    info "Restarting llama-server..."
-    docker compose restart llama-server
-    ok "Restarted"
+    # Stop using applied state, materialize settings, then start. Applying before
+    # cmd_start avoids a second (noisy) stop in its drift check.
+    _stop_inference_backend_applied
+    _apply_inference_settings
+    cmd_start
 }
 
 _refresh_update_cache() {
@@ -1441,8 +1521,7 @@ cmd_agent_host() {
     if [[ -z "$cfg_endpoint" ]]; then
         err "No LLM endpoint configured in ~/.openmono/settings.json"
         err "Point at local inference or your relay:"
-        err "  openmono config set llm.endpoint http://localhost:8080/v1  # Strata (Linux)"
-        err "  openmono config set llm.endpoint http://localhost:7474      # legacy llama.cpp"
+        err "  openmono config set llm.endpoint http://localhost:7474      # local inference (Strata / llama.cpp)"
         err "  openmono config set llm.endpoint http://<relay-host>:<remotePort>"
         err "  openmono config set llm.api_key <token>"
         exit 1
@@ -1612,7 +1691,7 @@ cmd_agent_sandbox() {
             # Probe the port compose actually binds (resolved from docker/.env
             # above) — a hardcoded 7474 declares a running server dead when a
             # previous install moved the host mapping.
-            local _hport="$LLAMA_PORT"
+            local _hport="$INFERENCE_PORT"
             if curl -sf "http://localhost:${_hport}/health" &>/dev/null; then
                 # If settings.json points at a different port than the live
                 # server, the config is stale — say so instead of silently
@@ -1649,7 +1728,7 @@ cmd_agent_sandbox() {
         # The configured endpoint points at loopback / the host gateway, which
         # the agent container cannot reach by that name. Rewrite the HOST only,
         # preserving the port and any base path from the config, so a custom
-        # STRATA_PORT/LLAMA_PORT or an endpoint like ...:8081/v1 keeps working:
+        # custom inference.port or an endpoint like ...:8081/v1 keeps working:
         #   - Strata serves host-native → reach it via the host gateway.
         #   - Native Metal llama.cpp also runs on the HOST (not in compose) →
         #     same host-gateway rewrite; leaving localhost in place makes the
@@ -1674,9 +1753,9 @@ cmd_agent_sandbox() {
         else
             _port="${_port:-7474}"
             # llama.cpp listens on 7474 INSIDE the container regardless of the
-            # host mapping (compose maps LLAMA_PORT->7474). If the endpoint
+            # host mapping (compose maps INFERENCE_PORT->7474). If the endpoint
             # names the host-side port, translate it to the internal one.
-            if [[ "$_port" == "$LLAMA_PORT" && "$LLAMA_PORT" != "7474" ]]; then
+            if [[ "$_port" == "$INFERENCE_PORT" && "$INFERENCE_PORT" != "7474" ]]; then
                 _port=7474
             fi
             export OPENMONO_ENDPOINT="http://llama-server:${_port}${_path}"
@@ -1792,13 +1871,44 @@ cmd_logs() {
     else
         _ensure_docker
         cd "$DOCKER_DIR"
-        export LLAMA_PORT
+        export INFERENCE_PORT
         docker compose logs -f llama-server
     fi
 }
 
 cmd_status() {
     echo ""
+
+    if _has_local_inference; then
+        local _des_port _des_slots _app_port _app_slots _backend_label
+        _des_port="$(_inference_port)"
+        _app_port="$(_applied_inference_port)"
+        _des_slots=""
+        if command -v jq &>/dev/null && [[ -f "$(_settings_file)" ]]; then
+            _des_slots="$(jq -r '.inference.parallel_slots // empty' "$(_settings_file)" 2>/dev/null || true)"
+        fi
+        _app_slots="$(_env_get INFERENCE_PARALLEL)"
+        [[ -n "$_app_slots" ]] || _app_slots="$(_env_get LLAMA_PARALLEL)"
+        [[ -n "$_app_slots" ]] || _app_slots="$(_env_get STRATA_PARALLEL)"
+        # The native backend reads parallel_slots straight from settings.json at
+        # start (it has no env applied key), so the applied value is the desired
+        # one — fall back to it so a pre-apply box doesn't show '?'.
+        if [[ "$NATIVE_INFERENCE" == "true" && -z "$_app_slots" && -n "$_des_slots" ]]; then
+            _app_slots="$_des_slots"
+        fi
+        _backend_label="$(_inference_backend)"
+        [[ "$NATIVE_INFERENCE" == "true" ]] && _backend_label="llama-native (Metal)"
+        echo -e "${BLUE}── Inference settings ───────────────────────────────${NC}"
+        echo "  backend : ${_backend_label}"
+        echo "  port    : desired ${_des_port} / applied ${_app_port:-?}"
+        echo "  slots   : desired ${_des_slots:-1} / applied ${_app_slots:-?}"
+        if _inference_settings_drift; then
+            ok "settings.json is applied"
+        else
+            warn "settings.json differs from applied state — run: openmono start"
+        fi
+        echo ""
+    fi
 
     if [[ "$NATIVE_INFERENCE" == "true" ]]; then
         native_cmd_status
@@ -1864,10 +1974,10 @@ print(models[0].get('id', '').strip() if models else '')
 
         echo ""
         echo -e "${BLUE}── llama-server health ──────────────────────────────${NC}"
-        if curl -sf "http://localhost:${LLAMA_PORT}/health" &>/dev/null; then
-            ok "http://localhost:${LLAMA_PORT}/health → OK"
+        if curl -sf "http://localhost:${INFERENCE_PORT}/health" &>/dev/null; then
+            ok "http://localhost:${INFERENCE_PORT}/health → OK"
         else
-            warn "http://localhost:${LLAMA_PORT}/health → not responding"
+            warn "http://localhost:${INFERENCE_PORT}/health → not responding"
         fi
 
         echo ""
@@ -1895,7 +2005,7 @@ print(models[0].get('id', '').strip() if models else '')
     echo ""
     echo -e "${BLUE}── Model ────────────────────────────────────────────${NC}"
     LOADED=""
-    LOADED=$(curl -sf --max-time 3 "http://localhost:${LLAMA_PORT}/props" \
+    LOADED=$(curl -sf --max-time 3 "http://localhost:${INFERENCE_PORT}/props" \
         | python3 -c "
 import sys, json
 d = json.load(sys.stdin)
@@ -1906,7 +2016,7 @@ name = (d.get('model_alias') or '').strip() \
 print(name)
 " 2>/dev/null || true)
     if [ -z "$LOADED" ]; then
-        LOADED=$(curl -sf --max-time 3 "http://localhost:${LLAMA_PORT}/v1/models" \
+        LOADED=$(curl -sf --max-time 3 "http://localhost:${INFERENCE_PORT}/v1/models" \
             | python3 -c "
 import sys, json
 d = json.load(sys.stdin)
@@ -2101,6 +2211,8 @@ cmd_config() {
         echo "Examples:"
         echo "  openmono config set llm.endpoint http://10.0.0.5:17474"
         echo "  openmono config set inference.vision_enabled true   # allow image input"
+        echo "  openmono config set inference.port 7474             # local inference port"
+        echo "  openmono config set inference.parallel_slots 2      # concurrent slots"
         echo "  openmono config get llm.endpoint"
         echo "  openmono config set host.sudo_policy allow"
         echo "  openmono config set host.exec_default ask"
@@ -2120,6 +2232,22 @@ cmd_config() {
     _openmono_config_value() {
         local key="$1" value="$2"
         case "$key" in
+            inference.port)
+                if [[ "$value" =~ ^[0-9]+$ ]] && (( value >= 1 && value <= 65535 )); then
+                    printf '%s' "$value"
+                    return 0
+                fi
+                err "inference.port must be a port number (1-65535, got: $value)"
+                return 1
+                ;;
+            inference.parallel_slots)
+                if [[ "$value" =~ ^[0-9]+$ ]] && (( value >= 1 )); then
+                    printf '%s' "$value"
+                    return 0
+                fi
+                err "inference.parallel_slots must be a whole number >= 1 (got: $value)"
+                return 1
+                ;;
             *.allow_list|*.deny_list|host.allow_list|host.deny_list)
             # Split on commas without bash-4 arrays (macOS ships bash 3.2).
             local out="" item
@@ -2390,10 +2518,19 @@ cmd_tunnel() {
                 mv "$tmp" "$env_file"
                 chmod 0600 "$env_file"
                 _sync_api_key_to_settings "$new_key"
+                _apply_inference_settings
                 ok "LLAMA_API_KEY rotated in docker/.env (docker/.env + settings.json)"
                 if [[ "$(_inference_backend)" == "strata" ]]; then
-                    # Strata backend: the rotated key guards the Caddy gateway.
-                    # Restart it when present; Strata itself keeps its own key.
+                    # Strata enforces its own --api-key; Caddy forwards the
+                    # client's Authorization header upstream, so the running
+                    # server must be restarted with the rotated key too.
+                    if [[ -f "$HOME/.openmono/strata.env" ]]; then
+                        info "Restarting Strata with the rotated API key..."
+                        bash "$REPO_DIR/scripts/strata.sh" stop || true
+                        bash "$REPO_DIR/scripts/strata.sh" start || \
+                            warn "Strata restart failed — run: openmono restart"
+                    fi
+                    # Restart Caddy when present so it picks up the new env.
                     if (cd "$REPO_DIR/docker" && _compose ps --services 2>/dev/null | grep -q '^caddy$'); then
                         info "Restarting Caddy gateway with new API key..."
                         (cd "$REPO_DIR/docker" && _compose up -d caddy) || \
@@ -2404,10 +2541,10 @@ cmd_tunnel() {
                     fi
                 elif command -v docker &>/dev/null && docker compose version &>/dev/null 2>&1; then
                     if (cd "$REPO_DIR/docker" && docker compose ps --services 2>/dev/null | grep -q '^llama-server$'); then
-                        info "Restarting llama-server with new API key..."
-                        (cd "$REPO_DIR/docker" && docker compose restart llama-server) || \
-                            warn "Restart failed — run manually: cd docker && docker compose restart llama-server"
-                        ok "llama-server restarted"
+                        info "Recreating llama-server with new API key..."
+                        (cd "$REPO_DIR/docker" && docker compose up -d --force-recreate llama-server) || \
+                            warn "Restart failed — run manually: openmono restart"
+                        ok "llama-server recreated"
                     else
                         warn "llama-server is not running — start it with: openmono start"
                     fi

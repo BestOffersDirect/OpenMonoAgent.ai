@@ -8,7 +8,7 @@
 #
 # Substituted at load time from the environment (see docker-compose.yml):
 #   LLAMA_API_KEY       shared bearer token (reused from the inference key)
-#   LLAMA_UPSTREAM      e.g. llama-server:7474 — or host.docker.internal:8080
+#   LLAMA_UPSTREAM      e.g. llama-server:7474 — or host.docker.internal:7474
 #                       for the Strata backend (see docker-compose.strata.yml).
 #                       Despite the legacy name it is a plain OpenAI-compatible
 #                       HTTP upstream either way: /v1, /v1/messages and

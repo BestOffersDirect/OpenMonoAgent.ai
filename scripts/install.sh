@@ -18,14 +18,15 @@ set -euo pipefail
 #                         llama  = standard bundled llama.cpp Docker path
 #                                  (Qwen stock; Bonsai adds the Prism image).
 #                         strata = Strata (Qwen3.8-Flash-Next, OpenAI-compatible
-#                                  :8080/v1) via scripts/strata.sh — no vendoring,
+#                                  :7474/v1) via scripts/strata.sh — no vendoring,
 #                                  needs Linux + NVIDIA + CUDA 13 (auto-installed),
 #                                  see docs/STRATA.md. Opt in with --model=flash-next.
 #                         (macOS Apple Silicon always uses its native path.)
 #   OPENMONO_GPU=1        Force GPU mode (writes GPU docker-compose override)
 #   OPENMONO_CPU=1        Force CPU mode (removes any GPU override)
 #   OPENMONO_VERBOSE=1    Show detailed command output
-#   LLAMA_PORT=7474       llama-server host port (default 7474)
+#   INFERENCE_PORT=7474   shared inference port for every backend (default 7474)
+#   OPENMONO_PARALLEL_SLOTS=N  Parallel slots (default 1; asked interactively)
 #   OPENMONO_MODEL        Model engine: auto (default), qwen, bonsai-pq2, bonsai-ptq1, flash-next
 #                         auto = analyze hardware, then pick (default Qwen on llama.cpp;
 #                                Bonsai/Strata offered only when the box can run them)
@@ -51,6 +52,8 @@ source "$SCRIPT_DIR/lib/prism.sh"
 source "$SCRIPT_DIR/lib/model-catalog.sh"
 # shellcheck source=/dev/null
 source "$SCRIPT_DIR/lib/vision.sh"
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR/lib/inference-settings.sh"
 
 # ── Context size presets (tokens) — edit here to change globally ─────────────
 CTX_24G=196608       # GPU 24GB+  q8_0 KV  (~8GB KV + 15GB weights ≈ 23GB)
@@ -226,6 +229,25 @@ esac
 if [ "${OPENMONO_INFERENCE_BACKEND:-}" = "strata" ]; then
     info "Inference backend: Strata (Qwen3.8-Flash-Next) — explicitly selected via OPENMONO_INFERENCE_BACKEND"
     info "Docs: docs/STRATA.md — Strata is MIT-licensed upstream (github.com/Niko1221/Strata)"
+fi
+
+# One canonical inference port for every backend. Preserve an explicit env or a
+# value already in settings.json (and migrate the old Strata default 8080);
+# otherwise default to 7474. LLAMA_PORT/STRATA_PORT are read only from legacy
+# installs; nothing below writes or exports them again.
+if [ "$OPENMONO_ROLE" != "agent" ]; then
+    _INFERENCE_PORT="${OPENMONO_PORT:-${INFERENCE_PORT:-${LLAMA_PORT:-${STRATA_PORT:-}}}}"
+    if [ -z "$_INFERENCE_PORT" ] && command -v jq &>/dev/null \
+        && [ -f "$HOME/.openmono/settings.json" ]; then
+        _INFERENCE_PORT="$(jq -r '.inference.port // empty' "$HOME/.openmono/settings.json" 2>/dev/null || true)"
+    fi
+    if [ -z "$_INFERENCE_PORT" ] && [ -f "$HOME/.openmono/strata.env" ]; then
+        _INFERENCE_PORT="$(bash -c 'source "$1" 2>/dev/null; printf "%s" "${INFERENCE_PORT:-${STRATA_PORT:-}}"' _ "$HOME/.openmono/strata.env")"
+    fi
+    [ "$_INFERENCE_PORT" = "8080" ] && _INFERENCE_PORT=7474
+    _INFERENCE_PORT="${_INFERENCE_PORT:-7474}"
+    export INFERENCE_PORT="$_INFERENCE_PORT"
+    om_persist_inference_port "$_INFERENCE_PORT"
 fi
 
 # Step counts vary by role. We keep numbering stable per-role rather than
@@ -416,6 +438,13 @@ if [ "$OPENMONO_ROLE" != "agent" ]; then
     # Unified picker: defaults to Qwen on stock llama.cpp; Bonsai / Strata are
     # offered only when this box supports them. Sets INFERENCE_BACKEND.
     prompt_model_choice
+    # Parallel slots: ask once for every backend/model, persist to settings.json.
+    # apply_settings.sh materializes it (INFERENCE_PARALLEL / the Strata config
+    # "parallel") on start; the docker/.env writes below keep the very first
+    # start in sync.
+    PARALLEL_SLOTS="$(om_choose_parallel_slots 1)"
+    export PARALLEL_SLOTS
+    export INFERENCE_PARALLEL="$PARALLEL_SLOTS"
     # Bonsai / Prism model plumbing below applies only to the llama.cpp backend;
     # Strata owns its own weights and engine, so skip it entirely for strata.
     if [ "$INFERENCE_BACKEND" != "strata" ]; then
@@ -698,10 +727,10 @@ if [ "$OPENMONO_ROLE" != "agent" ] && [ "$INFERENCE_BACKEND" = "strata" ]; then
     # Record the backend + port so openmono, healthcheck, and the tunnel script
     # route to Strata instead of llama.
     if [ -f "$DOCKER_ENV_FILE" ]; then
-        grep -v -E "^INFERENCE_BACKEND=|^STRATA_PORT=|^OPENMONO_VISION_ENABLED=" "$DOCKER_ENV_FILE" > "${DOCKER_ENV_FILE}.tmp" || true
+        grep -v -E "^INFERENCE_BACKEND=|^INFERENCE_PORT=|^LLAMA_PORT=|^STRATA_PORT=|^INFERENCE_PARALLEL=|^STRATA_PARALLEL=|^LLAMA_PARALLEL=|^LLAMA_UPSTREAM=|^OPENMONO_VISION_ENABLED=" "$DOCKER_ENV_FILE" > "${DOCKER_ENV_FILE}.tmp" || true
         mv "${DOCKER_ENV_FILE}.tmp" "$DOCKER_ENV_FILE"
     fi
-    printf "INFERENCE_BACKEND=strata\nSTRATA_PORT=%s\n" "${STRATA_PORT:-8080}" >> "$DOCKER_ENV_FILE"
+    printf "INFERENCE_BACKEND=strata\nINFERENCE_PORT=%s\nINFERENCE_PARALLEL=%s\nLLAMA_UPSTREAM=host.docker.internal:%s\n" "${INFERENCE_PORT:-7474}" "${PARALLEL_SLOTS:-1}" "${INFERENCE_PORT:-7474}" >> "$DOCKER_ENV_FILE"
     # Vision was chosen during Strata setup (yes|cpu|no), recorded by strata.sh
     # in ~/.openmono/strata.env; mirror it into settings.json so the agent
     # accepts images through this backend.
@@ -715,8 +744,8 @@ if [ "$OPENMONO_ROLE" != "agent" ] && [ "$INFERENCE_BACKEND" = "strata" ]; then
         printf "OPENMONO_VISION_ENABLED=0\n" >> "$DOCKER_ENV_FILE"
     fi
     detail "Vision: $_strata_vision (mirrored to inference.vision_enabled)"
-    detail "Persisted INFERENCE_BACKEND=strata STRATA_PORT=${STRATA_PORT:-8080} to $DOCKER_ENV_FILE"
-    detail "Strata endpoint: http://127.0.0.1:${STRATA_PORT:-8080}/v1 (host-native, OpenAI-compatible)"
+    detail "Persisted INFERENCE_BACKEND=strata INFERENCE_PORT=${INFERENCE_PORT:-7474} to $DOCKER_ENV_FILE"
+    detail "Strata endpoint: http://127.0.0.1:${INFERENCE_PORT:-7474}/v1 (host-native, OpenAI-compatible)"
     detail "Caddy gateway (optional) can front it via docker/docker-compose.strata.yml"
 fi
 
@@ -806,7 +835,7 @@ services:
       --cache-type-v \${KV_CACHE_V:-$_KV_V}
       --batch-size \${LLAMA_BATCH:-2048}
       --ubatch-size \${LLAMA_UBATCH:-1024}
-      --parallel \${LLAMA_PARALLEL:-1}
+      --parallel \${INFERENCE_PARALLEL:-1}
       --jinja
       --reasoning off
       --metrics \${MODEL_MMPROJ:+--mmproj /models/\${MODEL_MMPROJ} --image-min-tokens 1024 --image-max-tokens 1280}
@@ -831,7 +860,7 @@ EOF
     printf "     ${DIM}                  presets: 32k=32768  64k=65536  96k=98304  128k=131072  192k=196608${NC}\n"
     printf "     ${DIM}KV_CACHE_K/V      f16 (best) → q8_0 → q5_1 → q4_1 → q4_0 (least VRAM)${NC}\n"
     printf "     ${DIM}N_GPU_LAYERS      99=all on GPU; lower to spill layers to CPU RAM${NC}\n"
-    printf "     ${DIM}LLAMA_PARALLEL=N  N concurrent slots, each costs ctx-size of KV cache${NC}\n"
+    printf "     ${DIM}INFERENCE_PARALLEL=N  N concurrent slots, each costs ctx-size of KV cache${NC}\n"
     if [ -n "${MODEL_MMPROJ:-}" ]; then
     printf "\n  ${BOLD}${CYAN}Vision (enabled by default)${NC}\n"
     printf "     ${DIM}Vision encoder (mmproj) is loaded alongside the model${NC}\n"
@@ -912,7 +941,7 @@ services:
       --flash-attn \${LLAMA_FLASH_ATTN:-on}
       --cache-type-k \${KV_CACHE_K:-q8_0}
       --cache-type-v \${KV_CACHE_V:-q8_0}
-      --parallel \${LLAMA_PARALLEL:-1}
+      --parallel \${INFERENCE_PARALLEL:-1}
       --jinja
       --reasoning off
       --metrics \${MODEL_MMPROJ:+--mmproj /models/\${MODEL_MMPROJ} --image-min-tokens 1024 --image-max-tokens 1280}
@@ -979,7 +1008,7 @@ services:
       --flash-attn \${LLAMA_FLASH_ATTN:-on}
       --cache-type-k \${KV_CACHE_K:-q8_0}
       --cache-type-v \${KV_CACHE_V:-q8_0}
-      --parallel \${LLAMA_PARALLEL:-1}
+      --parallel \${INFERENCE_PARALLEL:-1}
       --jinja
       --reasoning off
       --metrics \${MODEL_MMPROJ:+--mmproj /models/\${MODEL_MMPROJ} --image-min-tokens 1024 --image-max-tokens 1280}
@@ -1053,10 +1082,10 @@ fi
 # what lets a box that previously ran Strata switch back to --model=qwen without
 # the launcher (which reads this file) still trying to route to a Strata server.
 if [ -f "$DOCKER_ENV_FILE" ]; then
-    grep -v -E "^MODEL_NAME=|^MODEL_ALIAS=|^MODEL_MMPROJ=|^OPENMONO_VISION_ENABLED=|^CTX_SIZE=|^INFERENCE_BACKEND=" "$DOCKER_ENV_FILE" > "${DOCKER_ENV_FILE}.tmp" || true
+    grep -v -E "^MODEL_NAME=|^MODEL_ALIAS=|^MODEL_MMPROJ=|^OPENMONO_VISION_ENABLED=|^CTX_SIZE=|^INFERENCE_BACKEND=|^INFERENCE_PORT=|^LLAMA_PORT=|^STRATA_PORT=|^LLAMA_UPSTREAM=|^INFERENCE_PARALLEL=|^LLAMA_PARALLEL=|^STRATA_PARALLEL=" "$DOCKER_ENV_FILE" > "${DOCKER_ENV_FILE}.tmp" || true
     mv "${DOCKER_ENV_FILE}.tmp" "$DOCKER_ENV_FILE"
 fi
-printf "INFERENCE_BACKEND=llama\nMODEL_NAME=%s\nMODEL_ALIAS=%s\nMODEL_MMPROJ=%s\nCTX_SIZE=%s\n" "$MODEL_NAME" "$MODEL_ALIAS" "${MODEL_MMPROJ:-}" "${_CTX:-$CTX_CPU}" >> "$DOCKER_ENV_FILE"
+printf "INFERENCE_BACKEND=llama\nINFERENCE_PORT=%s\nLLAMA_UPSTREAM=llama-server:7474\nMODEL_NAME=%s\nMODEL_ALIAS=%s\nMODEL_MMPROJ=%s\nCTX_SIZE=%s\nINFERENCE_PARALLEL=%s\n" "${INFERENCE_PORT:-7474}" "$MODEL_NAME" "$MODEL_ALIAS" "${MODEL_MMPROJ:-}" "${_CTX:-$CTX_CPU}" "${PARALLEL_SLOTS:-1}" >> "$DOCKER_ENV_FILE"
 if [ -n "${MODEL_MMPROJ:-}" ]; then
     printf "OPENMONO_VISION_ENABLED=1\n" >> "$DOCKER_ENV_FILE"
     om_persist_vision true
@@ -1079,9 +1108,9 @@ if [ "$OPENMONO_ROLE" != "agent" ]; then
     mkdir -p "$(dirname "$SETTINGS_FILE")"
     [ -f "$SETTINGS_FILE" ] || echo '{}' > "$SETTINGS_FILE"
     if [ "${INFERENCE_BACKEND:-llama}" = "strata" ]; then
-        _ep="http://127.0.0.1:${STRATA_PORT:-8080}/v1"
+        _ep="http://127.0.0.1:${INFERENCE_PORT:-7474}/v1"
     else
-        _ep="http://127.0.0.1:${LLAMA_PORT:-7474}"
+        _ep="http://127.0.0.1:${INFERENCE_PORT:-7474}"
     fi
     if [ -z "$(jq -r '.llm.endpoint // empty' "$SETTINGS_FILE" 2>/dev/null)" ]; then
         jq --arg e "$_ep" '.llm = ((.llm // {}) + {endpoint: $e})' "$SETTINGS_FILE" > "$SETTINGS_FILE.tmp" \
@@ -1268,13 +1297,11 @@ ok "Docker images built"
 if [ "$OPENMONO_ROLE" != "agent" ] && [ "$INFERENCE_BACKEND" = "strata" ]; then
     next_step "Starting Strata inference server"
 
-    export STRATA_PORT="${STRATA_PORT:-8080}"
-    if [ -f "$DOCKER_ENV_FILE" ]; then
-        grep -v -E "^STRATA_PORT=" "$DOCKER_ENV_FILE" > "${DOCKER_ENV_FILE}.tmp" || true
-        mv "${DOCKER_ENV_FILE}.tmp" "$DOCKER_ENV_FILE"
-    fi
-    echo "STRATA_PORT=${STRATA_PORT}" >> "$DOCKER_ENV_FILE"
-    detail "Persisted STRATA_PORT=${STRATA_PORT} to $DOCKER_ENV_FILE"
+    export INFERENCE_PORT="${INFERENCE_PORT:-7474}"
+
+    # Reconcile settings.json -> applied state once before the first start.
+    bash "$SCRIPT_DIR/apply_settings.sh" --apply --quiet || \
+        warn "Could not apply settings.json to the Strata config — check: bash scripts/apply_settings.sh --check"
 
     if ! bash "$SCRIPT_DIR/strata.sh" start; then
         warn "Strata did not become healthy yet — first boot can take several minutes."
@@ -1285,14 +1312,14 @@ fi
 if [ "$OPENMONO_ROLE" != "agent" ] && [ "$INFERENCE_BACKEND" != "strata" ]; then
     next_step "Starting llama-server"
 
-    LLAMA_PORT="${LLAMA_PORT:-7474}"
+    INFERENCE_PORT="${INFERENCE_PORT:-7474}"
 
     port_in_use() {
         ss -tlnp 2>/dev/null | grep -q ":${1} " \
         || lsof -i ":${1}" &>/dev/null 2>&1
     }
 
-    if port_in_use "$LLAMA_PORT"; then
+    if port_in_use "$INFERENCE_PORT"; then
         # If the port is held by our own llama-server container (this or a
         # previous install), stop it and restart on the SAME port — switching
         # ports to dodge the very service we are about to start is pointless.
@@ -1301,37 +1328,26 @@ if [ "$OPENMONO_ROLE" != "agent" ] && [ "$INFERENCE_BACKEND" != "strata" ]; then
             _port_holder="$(docker ps --filter 'name=llama-server' --format '{{.Names}}' 2>/dev/null | head -1 || true)"
         fi
         if [ -n "$_port_holder" ]; then
-            info "Port ${LLAMA_PORT} is held by an existing llama-server container — restarting on the same port"
+            info "Port ${INFERENCE_PORT} is held by an existing llama-server container — restarting on the same port"
             docker stop "$_port_holder" >/dev/null 2>&1 || true
             for _i in $(seq 1 10); do
-                port_in_use "$LLAMA_PORT" || break
+                port_in_use "$INFERENCE_PORT" || break
                 sleep 1
             done
         fi
-        if port_in_use "$LLAMA_PORT"; then
-            warn "Port ${LLAMA_PORT} is in use by another process"
+        if port_in_use "$INFERENCE_PORT"; then
+            warn "Port ${INFERENCE_PORT} is in use by another process"
             if command -v ss &>/dev/null; then
-                ss -tlnp 2>/dev/null | grep ":${LLAMA_PORT} " | head -1 | sed 's/^/     /' || true
+                ss -tlnp 2>/dev/null | grep ":${INFERENCE_PORT} " | head -1 | sed 's/^/     /' || true
             fi
-            for try in 8081 8082 8083 8084 8085 9080; do
-                if ! port_in_use "$try"; then
-                    LLAMA_PORT="$try"
-                    info "Using port $LLAMA_PORT instead"
-                    break
-                fi
-            done
+            die "Port ${INFERENCE_PORT} is busy. Free it, or choose another port with: openmono config set inference.port <port>  (then re-run openmono setup)"
         fi
     fi
 
-    export LLAMA_PORT
-    if [ -f "$DOCKER_ENV_FILE" ]; then
-        grep -v "^LLAMA_PORT=" "$DOCKER_ENV_FILE" > "${DOCKER_ENV_FILE}.tmp" || true
-        mv "${DOCKER_ENV_FILE}.tmp" "$DOCKER_ENV_FILE"
-    fi
-    echo "LLAMA_PORT=${LLAMA_PORT}" >> "$DOCKER_ENV_FILE"
-    detail "Persisted LLAMA_PORT=${LLAMA_PORT} to $DOCKER_ENV_FILE"
-
-    info "Starting daemon on port ${LLAMA_PORT}..."
+    export INFERENCE_PORT
+    info "Starting daemon on port ${INFERENCE_PORT}..."
+    bash "$SCRIPT_DIR/apply_settings.sh" --apply --quiet || \
+        warn "Could not apply settings.json to docker/.env — check: bash scripts/apply_settings.sh --check"
     if ! run docker compose up -d llama-server; then
         die "Failed to start llama-server (check: docker compose logs llama-server)"
     fi
@@ -1339,7 +1355,7 @@ if [ "$OPENMONO_ROLE" != "agent" ] && [ "$INFERENCE_BACKEND" != "strata" ]; then
     info "Waiting for llama-server to become healthy (model load can take 1-2 min)..."
     HEALTHY=false
     for i in $(seq 1 36); do
-        if curl -sf "http://localhost:${LLAMA_PORT}/health" &>/dev/null; then
+        if curl -sf "http://localhost:${INFERENCE_PORT}/health" &>/dev/null; then
             HEALTHY=true
             break
         fi
@@ -1349,7 +1365,7 @@ if [ "$OPENMONO_ROLE" != "agent" ] && [ "$INFERENCE_BACKEND" != "strata" ]; then
     echo ""
 
     if [ "$HEALTHY" = true ]; then
-        ok "llama-server is healthy on port ${LLAMA_PORT}"
+        ok "llama-server is healthy on port ${INFERENCE_PORT}"
     else
         warn "llama-server did not become healthy within 180s."
         warn "This can be normal on low-RAM systems (model is ~20 GB)."
@@ -1390,11 +1406,11 @@ clear_setup_prefs
 if [[ -n "${OPENMONO_ENV_FILE:-}" ]]; then
     cat > "$OPENMONO_ENV_FILE" <<ENVEOF
 export INSTALL_DIR="$INSTALL_DIR"
-export LLAMA_PORT="${LLAMA_PORT:-7474}"
+export INFERENCE_PORT="${INFERENCE_PORT:-7474}"
+export INFERENCE_PARALLEL="${INFERENCE_PARALLEL:-${PARALLEL_SLOTS:-1}}"
 export GPU_MODE="${GPU_MODE:-0}"
 export OPENMONO_ROLE="$OPENMONO_ROLE"
 export OPENMONO_INFERENCE_BACKEND="${INFERENCE_BACKEND:-llama}"
-export STRATA_PORT="${STRATA_PORT:-8080}"
 export OPENMONO_HOST_BRIDGE="${OPENMONO_HOST_BRIDGE:-0}"
 export MODEL_NAME="${MODEL_NAME:-}"
 export MODEL_ACCURACY="${MODEL_ACCURACY:-standard}"

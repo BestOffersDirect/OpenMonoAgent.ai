@@ -218,8 +218,8 @@
         "line": "Qwen3.8-Flash-Next via Strata (~70GB, NVIDIA / CUDA 13)"
       },
       "script": "scripts/strata.sh",
-      "port_env": "STRATA_PORT",
-      "port_default": 8080
+      "port_env": "INFERENCE_PORT",
+      "port_default": 7474
     }
   ],
   "context": {

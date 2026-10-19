@@ -6,7 +6,7 @@ set -euo pipefail
 #
 # Strata (https://github.com/Niko1221/Strata, MIT License) runs the
 # Qwen3.8-Flash-Next model on a regular gaming PC (NVIDIA/AMD GPU, 12GB+ VRAM)
-# and serves an OpenAI-compatible API at http://127.0.0.1:8080/v1
+# and serves an OpenAI-compatible API at http://127.0.0.1:7474/v1
 # (plus /v1/messages for Anthropic-style clients and /v1/responses).
 #
 # OpenMono does NOT vendor Strata. This script clones upstream Strata next to
@@ -15,7 +15,7 @@ set -euo pipefail
 # (run-<model>.sh). The .NET agent then talks to Strata exactly like any other
 # OpenAI-compatible provider — any API key and any model name work.
 #
-# State: ~/.openmono/strata.env  (STRATA_DIR, STRATA_PORT, STRATA_MODEL, ...)
+# State: ~/.openmono/strata.env  (STRATA_DIR, INFERENCE_PORT, STRATA_MODEL, ...)
 #
 # Usage:
 #   strata.sh check            # hardware preflight (no changes besides Strata's own python venv probe)
@@ -29,19 +29,40 @@ set -euo pipefail
 #
 # Env overrides:
 #   STRATA_DIR     where Strata lives            (default ~/strata)
-#   STRATA_PORT    server port                   (default 8080)
+#   INFERENCE_PORT server port                   (default 7474)
+#   STRATA_PORT    legacy alias for INFERENCE_PORT (read-only migration)
 #   STRATA_FAMILY  qwen|swift|coder|unsloth      (default qwen)
 #   STRATA_MODEL   Q2_0|IQ2_XS|IQ3_XXS|IQ3_S|... (default: setup picks for the RAM)
 #   STRATA_CONTEXT context tokens                (default: setup picks for the VRAM)
 #   STRATA_VISION  yes|no|cpu                    (interactive prompt; "no" when non-interactive)
+#   INFERENCE_PARALLEL parallel slots (batch)     (default: setup picks, 1)
+#   STRATA_PARALLEL legacy alias for INFERENCE_PARALLEL (read-only migration)
 #   STRATA_DATA_DIR model-file dir               (default <STRATA_DIR>-data next to Strata)
 #   STRATA_HOST    bind address                  (default 0.0.0.0 so the agent container can reach it)
 #   STRATA_API_KEY key Strata requires           (default: LLAMA_API_KEY from docker/.env)
 # ──────────────────────────────────────────────────────────────────────────────
 
 STRATA_REPO="https://github.com/Niko1221/Strata.git"
+
+# Capture values the caller exported BEFORE we apply defaults, so load_env()
+# can let explicit env win over the persisted strata.env. apply_settings.sh
+# writes strata.env as *applied* state; an explicit INFERENCE_PORT=... on the
+# command line must still override it. STRATA_PORT is accepted only from legacy
+# callers/installs.
+_STRATA_DIR_ENV="${STRATA_DIR:-}"
+_INFERENCE_PORT_ENV="${INFERENCE_PORT:-}"
+_STRATA_PORT_ENV="${STRATA_PORT:-}"
+_INFERENCE_PARALLEL_ENV="${INFERENCE_PARALLEL:-}"
+_STRATA_PARALLEL_ENV="${STRATA_PARALLEL:-}"
+_STRATA_FAMILY_ENV="${STRATA_FAMILY:-}"
+_STRATA_MODEL_ENV="${STRATA_MODEL:-}"
+_STRATA_CONTEXT_ENV="${STRATA_CONTEXT:-}"
+_STRATA_VISION_ENV="${STRATA_VISION:-}"
+_STRATA_DATA_DIR_ENV="${STRATA_DATA_DIR:-}"
+
 STRATA_DIR="${STRATA_DIR:-$HOME/strata}"
-STRATA_PORT="${STRATA_PORT:-8080}"
+INFERENCE_PORT="${INFERENCE_PORT:-${STRATA_PORT:-7474}}"
+INFERENCE_PARALLEL="${INFERENCE_PARALLEL:-${STRATA_PARALLEL:-}}"
 STRATA_FAMILY="${STRATA_FAMILY:-qwen}"
 STRATA_MODEL="${STRATA_MODEL:-}"
 STRATA_CONTEXT="${STRATA_CONTEXT:-}"
@@ -92,7 +113,8 @@ save_env() {
     mkdir -p "$OPENMONO_STATE_DIR"
     cat > "$STRATA_ENV_FILE" <<EOF
 STRATA_DIR="$STRATA_DIR"
-STRATA_PORT="$STRATA_PORT"
+INFERENCE_PORT="$INFERENCE_PORT"
+INFERENCE_PARALLEL="$INFERENCE_PARALLEL"
 STRATA_FAMILY="$STRATA_FAMILY"
 STRATA_MODEL="$STRATA_MODEL"
 STRATA_CONTEXT="$STRATA_CONTEXT"
@@ -102,13 +124,34 @@ EOF
 }
 
 load_env() {
+    # Clear the in-memory shared knobs so the persisted file (new or legacy
+    # keys) can supply them; explicit caller env is restored below and wins.
+    unset INFERENCE_PORT STRATA_PORT INFERENCE_PARALLEL STRATA_PARALLEL
     # shellcheck source=/dev/null
     [[ -f "$STRATA_ENV_FILE" ]] && source "$STRATA_ENV_FILE"
+    # Explicit env from the caller (install.sh, openmono) overrides persisted state.
+    [[ -n "$_STRATA_DIR_ENV" ]]      && STRATA_DIR="$_STRATA_DIR_ENV"
+    if [[ -n "$_INFERENCE_PORT_ENV" ]]; then
+        INFERENCE_PORT="$_INFERENCE_PORT_ENV"
+    elif [[ -n "$_STRATA_PORT_ENV" ]]; then
+        INFERENCE_PORT="$_STRATA_PORT_ENV"
+    fi
+    if [[ -n "$_INFERENCE_PARALLEL_ENV" ]]; then
+        INFERENCE_PARALLEL="$_INFERENCE_PARALLEL_ENV"
+    elif [[ -n "$_STRATA_PARALLEL_ENV" ]]; then
+        INFERENCE_PARALLEL="$_STRATA_PARALLEL_ENV"
+    fi
+    [[ -n "$_STRATA_FAMILY_ENV" ]]   && STRATA_FAMILY="$_STRATA_FAMILY_ENV"
+    [[ -n "$_STRATA_MODEL_ENV" ]]    && STRATA_MODEL="$_STRATA_MODEL_ENV"
+    [[ -n "$_STRATA_CONTEXT_ENV" ]]  && STRATA_CONTEXT="$_STRATA_CONTEXT_ENV"
+    [[ -n "$_STRATA_VISION_ENV" ]]   && STRATA_VISION="$_STRATA_VISION_ENV"
+    [[ -n "$_STRATA_DATA_DIR_ENV" ]] && STRATA_DATA_DIR="$_STRATA_DATA_DIR_ENV"
     STRATA_DIR="${STRATA_DIR:-$HOME/strata}"
-    STRATA_PORT="${STRATA_PORT:-8080}"
+    INFERENCE_PORT="${INFERENCE_PORT:-${STRATA_PORT:-7474}}"
+    INFERENCE_PARALLEL="${INFERENCE_PARALLEL:-${STRATA_PARALLEL:-}}"
 }
 
-strata_base_url() { echo "http://127.0.0.1:${STRATA_PORT}"; }
+strata_base_url() { echo "http://127.0.0.1:${INFERENCE_PORT}"; }
 
 # The API key Strata should require: STRATA_API_KEY, else the LLAMA_API_KEY the
 # llama.cpp backend uses (read from docker/.env) — the same value the agent
@@ -135,7 +178,7 @@ strata_curl() {
 ensure_server_config() {
     local run_script="$1" cfg_path key
     # Strata's run script quotes EVERY token, the flag included — the line reads
-    #   ... "--engine" "strata" "--config" "/path/strata-x.json" "--port" "8080"
+    #   ... "--engine" "strata" "--config" "/path/strata-x.json" "--port" "7474"
     # so the path sits between the flag's closing quote and the path's quote.
     # (Matching `--config[[:space:]]*"` there captured a lone space and silently
     # did nothing.)
@@ -154,9 +197,9 @@ ensure_server_config() {
         return 0
     fi
     key="$(strata_api_key)"
-    python3 - "$cfg_path" "$STRATA_HOST" "$key" <<'PY' || true
+    python3 - "$cfg_path" "$STRATA_HOST" "$key" "$INFERENCE_PARALLEL" <<'PY' || true
 import json, sys
-path, host, key = sys.argv[1], sys.argv[2], (sys.argv[3] if len(sys.argv) > 3 else "")
+path, host, key, parallel = sys.argv[1], sys.argv[2], (sys.argv[3] if len(sys.argv) > 3 else ""), (sys.argv[4] if len(sys.argv) > 4 else "")
 try:
     cfg = json.load(open(path))
 except Exception:
@@ -166,6 +209,11 @@ if host and cfg.get("host") != host:
     cfg["host"] = host; changed.append("host=" + host)
 if key and cfg.get("api_key") != key:
     cfg["api_key"] = key; changed.append("shared api key")
+if parallel and str(cfg.get("parallel")) != str(parallel):
+    try:
+        cfg["parallel"] = int(parallel); changed.append("parallel=" + str(parallel))
+    except ValueError:
+        pass
 if changed:
     json.dump(cfg, open(path, "w"), indent=1)
     print("[strata] run config updated (" + ", ".join(changed) + "): " + path)
@@ -529,6 +577,9 @@ cmd_install() {
     # `--yes` is consumed here (added to setup args); everything else after
     # `install` is forwarded to Strata's setup.sh verbatim,
     # e.g.: strata.sh install --yes --family coder
+    # Pick up a persisted install (dir/model/port/slots) so a re-run resumes it;
+    # explicitly exported STRATA_* values still win over strata.env.
+    load_env
     ensure_clone
     # Vision (image input) is a user choice, not a silent default. Prompt unless
     # STRATA_VISION was preset (env) or --vision was passed through to setup.sh.
@@ -551,7 +602,10 @@ cmd_install() {
     [[ -n "$STRATA_MODEL" ]] && setup_args+=(--model "$STRATA_MODEL")
     [[ -n "$STRATA_CONTEXT" ]] && setup_args+=(--context "$STRATA_CONTEXT")
     [[ -n "$STRATA_VISION" ]] && setup_args+=(--vision "$STRATA_VISION")
-    [[ "$STRATA_PORT" != "8080" ]] && setup_args+=(--port "$STRATA_PORT")
+    # Always pass the port explicitly: the old code skipped 8080 (the former
+    # default), which left setup.py choosing on its own. 7474 is now canonical.
+    [[ -n "$INFERENCE_PORT" ]] && setup_args+=(--port "$INFERENCE_PORT")
+    [[ -n "$INFERENCE_PARALLEL" ]] && setup_args+=(--parallel "$INFERENCE_PARALLEL")
     [[ -n "$STRATA_DATA_DIR" ]] && setup_args+=(--data-dir "$STRATA_DATA_DIR")
     # Bind a container-reachable address and share the agent's API key, exactly
     # like the llama.cpp backend (--host 0.0.0.0 --api-key $LLAMA_API_KEY).
@@ -682,7 +736,7 @@ cmd_stop() {
     fi
     # Fallback: anything still listening on the port (covers servers started by hand).
     if curl -sf "$(strata_base_url)/health" &>/dev/null; then
-        warn "Server still responding on $(strata_base_url) — it was started outside strata.sh; stop that process to free port $STRATA_PORT."
+        warn "Server still responding on $(strata_base_url) — it was started outside strata.sh; stop that process to free port $INFERENCE_PORT."
         return 1
     fi
     [[ "$stopped" == "1" ]] && ok "Strata stopped." || info "Strata is not running."
