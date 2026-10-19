@@ -53,9 +53,13 @@ om_persist_inference_port() {
 # $OPENMONO_PARALLEL_SLOTS when set, else the default. Always persists the
 # answer to settings.json and echoes it on stdout.
 om_choose_parallel_slots() {
+    # Runs inside a $(...) command substitution in the installers, which inherit
+    # their `set -euo pipefail` — so every test that can return 1 must be
+    # guarded, or the subshell dies silently and the prompt never prints.
     local default="${1:-1}" n="${OPENMONO_PARALLEL_SLOTS:-}"
     if [[ -z "$n" ]]; then
         if [[ -t 0 ]]; then
+            flush_stdin 2>/dev/null || true
             echo ""
             echo "  Parallel slots: how many requests may the model serve at once?" >&2
             echo "  Each slot reserves a full context of KV cache, so more slots cost" >&2
@@ -69,7 +73,9 @@ om_choose_parallel_slots() {
             n="$default"
         fi
     fi
-    [[ "$n" =~ ^[0-9]+$ ]] && (( n >= 1 )) || n="$default"
+    if ! [[ "$n" =~ ^[0-9]+$ ]] || (( n < 1 )); then
+        n="$default"
+    fi
     om_persist_parallel_slots "$n"
     printf '%s' "$n"
 }
