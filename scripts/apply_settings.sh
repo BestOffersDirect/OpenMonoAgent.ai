@@ -10,6 +10,7 @@ set -euo pipefail
 #   inference.port           -> INFERENCE_PORT (docker/.env, strata.env), Caddy
 #   inference.parallel_slots -> INFERENCE_PARALLEL, Strata config
 #   llm.api_key              -> LLAMA_API_KEY, Strata config api_key
+#                               (generated when missing; never rotated)
 #   inference.ctx_size       -> CTX_SIZE (llama/native), Strata --max-context
 #   inference.vision_enabled -> OPENMONO_VISION_ENABLED
 #   llm.endpoint             -> local endpoint (remote/relay endpoints untouched)
@@ -237,6 +238,32 @@ _desired_api_key() {
     printf '%s' "$key"
 }
 
+_new_api_key() {
+    local key=""
+    command -v openssl >/dev/null 2>&1 && key="$(openssl rand -hex 24 2>/dev/null || true)"
+    [[ -n "$key" ]] || key="$(head -c 24 /dev/urandom 2>/dev/null | od -An -tx1 | tr -d ' \n' || true)"
+    printf '%s' "$key"
+}
+
+# Every local inference backend takes a bearer key: llama-server runs with
+# --api-key, and Strata requires one and refuses to start without it on a
+# non-loopback bind. An empty key is an unauthenticated model endpoint on the
+# LAN, so always make one. llm.api_key is the desired state; the docker/.env
+# and Strata config writes below turn it into applied state.
+_ensure_api_key() {
+    local key="$1"
+    [[ -z "$key" ]] || { printf '%s' "$key"; return 0; }
+    key="$(_new_api_key)"
+    if [[ -z "$key" ]]; then
+        warn "could not generate an inference API key. Set it with:"
+        warn "  openmono config set llm.api_key <key>"
+        printf '%s' ""
+        return 0
+    fi
+    _settings_update '.llm = (.llm // {}) | .llm.api_key = $k' --arg k "$key" || true
+    printf '%s' "$key"
+}
+
 _desired_ctx() {
     local ctx
     ctx="$(_settings_get '.inference.ctx_size')"
@@ -401,6 +428,10 @@ _check() {
     _check_absent "$DOCKER_ENV" LLAMA_PARALLEL
     _check_absent "$DOCKER_ENV" STRATA_PARALLEL
     _check_env "$DOCKER_ENV" LLAMA_API_KEY "$key"
+    if [[ -z "$key" ]]; then
+        echo "  drift: llm.api_key is empty, but the inference server needs a bearer key" >&2
+        drift=1
+    fi
     _check_env "$DOCKER_ENV" LLAMA_UPSTREAM "$upstream"
     _check_env "$DOCKER_ENV" CTX_SIZE "$ctx"
     _check_env "$DOCKER_ENV" OPENMONO_VISION_ENABLED "$vision_env"
@@ -449,6 +480,13 @@ _apply() {
     _need_jq
     mkdir -p "$STATE_DIR"
     [[ -f "$SETTINGS_FILE" ]] || echo '{}' > "$SETTINGS_FILE"
+
+    # Every backend serves a bearer-protected API; make a key if the install never did.
+    local wanted_key="$key"
+    key="$(_ensure_api_key "$key")"
+    if [[ -n "$key" && -z "$wanted_key" ]]; then
+        info "generated an inference API key: llm.api_key"
+    fi
 
     # Pin the resolved defaults into settings.json so it is the single source.
     _settings_update '.inference = (.inference // {}) | .inference.port = $p | .inference.parallel_slots = $n' \

@@ -86,6 +86,21 @@ openmono config set llm.api_key "$(openssl rand -hex 24)"
 openmono start                                 # apply + start
 ```
 
+### Bind address and API key
+
+Strata is bound to `0.0.0.0`, not `127.0.0.1`: on Linux the agent runs in a
+container, and a loopback bind gives it `Connection refused`. Every OpenMono
+inference server runs with a bearer key — llama.cpp takes `--api-key`, Strata
+requires one and refuses to start without it on a non-loopback bind — so the
+key is not optional on any backend. `apply_settings.sh` creates one into
+`llm.api_key` when it is missing, and the install and every `openmono start`
+run that apply — so an install made before this existed repairs itself on the
+next `openmono restart`. An existing key is never rotated.
+
+Only `/health` and `/v1/health` are public. Everything else needs the bearer:
+`/v1/chat/completions`, `/props`, `/v1/models`, and on Strata also `/slots`
+and `/status`.
+
 `openmono status` shows desired vs applied values. To check without changing
 anything: `bash scripts/apply_settings.sh --check` (exit 2 = drift).
 Parallel slots are asked during install for every backend.
@@ -137,7 +152,8 @@ Single-box (`config-examples/strata-single-box.settings.json`):
 ```bash
 openmono config set llm.endpoint http://localhost:7474
 openmono config set llm.model Qwen3.8-Flash-Next
-# api_key: anything (or the --api-key from Strata setup, if one was set)
+# api_key: the shared key. OpenMono creates it in settings.json (llm.api_key)
+# because Strata is bound to 0.0.0.0 and requires one.
 ```
 
 Thinking levels: the agent's `off / low / medium / high` knob maps to Strata's
@@ -203,6 +219,7 @@ and path preserved, while plain `:7474`-style endpoints keep the legacy
 | Download/install interrupted | Re-run the same command — Strata resumes |
 | `prompt exceeds the context` | Re-run setup with a bigger context (`--setup --context N` in Strata terms) |
 | Agent connects but auth fails through the relay | Direct-Strata tunnel needs Strata's own `--api-key`; gateway tunnel needs `LLAMA_API_KEY` |
+| Server starts then dies; `openmono logs` ends with "a non-loopback bind requires an inference API key" | Strata refused the `0.0.0.0` bind because no key was set. `openmono restart` repairs it; by hand: `openmono config set llm.api_key "$(openssl rand -hex 24)" && openmono restart` |
 | `MapEndpoint` sends the container to the wrong host | Only loopback `/v1*` endpoints map to `host.docker.internal`; relay URLs pass through untouched |
 
 Strata engine detail lives in `~/strata/strata-*.log`; the wrapper log is

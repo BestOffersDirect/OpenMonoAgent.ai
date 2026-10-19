@@ -123,6 +123,19 @@ INFERENCE_PORT="${INFERENCE_PORT:-$(_env_get INFERENCE_PORT)}"
 [[ -n "$INFERENCE_PORT" ]] || INFERENCE_PORT="$(_env_get STRATA_PORT)"
 INFERENCE_PORT="${INFERENCE_PORT:-7474}"
 
+# curl the local inference server with the shared bearer key. llama.cpp serves
+# /health and /v1/health without one, but /props and /v1/models are gated, and
+# Strata gates more than llama.cpp — so send the key on every call.
+_inference_curl() {
+    local key
+    key="$(_env_get LLAMA_API_KEY)"
+    if [[ -n "$key" ]]; then
+        curl -H "Authorization: Bearer $key" "$@"
+    else
+        curl "$@"
+    fi
+}
+
 _env_set() {
     local key="$1" val="$2" env_file="$DOCKER_DIR/.env"
     mkdir -p "$(dirname "$env_file")"; touch "$env_file"
@@ -867,7 +880,7 @@ cmd_start() {
     cd "$DOCKER_DIR"
     export INFERENCE_PORT
     if ss -tlnp 2>/dev/null | grep -q ":${INFERENCE_PORT} "; then
-        if curl -sf "http://localhost:${INFERENCE_PORT}/health" &>/dev/null; then
+        if _inference_curl -sf "http://localhost:${INFERENCE_PORT}/health" &>/dev/null; then
             ok "llama-server already running on port ${INFERENCE_PORT}"
             echo "  Run the agent: openmono agent"
             return
@@ -881,7 +894,7 @@ cmd_start() {
     info "Waiting for llama-server to be healthy (model load can take 1-3 min)..."
     HEALTHY=false
     for i in $(seq 1 36); do
-        if curl -sf "http://localhost:${INFERENCE_PORT}/health" &>/dev/null; then
+        if _inference_curl -sf "http://localhost:${INFERENCE_PORT}/health" &>/dev/null; then
             echo ""
             ok "llama-server is healthy on port ${INFERENCE_PORT}"
             HEALTHY=true
@@ -917,13 +930,13 @@ _stop_inventory() {
     elif [[ "$NATIVE_INFERENCE" == "true" ]]; then
         # Show the applied port (not a freshly edited settings.json value).
         local nport; nport="$(_applied_inference_port)"
-        if curl -sf "http://localhost:${nport}/health" &>/dev/null; then
+        if _inference_curl -sf "http://localhost:${nport}/health" &>/dev/null; then
             echo "  - llama-server (native, Metal) on port ${nport}"
         else
             echo "  - llama-server (native): not responding on port ${nport}"
         fi
     else
-        if curl -sf "http://localhost:${INFERENCE_PORT}/health" &>/dev/null; then
+        if _inference_curl -sf "http://localhost:${INFERENCE_PORT}/health" &>/dev/null; then
             echo "  - llama-server (docker) healthy on port ${INFERENCE_PORT}"
         else
             echo "  - llama-server (docker): not responding"
@@ -1035,7 +1048,7 @@ cmd_stop() {
     else
         _ensure_docker
         if [[ "$sel_llama" == "true" ]]; then
-            if ! curl -sf "http://localhost:${INFERENCE_PORT}/health" &>/dev/null; then
+            if ! _inference_curl -sf "http://localhost:${INFERENCE_PORT}/health" &>/dev/null; then
                 warn "llama-server is not responding on port ${INFERENCE_PORT}"
             fi
         fi
@@ -1534,7 +1547,7 @@ cmd_agent_host() {
             is_local=true
             ;;
     esac
-    if [[ "$is_local" == "true" ]] && ! curl -sf --max-time 3 "${cfg_endpoint%/}/health" &>/dev/null; then
+    if [[ "$is_local" == "true" ]] && ! _inference_curl -sf --max-time 3 "${cfg_endpoint%/}/health" &>/dev/null; then
         if command -v docker &>/dev/null && docker info &>/dev/null 2>&1; then
             info "Local inference is not responding — starting it now..."
             cmd_start || exit 1
@@ -1692,7 +1705,7 @@ cmd_agent_sandbox() {
             # above) — a hardcoded 7474 declares a running server dead when a
             # previous install moved the host mapping.
             local _hport="$INFERENCE_PORT"
-            if curl -sf "http://localhost:${_hport}/health" &>/dev/null; then
+            if _inference_curl -sf "http://localhost:${_hport}/health" &>/dev/null; then
                 # If settings.json points at a different port than the live
                 # server, the config is stale — say so instead of silently
                 # waiting on the wrong door.
@@ -1707,12 +1720,12 @@ cmd_agent_sandbox() {
                     fi
                 fi
             fi
-            if ! curl -sf "http://localhost:${_hport}/health" &>/dev/null; then
+            if ! _inference_curl -sf "http://localhost:${_hport}/health" &>/dev/null; then
                 info "llama-server not responding on port ${_hport} — restarting..."
                 docker compose up -d llama-server
                 info "Waiting for llama-server to be healthy (model load can take 1-2 min)..."
                 for i in $(seq 1 36); do
-                    if curl -sf "http://localhost:${_hport}/health" &>/dev/null; then
+                    if _inference_curl -sf "http://localhost:${_hport}/health" &>/dev/null; then
                         ok "llama-server is healthy on port ${_hport}"
                         break
                     fi
@@ -1939,7 +1952,7 @@ cmd_status() {
         echo ""
         echo -e "${BLUE}── Model ────────────────────────────────────────────${NC}"
         _STRATA_PORT="$(_strata_port)"
-        LOADED=$(curl -sf --max-time 3 "http://localhost:${_STRATA_PORT}/v1/models" \
+        LOADED=$(_inference_curl -sf --max-time 3 "http://localhost:${_STRATA_PORT}/v1/models" \
             | python3 -c "
 import sys, json
 d = json.load(sys.stdin)
@@ -1974,7 +1987,7 @@ print(models[0].get('id', '').strip() if models else '')
 
         echo ""
         echo -e "${BLUE}── llama-server health ──────────────────────────────${NC}"
-        if curl -sf "http://localhost:${INFERENCE_PORT}/health" &>/dev/null; then
+        if _inference_curl -sf "http://localhost:${INFERENCE_PORT}/health" &>/dev/null; then
             ok "http://localhost:${INFERENCE_PORT}/health → OK"
         else
             warn "http://localhost:${INFERENCE_PORT}/health → not responding"
@@ -2005,7 +2018,7 @@ print(models[0].get('id', '').strip() if models else '')
     echo ""
     echo -e "${BLUE}── Model ────────────────────────────────────────────${NC}"
     LOADED=""
-    LOADED=$(curl -sf --max-time 3 "http://localhost:${INFERENCE_PORT}/props" \
+    LOADED=$(_inference_curl -sf --max-time 3 "http://localhost:${INFERENCE_PORT}/props" \
         | python3 -c "
 import sys, json
 d = json.load(sys.stdin)
@@ -2016,7 +2029,7 @@ name = (d.get('model_alias') or '').strip() \
 print(name)
 " 2>/dev/null || true)
     if [ -z "$LOADED" ]; then
-        LOADED=$(curl -sf --max-time 3 "http://localhost:${INFERENCE_PORT}/v1/models" \
+        LOADED=$(_inference_curl -sf --max-time 3 "http://localhost:${INFERENCE_PORT}/v1/models" \
             | python3 -c "
 import sys, json
 d = json.load(sys.stdin)

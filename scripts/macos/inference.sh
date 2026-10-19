@@ -33,6 +33,25 @@ native_load_config() {
     fi
 }
 
+# The shared bearer key, from docker/.env (single source of truth).
+native_inference_key() {
+    local docker_env="${REPO_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}/docker/.env"
+    [[ -f "$docker_env" ]] || return 0
+    grep '^LLAMA_API_KEY=' "$docker_env" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]' || true
+}
+
+# curl the local llama-server with that key. llama.cpp serves /health without
+# one, but /props and /v1/models are gated, so send it on every call.
+native_inference_curl() {
+    local key
+    key="$(native_inference_key)"
+    if [[ -n "$key" ]]; then
+        curl -H "Authorization: Bearer $key" "$@"
+    else
+        curl "$@"
+    fi
+}
+
 # Resolve which llama-server binary to run. A Bonsai install records the
 # on-machine Prism fork build in settings (.inference.binary) and it wins;
 # otherwise fall back to the brew stock binary for the Qwen path.
@@ -70,11 +89,8 @@ native_start_llama() {
     cpu_threads=$(sysctl -n hw.physicalcpu 2>/dev/null || echo 4)
 
     # Read API key from docker/.env (single source of truth)
-    local api_key=""
-    local docker_env="${REPO_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}/docker/.env"
-    if [[ -f "$docker_env" ]]; then
-        api_key=$(grep '^LLAMA_API_KEY=' "$docker_env" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]' || true)
-    fi
+    local api_key
+    api_key="$(native_inference_key)"
 
     info "Starting llama-server (Metal) — model: $MODEL_NAME"
     info "Binary: $server_bin"
@@ -109,7 +125,7 @@ native_stop_llama() {
     local port="${1:-${LLAMA_NATIVE_PORT:-7474}}"
 
     # Check if llama-server is actually responding on the port (best indicator that it's really running)
-    if ! curl -sf "http://localhost:${port}/health" &>/dev/null; then
+    if ! native_inference_curl -sf "http://localhost:${port}/health" &>/dev/null; then
         warn "llama-server is not responding on port ${port}"
         return 1
     fi
@@ -138,7 +154,7 @@ native_cmd_start() {
     local port="${LLAMA_NATIVE_PORT:-7474}"
 
     # Check if llama-server is already healthy (best indicator)
-    if curl -sf "http://localhost:${port}/health" &>/dev/null; then
+    if native_inference_curl -sf "http://localhost:${port}/health" &>/dev/null; then
         ok "llama-server already running on port ${port}"
         return 0
     fi
@@ -147,7 +163,7 @@ native_cmd_start() {
 
     info "Waiting for llama-server to be healthy (model load: 1-3 min)..."
     for i in $(seq 1 36); do
-        if curl -sf "http://localhost:${port}/health" &>/dev/null; then
+        if native_inference_curl -sf "http://localhost:${port}/health" &>/dev/null; then
             ok "llama-server is healthy on port ${port} (Metal GPU)"
             return 0
         fi
@@ -174,7 +190,7 @@ native_cmd_restart() {
     native_start_llama || return 1
     info "Waiting for llama-server to be healthy..."
     for i in $(seq 1 36); do
-        if curl -sf "http://localhost:${port}/health" &>/dev/null; then
+        if native_inference_curl -sf "http://localhost:${port}/health" &>/dev/null; then
             ok "llama-server restarted and healthy on port ${port} (Metal GPU)"
             return 0
         fi
@@ -234,7 +250,7 @@ native_cmd_status() {
     fi
 
     # Health check
-    if curl -sf "http://localhost:${port}/health" &>/dev/null; then
+    if native_inference_curl -sf "http://localhost:${port}/health" &>/dev/null; then
         printf "│ Health Endpoint : ${GREEN}✓${NC} http://localhost:${port}/health\n"
     else
         printf "│ Health Endpoint : ${YELLOW}✗${NC} http://localhost:${port}/health (offline)\n"
@@ -254,12 +270,12 @@ native_cmd_status() {
 native_ensure_running() {
     local port="${LLAMA_NATIVE_PORT:-7474}"
 
-    if ! curl -sf "http://localhost:${port}/health" &>/dev/null; then
+    if ! native_inference_curl -sf "http://localhost:${port}/health" &>/dev/null; then
         info "llama-server not running — starting it (Metal, model load: 1–3 min)..."
         native_start_llama || return 1
         info "Waiting for llama-server to be healthy..."
         for i in $(seq 1 36); do
-            if curl -sf "http://localhost:${port}/health" &>/dev/null; then
+            if native_inference_curl -sf "http://localhost:${port}/health" &>/dev/null; then
                 ok "llama-server is healthy"
                 break
             fi
