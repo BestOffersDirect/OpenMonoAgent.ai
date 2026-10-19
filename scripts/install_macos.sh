@@ -146,7 +146,7 @@ role_prompt
 
 case "$OPENMONO_ROLE" in
     full|inference|agent) ;;
-    *) echo "ERROR: Invalid OPENMONO_ROLE='$OPENMONO_ROLE' (expected: full, inference, agent)" >&2; exit 1 ;;
+    *) err "Invalid OPENMONO_ROLE='$OPENMONO_ROLE' (expected: full, inference, agent)"; exit 1 ;;
 esac
 
 # Step counts vary by role.
@@ -539,11 +539,8 @@ if [ "$OPENMONO_ROLE" != "agent" ]; then
     mv /tmp/env.tmp "$ENV_FILE"
     chmod 0600 "$ENV_FILE"
 
-    PARALLEL_SLOTS="$(om_choose_parallel_slots 1)"
-    # The tty can leave a stray newline in the command substitution, so strip
-    # whitespace and fall back to 1 if the result is not a clean integer.
-    PARALLEL_SLOTS="${PARALLEL_SLOTS//[[:space:]]/}"
-    [[ "$PARALLEL_SLOTS" =~ ^[0-9]+$ ]] && [ "$PARALLEL_SLOTS" -ge 1 ] || PARALLEL_SLOTS=1
+    om_choose_parallel_slots 1
+    PARALLEL_SLOTS="$OM_PARALLEL_SLOTS"
     # Warn-only: llama.cpp --parallel N reserves N independent full-context KV
     # buffers, so on unified memory the slot count competes with the weights.
     om_warn_parallel_slots native-metal "$PARALLEL_SLOTS" "${_CTX_SIZE:-}"

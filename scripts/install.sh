@@ -208,7 +208,7 @@ role_prompt
 
 case "$OPENMONO_ROLE" in
     full|inference|agent) ;;
-    *) echo "ERROR: Invalid OPENMONO_ROLE='$OPENMONO_ROLE' (expected: full, inference, agent)" >&2; exit 1 ;;
+    *) err "Invalid OPENMONO_ROLE='$OPENMONO_ROLE' (expected: full, inference, agent)"; exit 1 ;;
 esac
 
 # ── Inference backend (Linux only; macOS uses its native path) ───────────────
@@ -224,7 +224,7 @@ else
 fi
 case "$INFERENCE_BACKEND" in
     strata|llama|none) ;;
-    *) echo "ERROR: Invalid OPENMONO_INFERENCE_BACKEND='$INFERENCE_BACKEND' (expected: strata, llama)" >&2; exit 1 ;;
+    *) err "Invalid OPENMONO_INFERENCE_BACKEND='$INFERENCE_BACKEND' (expected: strata, llama)"; exit 1 ;;
 esac
 if [ "${OPENMONO_INFERENCE_BACKEND:-}" = "strata" ]; then
     info "Inference backend: Strata (Qwen3.8-Flash-Next) — explicitly selected via OPENMONO_INFERENCE_BACKEND"
@@ -472,11 +472,8 @@ if [ "$OPENMONO_ROLE" != "agent" ]; then
     # apply_settings.sh materializes it (INFERENCE_PARALLEL / the Strata config
     # "parallel") on start; the docker/.env writes below keep the very first
     # start in sync.
-    PARALLEL_SLOTS="$(om_choose_parallel_slots 1)"
-    # The tty can leave a stray newline in the command substitution, so strip
-    # whitespace and fall back to 1 if the result is not a clean integer.
-    PARALLEL_SLOTS="${PARALLEL_SLOTS//[[:space:]]/}"
-    [[ "$PARALLEL_SLOTS" =~ ^[0-9]+$ ]] && [ "$PARALLEL_SLOTS" -ge 1 ] || PARALLEL_SLOTS=1
+    om_choose_parallel_slots 1
+    PARALLEL_SLOTS="$OM_PARALLEL_SLOTS"
     # Warn about what this many slots costs on the backend actually selected.
     # Warn-only by design: Strata silently reduces an over-large count itself and
     # llama.cpp just needs the user to know KV memory scales with the count.

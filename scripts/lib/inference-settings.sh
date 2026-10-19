@@ -9,8 +9,8 @@
 # installer can call them before the backend exists.
 #
 # Usage:
-#   n="$(om_choose_parallel_slots 1)"   # prompt (interactive) / env / default,
-#                                        # persist, and echo the chosen value
+#   om_choose_parallel_slots 1     # prompt (interactive) / env / default,
+#                                   # persist, and set $OM_PARALLEL_SLOTS
 #   om_persist_parallel_slots "$n"
 #   om_persist_inference_port 7474
 
@@ -49,58 +49,53 @@ om_persist_inference_port() {
         --argjson p "$p"
 }
 
-# Ask for the number of parallel slots. Non-interactive (or piped) installs use
-# $OPENMONO_PARALLEL_SLOTS when set, else the default. Always persists the
-# answer to settings.json and echoes a VALID positive integer on stdout — it
-# can never return empty, so `PARALLEL_SLOTS="$(om_choose_parallel_slots 1)"`
-# is always safe even under `set -euo pipefail`.
+# Ask for the number of parallel slots and set $OM_PARALLEL_SLOTS to a valid
+# positive integer.
+#
+# Same shape as role_prompt (sets $OPENMONO_ROLE) and prompt_model_choice (sets
+# $INFERENCE_BACKEND): prompt on stdout, hand the answer back through a
+# variable. It deliberately does NOT return the value through a command
+# substitution, because that makes stdout two things at once — the display
+# channel and the return channel. That single choice is what made this prompt
+# hard: either the prompt text was captured into the value ("\n2" instead of
+# "2"), or the text moved to stderr where `openmono setup` sends it to the log
+# file and the user saw a blank hung input.
+#
+# Non-interactive installs take $OPENMONO_PARALLEL_SLOTS when set, else the
+# default. The answer is always persisted to settings.json.
 om_choose_parallel_slots() {
-    # Runs inside a $(...) command substitution in the installers, which inherit
-    # their `set -euo pipefail`. Two consequences, both handled below:
-    #   1. a bare test as its own statement (e.g. `(( n < 1 ))`) aborts the
-    #      subshell when false, so every such test here is part of an if/|| list;
-    #   2. stdout is the caller's capture pipe, so prompt text and blank lines
-    #      must go to stderr or they corrupt the returned value.
     local default="${1:-1}" n="${OPENMONO_PARALLEL_SLOTS:-}"
+    OM_PARALLEL_SLOTS=""
     # Sanitize the default up front so the fallback path always has a valid int.
     if ! [[ "$default" =~ ^[0-9]+$ ]] || [ "$default" -lt 1 ]; then default=1; fi
     if [[ -z "$n" ]] && [[ -t 0 ]]; then
-        # Drain any keystrokes buffered by earlier prompts/long steps (a stray
-        # Enter or a leftover char from a prior `read` would otherwise be
-        # consumed by the read below and silently answer this prompt).
+        # Drain keystrokes buffered by earlier prompts/long steps so a stray
+        # Enter cannot silently answer this prompt.
         flush_stdin 2>/dev/null || true
-        # Every byte this function writes to STDOUT is captured by the caller's
-        # $(...) — including a bare `echo ""`. That blank separator must go to
-        # stderr with the rest of the prompt, or it lands at the front of the
-        # captured value ("\n2" instead of "2").
-        echo "" >&2
-        echo "  Parallel slots: how many requests may the model serve at once?" >&2
-        echo "  More slots cost memory and can cost speed, but how depends on the" >&2
-        echo "  backend:" >&2
-        echo "    llama.cpp / native - each slot gets its OWN full-context KV" >&2
-        echo "                         cache, so KV memory grows with the slot count." >&2
-        echo "    Strata             - each slot keeps its own K/V for the WHOLE" >&2
-        echo "                         context (the context is not divided between" >&2
-        echo "                         slots), but that K/V is taken from the expert" >&2
-        echo "                         cache, and Strata serves at most 8 slots." >&2
-        echo "  Use 1 for a single interactive agent; raise it only if you run" >&2
-        echo "  several sessions/agents at once." >&2
-        echo "" >&2
-        printf "  Slots [default: %s]: " "$default" >&2
+        echo ""
+        echo "  Parallel slots: how many requests may the model serve at once?"
+        echo "  More slots cost memory and can cost speed, but how depends on the"
+        echo "  backend:"
+        echo "    llama.cpp / native - each slot gets its OWN full-context KV"
+        echo "                         cache, so KV memory grows with the slot count."
+        echo "    Strata             - each slot keeps its own K/V for the WHOLE"
+        echo "                         context (the context is not divided between"
+        echo "                         slots), but that K/V is taken from the expert"
+        echo "                         cache, and Strata serves at most 8 slots."
+        echo "  Use 1 for a single interactive agent; raise it only if you run"
+        echo "  several sessions/agents at once."
+        echo ""
+        printf "  Slots [default: %s]: " "$default"
         read -r n || n=""
     fi
-    # Coerce to a valid positive integer; anything else (empty, junk, a stray
-    # char, EOF) falls back to the default. This guarantees the function always
-    # echoes a real number and never leaves the caller's variable empty.
+    # Coerce to a valid positive integer; empty, junk or EOF falls back to the
+    # default, so OM_PARALLEL_SLOTS is never left empty or non-numeric.
     if ! [[ "${n:-}" =~ ^[0-9]+$ ]] || [ "${n:-0}" -lt 1 ]; then
         n="$default"
     fi
     om_persist_parallel_slots "$n"
-    # Belt and braces: the value is already a validated integer here, so the
-    # strip is a no-op today. It stays only so a future stray write to stdout
-    # upstream of this point cannot corrupt the caller's variable.
-    n="${n//[[:space:]]/}"
-    printf '%s' "$n"
+    OM_PARALLEL_SLOTS="$n"
+    return 0
 }
 
 # Warn (never clamp) about what the chosen slot count costs on THIS backend.

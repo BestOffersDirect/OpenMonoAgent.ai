@@ -105,6 +105,12 @@ step() {
 info()  { printf "  ${BLUE}ℹ${NC}  %s\n" "$*"; _log "INFO: $*"; }
 ok()    { printf "  ${GREEN}✓${NC}  %s\n" "$*"; _log "OK: $*"; }
 warn()  { printf "  ${YELLOW}⚠${NC}  %s\n" "$*"; _log "WARN: $*"; }
+
+# Convention in this repo: stdout is the display channel (info/ok/warn and every
+# interactive prompt all write there), stderr is the diagnostic channel. openmono
+# setup runs the installers as `bash install.sh 2>> $OPENMONO_LOG_FILE` and on
+# failure prints show_log_tail, so stderr is deliberately off-screen — anything
+# the user has to READ or ANSWER must go to stdout, never here.
 err()   { printf "  ${RED}✗${NC}  %s\n" "$*" >&2; _log "ERROR: $*"; }
 
 # detail — only shown in verbose mode, always logged
