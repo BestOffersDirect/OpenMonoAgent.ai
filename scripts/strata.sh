@@ -113,8 +113,10 @@ save_env() {
     mkdir -p "$OPENMONO_STATE_DIR"
     cat > "$STRATA_ENV_FILE" <<EOF
 STRATA_DIR="$STRATA_DIR"
-INFERENCE_PORT="$INFERENCE_PORT"
-INFERENCE_PARALLEL="$INFERENCE_PARALLEL"
+INFERENCE_PORT="${INFERENCE_PORT:-7474}"
+# Persist a resolved number, never an empty string: apply_settings.sh compares
+# this against settings.json and would report drift on an empty value.
+INFERENCE_PARALLEL="${INFERENCE_PARALLEL:-1}"
 STRATA_FAMILY="$STRATA_FAMILY"
 STRATA_MODEL="$STRATA_MODEL"
 STRATA_CONTEXT="$STRATA_CONTEXT"

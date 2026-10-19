@@ -88,8 +88,21 @@ openmono start                                 # apply + start
 
 `openmono status` shows desired vs applied values. To check without changing
 anything: `bash scripts/apply_settings.sh --check` (exit 2 = drift).
-Parallel slots are asked during install for every backend; each slot reserves
-a full context of KV cache, so raise it only for concurrent sessions.
+Parallel slots are asked during install for every backend.
+
+Strata's slots are **not** a share of the context. `"parallel": N` is the
+engine's `--batch`/`--slots`: the configured context stays whole and **every
+slot keeps its own full-context K/V session**. What a slot costs is the VRAM it
+takes away from the model's expert cache — about 0.56 GiB at a 32K context with
+8-bit KV, more at longer contexts unless KV streaming (`--kv-resident`) keeps
+only the attention window resident and puts the rest in pinned RAM. So raising
+slots does not shrink anyone's context; it trades per-request speed for
+concurrency. Strata serves **2..8 slots** (8 per group with a layer split) and
+never refuses a larger number — it logs the count it can actually run
+(`batch_slots=N`, also visible as `concurrency.serving` in `GET /v1/status`).
+On a lone 12 or 16 GB card upstream recommends staying at 1: a batch costs about
+10-25% speed per request there, because different conversations route to
+different experts and the expert cache shrinks.
 
 ### Switching backends
 

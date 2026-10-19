@@ -43,14 +43,22 @@ trap _cleanup_terminal EXIT INT TERM HUP
 # ERR trap — fires when any command exits non-zero under set -e.
 # Logs the failing command and line number so the log is always useful.
 # Does not fire for intentionally handled errors (||, if, &&).
-set -o errtrace
-_trap_err() {
-    local exit_code=$?
-    local line="${BASH_LINENO[0]:-?}"
-    local cmd="${BASH_COMMAND:-?}"
-    _log "FATAL: exit $exit_code at line $line — $cmd"
-}
-trap '_trap_err' ERR
+#
+# errtrace / BASH_LINENO / BASH_COMMAND / `local` / `${var:0}` are all bash-isms.
+# macOS default shells (zsh) reject `set -o errtrace` and would abort a
+# `set -e` script right here, so enable the trap only when actually running
+# under bash. Under any other shell the install still works; it just loses the
+# extra "FATAL: line N" detail in the log.
+if [ -n "${BASH_VERSION:-}" ]; then
+    set -o errtrace
+    _trap_err() {
+        local exit_code=$?
+        local line="${BASH_LINENO[0]:-?}"
+        local cmd="${BASH_COMMAND:-?}"
+        _log "FATAL: exit $exit_code at line $line — $cmd"
+    }
+    trap '_trap_err' ERR
+fi
 
 OPENMONO_VERBOSE="${OPENMONO_VERBOSE:-0}"
 
@@ -241,7 +249,13 @@ flush_stdin() {
     local _discard
     # Tiny non-zero timeout: each buffered line is consumed at once; when the
     # buffer empties, read blocks for the timeout, fails (>128), and we stop.
-    while read -r -t 0.1 _discard 2>/dev/null; do :; done
+    # Guarded so a shell without fractional `read -t` support (or a read that
+    # keeps returning success) can never hang the installer.
+    local _guard=0
+    while read -r -t 0.1 _discard 2>/dev/null; do
+        _guard=$((_guard + 1))
+        (( _guard > 200 )) && break
+    done
     return 0
 }
 

@@ -438,11 +438,49 @@ if [ "$OPENMONO_ROLE" != "agent" ]; then
     # Unified picker: defaults to Qwen on stock llama.cpp; Bonsai / Strata are
     # offered only when this box supports them. Sets INFERENCE_BACKEND.
     prompt_model_choice
+    # Vision is a user choice (when the hardware+model allow it): ask it FIRST,
+    # right after model selection, before the parallel-slots prompt. Asking
+    # vision before slots keeps the slots question last, so a stray buffered
+    # keystroke or a stuck `read` can never swallow the vision prompt.
+    # OPENMONO_VISION=yes|no presets it non-interactively; the catalog's mmproj
+    # availability still gates whether the question is even possible.
+    if [ "$INFERENCE_BACKEND" != "strata" ] && [ -n "${MODEL_MMPROJ:-}" ]; then
+        _vision_choice="${OPENMONO_VISION:-}"
+        if [ -z "$_vision_choice" ] && [ -t 0 ]; then
+            flush_stdin
+            echo ""
+            echo "  Enable vision (image input)? The projector adds ~900 MB of"
+            echo "  weights and ~1-2 GB of VRAM/RAM headroom; it lets the agent"
+            echo "  read screenshots and image files (@image.png in chat)."
+            printf "  Enable vision? [Y/n]: "
+            read -r _vision_answer || _vision_answer=""
+            case "${_vision_answer:-Y}" in
+                [Nn]*) _vision_choice="no" ;;
+                *)     _vision_choice="yes" ;;
+            esac
+        elif [ -z "$_vision_choice" ]; then
+            _vision_choice="yes"   # non-interactive: catalog default (on when available)
+        fi
+        if [ "$_vision_choice" = "no" ] || [ "$_vision_choice" = "off" ]; then
+            MODEL_MMPROJ=""
+            MODEL_MMPROJ_URL=""
+            _VISION_DECLINED=1
+            info "Vision disabled by choice — full context restored (no mmproj)."
+        fi
+    fi
     # Parallel slots: ask once for every backend/model, persist to settings.json.
     # apply_settings.sh materializes it (INFERENCE_PARALLEL / the Strata config
     # "parallel") on start; the docker/.env writes below keep the very first
     # start in sync.
     PARALLEL_SLOTS="$(om_choose_parallel_slots 1)"
+    # The tty can leave a stray newline in the command substitution, so strip
+    # whitespace and fall back to 1 if the result is not a clean integer.
+    PARALLEL_SLOTS="${PARALLEL_SLOTS//[[:space:]]/}"
+    [[ "$PARALLEL_SLOTS" =~ ^[0-9]+$ ]] && [ "$PARALLEL_SLOTS" -ge 1 ] || PARALLEL_SLOTS=1
+    # Warn about what this many slots costs on the backend actually selected.
+    # Warn-only by design: Strata silently reduces an over-large count itself and
+    # llama.cpp just needs the user to know KV memory scales with the count.
+    om_warn_parallel_slots "$INFERENCE_BACKEND" "$PARALLEL_SLOTS" "${STRATA_CONTEXT:-}"
     export PARALLEL_SLOTS
     export INFERENCE_PARALLEL="$PARALLEL_SLOTS"
     # Bonsai / Prism model plumbing below applies only to the llama.cpp backend;
@@ -475,40 +513,22 @@ if [ "$OPENMONO_ROLE" != "agent" ]; then
             esac
         fi
     fi
+    # The Prism fallback above re-ran select_model, which repopulates the
+    # catalog's mmproj. Re-apply the user's vision answer so declining vision
+    # is never silently undone by a model fallback.
+    if [ "${_VISION_DECLINED:-0}" = "1" ]; then
+        MODEL_MMPROJ=""
+        MODEL_MMPROJ_URL=""
+    fi
     # 8GB VRAM: vision projector stays resident (~0.63GB + burst) — that plus
     # 5.95GB weights leaves no headroom. Disable it; text inference only.
+    # (The user is asked about vision up front, right after model selection,
+    # before the parallel-slots prompt; this guard only applies the hard cap.)
     if [ "${IS_BONSAI:-0}" = "1" ] && [ "${_GPU_TIER:-0}" -le 8 ]; then
         MODEL_MMPROJ=""
         MODEL_MMPROJ_URL=""
         warn "8GB VRAM: vision (mmproj) disabled to protect VRAM headroom."
         warn "Re-enable later with an 8GB+ headroom check: download $PRISM_MMPROJ_NAME into models/ and set MODEL_MMPROJ in docker/.env"
-    fi
-    # Vision is a user choice (when the hardware+model allow it): ask instead
-    # of silently enabling/disabling. OPENMONO_VISION=yes|no presets it
-    # non-interactively; the catalog's mmproj availability still gates whether
-    # the question is even possible.
-    if [ -n "${MODEL_MMPROJ:-}" ]; then
-        _vision_choice="${OPENMONO_VISION:-}"
-        if [ -z "$_vision_choice" ] && [ -t 0 ]; then
-            flush_stdin
-            echo ""
-            echo "  Enable vision (image input)? The projector adds ~900 MB of"
-            echo "  weights and ~1-2 GB of VRAM/RAM headroom; it lets the agent"
-            echo "  read screenshots and image files (@image.png in chat)."
-            printf "  Enable vision? [Y/n]: "
-            read -r _vision_answer || _vision_answer=""
-            case "${_vision_answer:-Y}" in
-                [Nn]*) _vision_choice="no" ;;
-                *)     _vision_choice="yes" ;;
-            esac
-        elif [ -z "$_vision_choice" ]; then
-            _vision_choice="yes"   # non-interactive: catalog default (on when available)
-        fi
-        if [ "$_vision_choice" = "no" ] || [ "$_vision_choice" = "off" ]; then
-            MODEL_MMPROJ=""
-            MODEL_MMPROJ_URL=""
-            info "Vision disabled by choice — full context restored (no mmproj)."
-        fi
     fi
     ok "Model selected: $MODEL_NAME"
     if [ -n "${MODEL_MMPROJ:-}" ]; then
