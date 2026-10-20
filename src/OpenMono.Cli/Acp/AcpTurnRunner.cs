@@ -475,8 +475,10 @@ public sealed class AcpTurnRunner : IAcpEventSink
         // the session grant the same way the TUI card does. Always route
         // through RunAsync — a DenyAll must set the gateway's deny-all flag so
         // later commands never re-prompt, exactly like the TUI surface.
-        return await gateway.RunAsync(request,
-            (_, _, _) => Task.FromResult(decision), ct);
+        // No tool card on this path (synthetic messages only), so the text
+        // answer is fed to the model verbatim, exactly as before.
+        return (await gateway.RunAsync(request,
+            (_, _, _) => Task.FromResult(decision), ct)).Answer;
     }
 
     public async Task ResumeWithPlanDecisionAsync(string decision, CancellationToken ct)

@@ -102,7 +102,8 @@ public class HostGatewayTests : IAsyncLifetime
             new HostExecRequest("echo bridge-ok", null, false, false),
             (_, _, _) => Task.FromResult(HostConsentDecision.AllowOnce),
             CancellationToken.None);
-        result.Should().Contain("bridge-ok");
+        result.Ok.Should().BeTrue();
+        result.Answer.Should().Contain("bridge-ok");
     }
 
     [Fact]
@@ -163,8 +164,9 @@ public class HostGatewayTests : IAsyncLifetime
             (_, _, _) => Task.FromResult(HostConsentDecision.AllowOnce),
             CancellationToken.None);
 
-        answer.Should().Contain("host-exec-ok");
-        answer.Should().MatchRegex("^\\[host-exec on .*\\]\\n\\$ echo host-exec-ok\\n");
+        answer.Ok.Should().BeTrue();
+        answer.Answer.Should().Contain("host-exec-ok");
+        answer.Answer.Should().MatchRegex("^\\[host-exec on .*\\]\\n\\$ echo host-exec-ok\\n");
     }
 
     [Fact]
@@ -179,7 +181,9 @@ public class HostGatewayTests : IAsyncLifetime
             (_, _, _) => Task.FromResult(HostConsentDecision.DenyOnce),
             CancellationToken.None);
 
-        answer.Should().Contain("denied by user");
+        answer.Denied.Should().BeTrue();
+        answer.ErrorCode.Should().Be(HostExecOutcome.ErrUserDenied);
+        answer.Answer.Should().Contain("denied by user");
         File.Exists(marker).Should().BeFalse();
     }
 
@@ -194,14 +198,14 @@ public class HostGatewayTests : IAsyncLifetime
             new HostExecRequest("echo one", null, false, false),
             (_, _, _) => { prompts++; return Task.FromResult(HostConsentDecision.AllowAll); },
             CancellationToken.None);
-        first.Should().Contain("one");
+        first.Answer.Should().Contain("one");
 
         // allow-all covers plain commands: no second prompt.
         var second = await gw.RunAsync(
             new HostExecRequest("echo two", null, false, false),
             (_, _, _) => { prompts++; return Task.FromResult(HostConsentDecision.AllowOnce); },
             CancellationToken.None);
-        second.Should().Contain("two");
+        second.Answer.Should().Contain("two");
         prompts.Should().Be(1);
         gw.SessionAllowsAll.Should().BeTrue();
     }
@@ -226,7 +230,8 @@ public class HostGatewayTests : IAsyncLifetime
         // as_root must always re-prompt, and the daemon's sudo gate (ask, no
         // human) still refuses the escalation itself.
         prompts.Should().Be(1);
-        answer.Should().Contain("sudo");
+        answer.ErrorCode.Should().Be(HostExecOutcome.ErrPolicy);
+        answer.Answer.Should().Contain("sudo");
     }
 
     [Fact]
@@ -249,7 +254,8 @@ public class HostGatewayTests : IAsyncLifetime
             CancellationToken.None);
 
         prompts.Should().Be(0);
-        answer.Should().Contain("sudo is denied");
+        answer.ErrorCode.Should().Be(HostExecOutcome.ErrPolicy);
+        answer.Answer.Should().Contain("sudo is denied");
     }
 
     [Fact]
@@ -263,7 +269,9 @@ public class HostGatewayTests : IAsyncLifetime
             (_, _, _) => Task.FromResult(HostConsentDecision.AllowOnce),
             CancellationToken.None);
 
-        answer.Should().Contain("denied by host-bridge policy");
+        answer.Denied.Should().BeTrue();
+        answer.ErrorCode.Should().Be(HostExecOutcome.ErrPolicy);
+        answer.Answer.Should().Contain("denied by host-bridge policy");
     }
 
     [Fact]
@@ -276,7 +284,7 @@ public class HostGatewayTests : IAsyncLifetime
             new HostExecRequest("echo one", null, false, false),
             (_, _, _) => Task.FromResult(HostConsentDecision.DenyAll),
             CancellationToken.None);
-        first.Should().Contain("denied by user");
+        first.Answer.Should().Contain("denied by user");
         gw.SessionDeniesAll.Should().BeTrue();
 
         // A later command is refused without another prompt.
@@ -285,7 +293,7 @@ public class HostGatewayTests : IAsyncLifetime
             new HostExecRequest("echo two", null, false, false),
             (_, _, _) => { prompts++; return Task.FromResult(HostConsentDecision.AllowOnce); },
             CancellationToken.None);
-        second.Should().Contain("denied by user");
+        second.Answer.Should().Contain("denied by user");
         prompts.Should().Be(0);
     }
 
@@ -303,7 +311,8 @@ public class HostGatewayTests : IAsyncLifetime
             new HostExecRequest("echo should-not-run", null, false, false),
             (_, _, _) => Task.FromResult(HostConsentDecision.AllowOnce),
             CancellationToken.None);
-        answer.Should().Contain("not paired");
+        answer.ErrorCode.Should().Be(HostExecOutcome.ErrStale);
+        answer.Answer.Should().Contain("not paired");
     }
 
     [Fact]
@@ -321,7 +330,11 @@ public class HostGatewayTests : IAsyncLifetime
             new HostExecRequest("echo stale", null, false, false),
             (_, _, _) => Task.FromResult(HostConsentDecision.AllowOnce),
             CancellationToken.None);
-        answer.Should().Contain("pairing is stale");
+        // Rotation is a deliberate takeover, NOT something the silent
+        // self-heal may undo: the session is live under the other gateway's
+        // token, so the auto lane refuses and the exec fails closed.
+        answer.ErrorCode.Should().Be(HostExecOutcome.ErrStale);
+        answer.Answer.Should().Contain("pairing is stale");
     }
 
     [Fact]
@@ -395,7 +408,7 @@ public class HostGatewayTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task Run_IdleTokenExpired_FailsClosed()
+    public async Task Run_IdleTokenExpired_AutoRepairsSilently()
     {
         using var shortIdentity = new HostIdentity("", SudoPolicy.Ask, null);
         await using var shortDaemon = new HostDaemon(
@@ -408,13 +421,158 @@ public class HostGatewayTests : IAsyncLifetime
 
         await Task.Delay(200);
 
-        // The stale pairing dies on its next call, fail closed — same shape
-        // as token rotation.
+        // The idle-expired token dies on the daemon side (fail closed), but a
+        // live agent self-heals: the refused exec never ran, so one silent
+        // credential-free re-pair (pair_auto=this_session lane) plus one
+        // retry executes the command. Idle expiry is an orphan-GC for dead
+        // agents, not an ambush on live ones.
         var answer = await gw.RunAsync(
             new HostExecRequest("echo after-idle", null, false, false),
             (_, _, _) => Task.FromResult(HostConsentDecision.AllowOnce),
             CancellationToken.None);
-        answer.Should().Contain("pairing is stale");
+        answer.Ok.Should().BeTrue(because: $"a live agent self-heals idle expiry; daemon said: {answer.Answer}");
+        answer.Answer.Should().Contain("after-idle");
+    }
+
+    [Fact]
+    public async Task Run_IdleExpired_PairAutoStrict_FailsClosed_NoPrompt()
+    {
+        var config = new BridgeConfig
+        {
+            PairSecret = Secret,
+            HostExec = new HostExecPolicy { Default = "allow" },
+            PairAuto = "strict",
+            PairRequestWaitSeconds = 1,
+        };
+        await using var shortDaemon = new HostDaemon(config,
+            new HostIdentity("", SudoPolicy.Ask, null), _workDir, GetFreePort(),
+            idleTimeout: TimeSpan.FromMilliseconds(50));
+        shortDaemon.Start();
+
+        var gw = new HostGateway($"http://127.0.0.1:{shortDaemon.Port}", "gw-idle-strict", _workDir, Secret);
+        (await gw.PairAsync()).Should().BeNull();
+        await Task.Delay(200);
+
+        // pair_auto=strict closes the silent lane: the self-heal must fail
+        // fast — no operator prompt queued, no hang — and the exec comes
+        // back as an honest stale failure (✗).
+        var answer = await gw.RunAsync(
+            new HostExecRequest("echo after-idle", null, false, false),
+            (_, _, _) => Task.FromResult(HostConsentDecision.AllowOnce),
+            CancellationToken.None);
+        answer.Ok.Should().BeFalse();
+        answer.ErrorCode.Should().Be(HostExecOutcome.ErrStale);
+        answer.Answer.Should().Contain("pairing is stale");
+        shortDaemon.ListPendingRequests().Should().BeEmpty();
+    }
+
+    [Fact]
+    public async Task Keepalive_RefreshesIdleClock()
+    {
+        await using var daemon = new HostDaemon(
+            new BridgeConfig { PairSecret = Secret, HostExec = new HostExecPolicy { Default = "allow" } },
+            new HostIdentity("", SudoPolicy.Ask, null), _workDir, GetFreePort(),
+            idleTimeout: TimeSpan.FromMilliseconds(400));
+        daemon.Start();
+
+        using var client = new HostDaemonClient($"http://127.0.0.1:{daemon.Port}");
+        var paired = await client.PairAsync(new PairRequest(Secret, "ka-refresh", _workDir), CancellationToken.None);
+        paired.Ok.Should().BeTrue();
+
+        // Beat just inside the window, repeatedly: total elapsed exceeds it,
+        // but each keepalive refreshes it — like exec activity does.
+        for (var i = 0; i < 3; i++)
+        {
+            await Task.Delay(250);
+            var beat = await client.KeepaliveAsync(new RevokeRequest(paired.Token!, "ka-refresh"), CancellationToken.None);
+            beat.Ok.Should().BeTrue(because: $"keepalive must refresh the idle clock: {beat.Error}");
+        }
+
+        // Exec after the cumulative idle time still passes the token gate.
+        var exec = await client.ExecAsync(
+            new ExecRequest(paired.Token!, "ka-refresh", new HostExecRequest("echo ka-ok", null, false, false)),
+            CancellationToken.None);
+        exec.Ok.Should().BeTrue(because: $"keepalives kept the pairing alive: {exec.Output} {exec.Error}");
+        exec.Output.Should().Contain("ka-ok");
+    }
+
+    [Fact]
+    public async Task Keepalive_WrongToken_FailsClosed()
+    {
+        using var client = new HostDaemonClient($"http://127.0.0.1:{_daemon.Port}");
+        var beat = await client.KeepaliveAsync(new RevokeRequest("dead-token", "no-such-session"), CancellationToken.None);
+        beat.Ok.Should().BeFalse();
+        beat.Error.Should().Be("no_such_session_or_token");
+    }
+
+    [Fact]
+    public async Task Keepalive_RespectsHardCap()
+    {
+        var config = new BridgeConfig
+        {
+            PairSecret = Secret,
+            HostExec = new HostExecPolicy { Default = "allow" },
+            TokenMaxHours = 0.002, // ~7.2 seconds
+        };
+        await using var daemon = new HostDaemon(config,
+            new HostIdentity("", SudoPolicy.Ask, null), _workDir, GetFreePort(),
+            idleTimeout: TimeSpan.FromMinutes(5));
+        daemon.Start();
+
+        using var client = new HostDaemonClient($"http://127.0.0.1:{daemon.Port}");
+        var paired = await client.PairAsync(new PairRequest(Secret, "ka-cap", _workDir), CancellationToken.None);
+        paired.Ok.Should().BeTrue();
+
+        // Wait past the hard cap with live keepalives: the cap is a ceiling
+        // since pairing — a heartbeat must never extend past it.
+        string? lastError = null;
+        for (var i = 0; i < 5; i++)
+        {
+            await Task.Delay(2_000);
+            var beat = await client.KeepaliveAsync(new RevokeRequest(paired.Token!, "ka-cap"), CancellationToken.None);
+            if (!beat.Ok) { lastError = beat.Error; break; }
+        }
+        lastError.Should().Be("token_expired", "keepalive must enforce the hard cap, not dodge it");
+
+        // And the dropped session cannot come back via keepalive.
+        (await client.KeepaliveAsync(new RevokeRequest(paired.Token!, "ka-cap"), CancellationToken.None))
+            .Error.Should().Be("no_such_session_or_token");
+    }
+
+    [Fact]
+    public async Task Heartbeat_KeepsPairingAliveAcrossIdleWindow()
+    {
+        await using var daemon = new HostDaemon(
+            new BridgeConfig { PairSecret = Secret, HostExec = new HostExecPolicy { Default = "allow" } },
+            new HostIdentity("", SudoPolicy.Ask, null), _workDir, GetFreePort(),
+            idleTimeout: TimeSpan.FromSeconds(3));
+        daemon.Start();
+
+        var gw = new HostGateway($"http://127.0.0.1:{daemon.Port}", "hb-alive", _workDir, Secret);
+        gw.HeartbeatIntervalOverride = TimeSpan.FromMilliseconds(500);
+        (await gw.PairAsync()).Should().BeNull();
+
+        // Idle window is 3s; without the heartbeat the pairing dies by ~3s
+        // of silence. With it, an exec well past the window still runs.
+        await Task.Delay(5_000);
+        var answer = await gw.RunAsync(
+            new HostExecRequest("echo hb-ok", null, false, false),
+            (_, _, _) => Task.FromResult(HostConsentDecision.AllowOnce),
+            CancellationToken.None);
+        answer.Ok.Should().BeTrue(because: $"the heartbeat must keep a live agent's pairing alive: {answer.Answer}");
+        answer.Answer.Should().Contain("hb-ok");
+        gw.Dispose();
+    }
+
+    [Fact]
+    public void HeartbeatIntervalSizesToReportedIdleWindow()
+    {
+        // One third of the window, clamped to 1m..30m; -1 (no expiry) = none.
+        HostGateway.HeartbeatIntervalSeconds(-1).Should().Be(-1);
+        HostGateway.HeartbeatIntervalSeconds(7_200).Should().Be(1_800); // default 2h → 30m cap
+        HostGateway.HeartbeatIntervalSeconds(300).Should().Be(100);
+        HostGateway.HeartbeatIntervalSeconds(60).Should().Be(60);   // floor
+        HostGateway.HeartbeatIntervalSeconds(0).Should().Be(600);   // old daemon: 30m/3
     }
 
     [Fact]
@@ -441,7 +599,7 @@ public class HostGatewayTests : IAsyncLifetime
                 new HostExecRequest($"echo tick-{i}", null, false, false),
                 (_, _, _) => Task.FromResult(HostConsentDecision.AllowOnce),
                 CancellationToken.None);
-            answer.Should().Contain($"tick-{i}");
+            answer.Answer.Should().Contain($"tick-{i}");
         }
         (DateTime.UtcNow - started).Should().BeGreaterThan(TimeSpan.FromSeconds(4),
             "the loop must outlive the idle window for the refresh to mean anything");
@@ -523,7 +681,7 @@ public class HostGatewayTests : IAsyncLifetime
                 new HostExecRequest("echo after-restart", null, false, false),
                 (_, _, _) => Task.FromResult(HostConsentDecision.AllowOnce),
                 CancellationToken.None);
-            answer.Should().Contain("after-restart");
+            answer.Answer.Should().Contain("after-restart");
         }
     }
 

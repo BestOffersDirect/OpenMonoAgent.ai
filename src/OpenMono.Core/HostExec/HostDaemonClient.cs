@@ -16,13 +16,19 @@ namespace OpenMono.HostBridge;
 ///   POST /exec    { token, session_id, request }       -> ExecResponse
 ///   POST /revoke  { token, session_id }                -> StatusResponse
 ///   POST /verify  { token, session_id }                -> VerifyResponse
+///   POST /keepalive { token, session_id }              -> StatusResponse (refreshes idle clock)
 ///   GET  /ping                                         -> PingResponse
 /// </summary>
 public sealed record PairRequest(
     [property: JsonPropertyName("secret")] string Secret,
     [property: JsonPropertyName("session_id")] string SessionId,
     [property: JsonPropertyName("workdir")] string WorkDir,
-    [property: JsonPropertyName("invite")] string? Invite = null);
+    [property: JsonPropertyName("invite")] string? Invite = null,
+    // Gateway self-heal (stale-token repair): pairs ONLY through the
+    // pair_auto lane — never with a credential, never with an operator
+    // prompt. An operator revoke or cap-expiry therefore cannot be undone
+    // silently; the repair fails closed instead.
+    [property: JsonPropertyName("auto_only")] bool AutoOnly = false);
 
 public sealed record PairResponse(
     [property: JsonPropertyName("ok")] bool Ok,
@@ -74,7 +80,11 @@ public sealed record DaemonStatusResponse(
     [property: JsonPropertyName("daemon")] bool Daemon,
     [property: JsonPropertyName("port")] int Port = 0,
     [property: JsonPropertyName("version")] string Version = "",
-    [property: JsonPropertyName("paired_sessions")] int PairedSessions = 0);
+    [property: JsonPropertyName("paired_sessions")] int PairedSessions = 0,
+    // This daemon's idle-token expiry window in seconds (-1 = no expiry).
+    // Missing on old daemons → 0; clients must treat 0 as "unknown" and
+    // fall back to a safe default heartbeat interval.
+    [property: JsonPropertyName("idle_timeout_seconds")] int IdleTimeoutSeconds = 0);
 
 // ── Admin surface (host-side CLI only; authenticated by the pair secret) ──
 public sealed record InviteRequest(
@@ -198,6 +208,14 @@ public sealed class HostDaemonClient : IDisposable
 
     public Task<StatusResponse> RevokeAsync(RevokeRequest request, CancellationToken ct) =>
         PostJsonAsync<RevokeRequest, StatusResponse>("/revoke", request, ct,
+            new StatusResponse(false, Error: "daemon unreachable"));
+
+    /// <summary>Refresh the pairing's idle clock without running anything.
+    /// Old daemons answer 404 (error "not found") — callers treat that as
+    /// "no heartbeat route", not as a dead session; the auto-repair path on
+    /// exec covers those daemons.</summary>
+    public Task<StatusResponse> KeepaliveAsync(RevokeRequest request, CancellationToken ct) =>
+        PostJsonAsync<RevokeRequest, StatusResponse>("/keepalive", request, ct,
             new StatusResponse(false, Error: "daemon unreachable"));
 
     /// <summary>Ask the daemon whether this exact session+token is still a

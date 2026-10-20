@@ -205,7 +205,10 @@ public sealed class HostDaemon : IAsyncDisposable
             int paired;
             lock (_sessionsLock)
                 paired = _sessions.Count;
-            WriteJson(ctx, 200, new DaemonStatusResponse(true, true, Port, BridgeOptions.Version, paired));
+            // idle_timeout_seconds lets a paired client size its keepalive
+            // heartbeat against this daemon's actual idle window (-1 = no expiry).
+            int idleSeconds = _idleTimeout > TimeSpan.Zero ? (int)_idleTimeout.TotalSeconds : -1;
+            WriteJson(ctx, 200, new DaemonStatusResponse(true, true, Port, BridgeOptions.Version, paired, idleSeconds));
             return;
         }
 
@@ -234,6 +237,13 @@ public sealed class HostDaemon : IAsyncDisposable
         {
             var req = await ReadJsonAsync<RevokeRequest>(ctx);
             await HandleVerifyAsync(ctx, req);
+            return;
+        }
+
+        if (method == "POST" && path == "/keepalive")
+        {
+            var req = await ReadJsonAsync<RevokeRequest>(ctx);
+            HandleKeepalive(ctx, req);
             return;
         }
 
@@ -271,7 +281,17 @@ public sealed class HostDaemon : IAsyncDisposable
     {
         bool removed;
         lock (_sessionsLock)
+        {
             removed = _sessions.Remove(sessionId);
+            // Operator-initiated kill: also drop the auto-approve memory so a
+            // revoked session cannot silently re-pair itself — it must re-enter
+            // the approval lane. (Idle expiry leaves the memory: a live agent
+            // self-heals; an operator's decision does not get undone.) The
+            // credential lane is untouched: an agent still holding a live
+            // secret/invite can always re-pair with it — the credential, not
+            // the revoke, is the security boundary.
+            _everPaired.Remove(sessionId);
+        }
         AuditLog.WriteNote($"admin revoke session={LogRedactor.Redact(sessionId)} removed={removed}");
         return removed;
     }
@@ -408,13 +428,22 @@ public sealed class HostDaemon : IAsyncDisposable
         }
 
         // Path 1: permanent pair secret (host-side admin + launcher back-compat).
-        var viaSecret = !string.IsNullOrEmpty(_pairSecret) && req.Secret == _pairSecret;
+        // auto_only (the gateway's stale-token self-heal) never uses a
+        // credential and never queues an operator prompt: the ONLY way it can
+        // pair is the pair_auto lane below, or it fails closed immediately. An
+        // operator revoke or a hard-cap expiry clears the auto-approve memory,
+        // so neither can a silent repair undo them — that is the whole point of
+        // the cap and of revoke. Idle expiry keeps the memory on purpose: a
+        // live agent self-heals; a long-dead one re-pairs through the normal
+        // credential/approval lanes on its next explicit /host on.
+        var autoOnly = req.AutoOnly;
+        var viaSecret = !autoOnly && !string.IsNullOrEmpty(_pairSecret) && req.Secret == _pairSecret;
 
         // Path 2: launcher invite (TTL-bounded; valid for every pair from the
         // run that received it, including re-pairs). Preferred over the secret:
         // leaking it grants pairings only for the life of the invite, then it
         // is dead.
-        var viaInvite = !viaSecret && ConsumeInvite(req.Invite);
+        var viaInvite = !autoOnly && !viaSecret && ConsumeInvite(req.Invite);
 
         // A wrong non-empty secret is an explicit refusal — never fall through
         // to the approval lane (an attacker guessing secrets must not be able
@@ -435,12 +464,29 @@ public sealed class HostDaemon : IAsyncDisposable
         {
             bool auto;
             lock (_sessionsLock)
+            {
                 auto = _config.PairAuto.Equals("this_session", StringComparison.OrdinalIgnoreCase) &&
                        _everPaired.Contains(req.SessionId);
+                // A silent self-heal (auto_only) must never steal a LIVE
+                // pairing: a session id that is currently paired under a
+                // different token was taken over by another gateway on
+                // purpose — fighting it back would ping-pong tokens.
+                if (autoOnly && auto && _sessions.ContainsKey(req.SessionId))
+                    auto = false;
+            }
             if (auto)
             {
                 viaRequest = "auto-approved (pair_auto=this_session, seen before)";
                 AuditLog.WriteNote($"pair auto-approved session={LogRedactor.Redact(req.SessionId)}");
+            }
+            else if (autoOnly)
+            {
+                // Self-heal against a session this daemon will not auto-approve
+                // (never paired here, operator-revoked, cap-expired, or
+                // pair_auto=strict): fail fast, never queue a prompt.
+                AuditLog.WriteNote($"pair auto-repair refused session={LogRedactor.Redact(req.SessionId)}");
+                WriteJson(ctx, 403, new PairResponse(false, Error: "pair_auto_unavailable"));
+                return;
             }
             else
             {
@@ -593,6 +639,54 @@ public sealed class HostDaemon : IAsyncDisposable
             return _sessions.TryGetValue(sessionId, out var s) && s.Token == token;
     }
 
+    /// <summary>
+    /// Liveness check for one session's own token (POST /keepalive). Unlike
+    /// /verify, a successful keepalive REFRESHES the idle clock — the paired
+    /// agent's heartbeat keeps its pairing alive while its process lives, so
+    /// idle expiry becomes an orphan-GC for dead agents instead of an
+    /// ambush on live ones. The hard cap (<c>token_max_hours</c>) is still
+    /// enforced here: a heartbeat must never extend a pairing past the cap,
+    /// and an over-cap session is dropped (fail closed, same as exec).
+    /// </summary>
+    private void HandleKeepalive(HttpListenerContext ctx, RevokeRequest? req)
+    {
+        if (req is null || string.IsNullOrWhiteSpace(req.SessionId) || string.IsNullOrWhiteSpace(req.Token))
+        {
+            WriteJson(ctx, 200, new StatusResponse(false, "missing_session_id_or_token"));
+            return;
+        }
+        var result = RefreshSessionIdle(req.SessionId, req.Token);
+        WriteJson(ctx, 200, result switch
+        {
+            "ok" => new StatusResponse(true),
+            "expired" => new StatusResponse(false, "token_expired"),
+            _ => new StatusResponse(false, "no_such_session_or_token"),
+        });
+    }
+
+    /// <summary>ok | stale (no such session/token) | expired (over hard cap —
+    /// session dropped). Idle expiry is checked before it can bite: a
+    /// heartbeat that arrives while the token is still live refreshes it.</summary>
+    private string RefreshSessionIdle(string sessionId, string token)
+    {
+        lock (_sessionsLock)
+        {
+            if (!_sessions.TryGetValue(sessionId, out var s) || s.Token != token)
+                return "stale";
+            var maxHours = _config.TokenMaxHours;
+            if (maxHours > 0 &&
+                DateTime.UtcNow - s.PairedUtc > TimeSpan.FromHours(maxHours))
+            {
+                _sessions.Remove(sessionId);
+                _everPaired.Remove(sessionId);
+                AuditLog.WriteNote($"session token expired (max {maxHours}h, keepalive) session={LogRedactor.Redact(sessionId)}");
+                return "expired";
+            }
+            _sessions[sessionId] = s with { LastSeenUtc = DateTime.UtcNow };
+            return "ok";
+        }
+    }
+
     private bool ValidateToken(string? sessionId, string? token, out string workDir)
     {
         workDir = _workDir;
@@ -619,6 +713,11 @@ public sealed class HostDaemon : IAsyncDisposable
                 DateTime.UtcNow - s.PairedUtc > TimeSpan.FromHours(maxHours))
             {
                 _sessions.Remove(sessionId);
+                // The cap's whole point is forcing the approval lane — clear
+                // the auto-approve memory too, or an agent-side silent
+                // re-pair would defeat it (the credential lane stays open
+                // by design: a live secret is a live pairing right).
+                _everPaired.Remove(sessionId);
                 AuditLog.WriteNote($"session token expired (max {maxHours}h) session={LogRedactor.Redact(sessionId)}");
                 return false;
             }

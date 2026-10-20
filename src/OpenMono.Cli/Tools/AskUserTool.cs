@@ -67,7 +67,7 @@ public sealed class AskUserTool : ToolBase
         if (!HostExecRequest.TryParse(question, out var request) || request is null)
             return ToolResult.Success(HostExecRequest.MalformedEnvelopeAnswer(question));
 
-        var answer = await gateway.RunAsync(request, async (cmd, isRoot, innerCt) =>
+        var outcome = await gateway.RunAsync(request, async (cmd, isRoot, innerCt) =>
         {
             var label = isRoot ? "HOST EXECUTION (as root)" : "HOST EXECUTION";
             var prompt = $"Run on the host as {gateway.RunAs}: {cmd}";
@@ -80,6 +80,11 @@ public sealed class AskUserTool : ToolBase
             return HostConsent.Map(reply);
         }, ct);
 
-        return ToolResult.Success(answer);
+        // Honest tool status: a host command that did not run renders ✗.
+        if (outcome.Ok)
+            return ToolResult.Success(outcome.Answer);
+        return outcome.ErrorCode == HostExecOutcome.ErrUserDenied
+            ? ToolResult.PermissionDenied(outcome.Answer)
+            : ToolResult.Failure(outcome.Answer, outcome.ErrorCode ?? HostExecOutcome.ErrExecFailed);
     }
 }

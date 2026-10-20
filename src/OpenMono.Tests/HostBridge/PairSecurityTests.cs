@@ -284,13 +284,17 @@ public class PairSecurityTests
         sessions.Items!.Should().ContainSingle(s => s.SessionId == "admin-e2e");
 
         // Revoke from the host kills the session; the agent's next exec fails.
+        // The revoke also clears the daemon's auto-approve memory, so the
+        // gateway's silent self-heal cannot resurrect an operator-killed
+        // session — the failure stays honest.
         (await client.AdminActionAsync(Secret, "/admin/revoke", "admin-e2e", CancellationToken.None))
             .Ok.Should().BeTrue();
         var answer = await gw.RunAsync(
             new HostExecRequest("echo post-revoke", null, false, false),
             (_, _, _) => Task.FromResult(HostConsentDecision.AllowOnce),
             CancellationToken.None);
-        answer.Should().Contain("pairing is stale");
+        answer.Ok.Should().BeFalse("an operator revoke must not be undone by the silent self-heal");
+        answer.Answer.Should().Contain("pairing is stale");
 
         client.Dispose();
     }
@@ -336,14 +340,18 @@ public class PairSecurityTests
                 new HostExecRequest($"echo alive-{i}", null, false, false),
                 (_, _, _) => Task.FromResult(HostConsentDecision.AllowOnce),
                 CancellationToken.None);
-            if (live.Contains("pairing is stale")) break;
+            if (live.Answer.Contains("pairing is stale")) break;
         }
 
         var answer = await gw.RunAsync(
             new HostExecRequest("echo past-cap", null, false, false),
             (_, _, _) => Task.FromResult(HostConsentDecision.AllowOnce),
             CancellationToken.None);
-        answer.Should().Contain("pairing is stale");
+        // The cap's point is forcing the approval lane: the daemon also
+        // cleared the auto-approve memory, so the silent self-heal refuses
+        // and the exec fails closed instead of quietly continuing.
+        answer.Ok.Should().BeFalse();
+        answer.Answer.Should().Contain("pairing is stale");
     }
 
     // ── Grant TTLs (agent-side, consent vocabulary) ─────────────────
@@ -362,7 +370,7 @@ public class PairSecurityTests
             new HostExecRequest("echo grant-probe", null, false, false),
             (_, _, _) => Task.FromResult(HostConsentDecision.AllowOnce),
             CancellationToken.None);
-        answer.Should().Contain("grant-probe");
+        answer.Answer.Should().Contain("grant-probe");
     }
 
     [Fact]
@@ -380,7 +388,7 @@ public class PairSecurityTests
             new HostExecRequest("echo establish", null, false, false),
             (_, _, _) => { decided = true; return Task.FromResult(HostConsentDecision.Allow30m); },
             CancellationToken.None);
-        answer.Should().Contain("establish");
+        answer.Answer.Should().Contain("establish");
         decided.Should().BeTrue();
 
         // Next command: consent callback must NOT be invoked (grant covers it).
@@ -389,7 +397,7 @@ public class PairSecurityTests
             new HostExecRequest("echo covered", null, false, false),
             (_, _, _) => { secondPrompted = true; return Task.FromResult(HostConsentDecision.DenyOnce); },
             CancellationToken.None);
-        second.Should().Contain("covered");
+        second.Answer.Should().Contain("covered");
         secondPrompted.Should().BeFalse("a live 30m grant must not re-prompt");
     }
 

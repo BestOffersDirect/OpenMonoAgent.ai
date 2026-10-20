@@ -137,6 +137,7 @@ public static class HostGatewayBootstrap
             if (error is not null)
             {
                 Utils.Log.Info($"[HOSTGATEWAY] pair failed for session {session.Id}: {error}");
+                gateway.Dispose();
                 return null;
             }
 
@@ -159,8 +160,10 @@ public static class HostGatewayBootstrap
         if (existing is not null)
         {
             // Unpaired or stale (daemon restarted — tokens are in-memory):
-            // unregister so the fresh pairing below replaces the dead one.
+            // unregister so the fresh pairing below replaces the dead one,
+            // and dispose it so its heartbeat timer + HTTP client go with it.
             HostGatewayRegistry.Unregister(session.Id);
+            existing.Dispose();
         }
 
         var secret = ResolveSecret();
@@ -180,7 +183,10 @@ public static class HostGatewayBootstrap
         }
         var error = await gateway.PairAsync(ct: ct);
         if (error is not null)
+        {
+            gateway.Dispose();
             return (null, error);
+        }
 
         HostGatewayRegistry.Register(session.Id, gateway);
         Utils.Log.Info($"[HOSTGATEWAY] paired (manual) session {session.Id} at {gateway.BaseUrl} run_as={gateway.RunAs} sudo={gateway.Sudo}");

@@ -180,14 +180,24 @@ Project layout (`src/OpenMono.HostBridge/`, .NET 10, references the CLI project 
 - **Legacy bool configs.** Old `host-bridge.json` files stored `allow_sudo` as a
   JSON boolean; it is mapped on load (`true` → `allow`, `false` → `deny`,
   missing/null → `ask`) and normalized to the string form on the next save.
-- **Idle-token expiry.** A paired sandbox session holds a daemon session
-  token; if it goes silent for longer than `--idle-timeout <hours>` (default
-  **2**, `0` disables), the token dies on its next call — the pairing fails
-  closed and the agent must re-pair (`/host on` again). Any validated call
-  refreshes the clock, so an active session never expires mid-task.
-  `GET /status` on the daemon reports `ok`, `port`, `version`, and a
-  `paired_sessions` count (counts only — never tokens or session ids);
-  `openmono host status` uses it.
+- **Idle-token expiry + keepalive.** A paired sandbox session holds a daemon
+  session token; if it goes silent for longer than `--idle-timeout <hours>`
+  (default **2**, `0` disables), the token dies on its next call. Any
+  validated call refreshes the clock — and a paired gateway now also
+  heartbeats the daemon's `POST /keepalive` endpoint in the background
+  (interval = one third of the idle window, clamped 1m..30m), so a live
+  agent's pairing never expires mid-task: idle expiry is an orphan-GC for
+  dead agents, not an ambush on live ones. A pairing that still goes stale
+  (e.g. idle expiry during a network partition) is silently re-paired once
+  through the daemon's `pair_auto=this_session` lane and the refused exec is
+  retried once — safe because a refused exec never ran. An **operator
+  revoke**, a **daemon restart**, or the **hard cap** (`token_max_hours`)
+  cannot be silently undone: the daemon clears its auto-approve memory for
+  those, so the exec fails closed with an honest ✗ and the agent must
+  re-pair (`/host on`). `pair_auto=strict` disables the silent re-pair too.
+  `GET /status` on the daemon reports `ok`, `port`, `version`, a
+  `paired_sessions` count, and `idle_timeout_seconds` (counts only — never
+  tokens or session ids); `openmono host status` uses it.
 - **Timeouts.** A timed-out foreground command is killed (whole process tree;
   via passwordless sudo when the command ran elevated) and the report says
   `was terminated` only when the process is confirmed gone. Otherwise it says

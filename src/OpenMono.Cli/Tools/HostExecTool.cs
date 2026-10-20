@@ -64,19 +64,34 @@ public sealed class HostExecTool : ToolBase
         // allow-all silently covering a root escalation — the documented rule
         // is "allow-all never covers sudo". We can't safely show a second card
         // mid-tool here, so we refuse and tell the model to get per-call consent.
-        var answer = await gateway.RunAsync(request, (_, isRoot, _) =>
+        var outcome = await gateway.RunAsync(request, (_, isRoot, _) =>
         {
             if (isRoot && gateway.SessionAllowsAll)
                 return Task.FromResult(HostConsentDecision.DenyOnce);
             return Task.FromResult(HostConsentDecision.AllowOnce);
         }, ct);
 
-        if (request.AsRoot && gateway.SessionAllowsAll && answer.StartsWith("Host execution denied", StringComparison.Ordinal))
+        if (request.AsRoot && gateway.SessionAllowsAll && outcome.ErrorCode == HostExecOutcome.ErrUserDenied)
             return ToolResult.PermissionDenied(
                 $"Host escalation (sudo) refused: a blanket host allow-all never covers root. " +
                 "Re-send this HostExec call with as_root and get the user to approve THIS command explicitly.");
 
-        return ToolResult.Success(answer);
+        // Honest tool status: anything that did not run renders ✗.
+        return outcome.ErrorCode switch
+        {
+            null => ToolResult.Success(outcome.Answer),
+            HostExecOutcome.ErrUserDenied => ToolResult.PermissionDenied(outcome.Answer),
+            HostExecOutcome.ErrStale => ToolResult.Failure(
+                outcome.Answer, HostExecOutcome.ErrStale,
+                "Do NOT retry. Ask the user to re-pair (the Host toggle, or /host on), then call HostExec again."),
+            HostExecOutcome.ErrUnreachable => ToolResult.Failure(
+                outcome.Answer, HostExecOutcome.ErrUnreachable,
+                "Do NOT retry or fake it with Bash. Ask the user to start the host daemon (openmono host daemon), then re-pair."),
+            HostExecOutcome.ErrPolicy => ToolResult.Failure(
+                outcome.Answer, HostExecOutcome.ErrPolicy,
+                "The host daemon's policy refused this command — do NOT retry it unchanged or try to route around the policy."),
+            _ => ToolResult.Failure(outcome.Answer, outcome.ErrorCode ?? HostExecOutcome.ErrExecFailed),
+        };
     }
 
     private static HostExecRequest FromInput(JsonElement input)

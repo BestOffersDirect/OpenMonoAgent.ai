@@ -172,6 +172,7 @@ public static class AcpEndpoints
                 // the daemon would reject every exec. Drop it and re-pair
                 // below instead of no-opping on the dead pairing.
                 HostGatewayRegistry.Unregister(session.Id);
+                gateway.Dispose();
                 gateway = null;
             }
             if (gateway is not { IsPaired: true })
@@ -200,6 +201,7 @@ public static class AcpEndpoints
         {
             await existing.UnpairAsync(ct);
             HostGatewayRegistry.Unregister(session.Id);
+            existing.Dispose();
         }
         session.State.Meta.HostEnabled = false;
         StripHostStandingOrders(session);

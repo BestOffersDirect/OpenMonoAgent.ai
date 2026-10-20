@@ -54,6 +54,7 @@ public sealed class HostCommand : ICommand
                     // re-pair instead of no-opping on the dead state.
                     context.Renderer.WriteInfo("Existing pairing is stale (daemon restarted?) — re-pairing ...");
                     HostGatewayRegistry.Unregister(context.Session.Id);
+                    gateway.Dispose();
                 }
                 context.Renderer.WriteInfo($"Pairing with host daemon at {HostGatewayBootstrap.ResolveBaseUrl()} ...");
                 if (!HostGatewayBootstrap.HasCredential())
@@ -87,6 +88,7 @@ public sealed class HostCommand : ICommand
                 }
                 await gateway.UnpairAsync(ct);
                 HostGatewayRegistry.Unregister(context.Session.Id);
+                gateway.Dispose();
                 context.Session.Meta.HostEnabled = false;
                 context.Renderer.WriteInfo("HOST:OFF — pairing revoked, back to workspace-only tools.");
                 break;

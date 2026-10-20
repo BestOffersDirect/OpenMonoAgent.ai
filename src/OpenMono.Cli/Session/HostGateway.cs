@@ -1,6 +1,31 @@
+using System.Net.Http;
 using OpenMono.HostBridge;
 
 namespace OpenMono.Session;
+
+/// <summary>
+/// The result of one gateway run: whether the host command actually executed,
+/// whether it was refused (and why), and the text answer for the model loop.
+/// Callers map this onto tool results so a failed host action renders as a
+/// failure (✗) instead of a success (✓) — the old bare-string return hid
+/// every refusal class behind the same "looks like an answer" shape.
+/// </summary>
+public sealed record HostExecOutcome(
+    bool Ok,
+    bool Denied,
+    string? ErrorCode,
+    string Output)
+{
+    /// <summary>The text fed to the model (execution output or refusal
+    /// message) — unchanged wording from before the typed outcome.</summary>
+    public string Answer => Output;
+
+    public const string ErrStale = "host_session_stale";
+    public const string ErrPolicy = "host_policy_denied";
+    public const string ErrUnreachable = "daemon_unreachable";
+    public const string ErrUserDenied = "user_denied";
+    public const string ErrExecFailed = "host_execution_failed";
+}
 
 /// <summary>
 /// The sandbox side of host mode: pairs with a bare-metal host-bridge daemon
@@ -15,8 +40,18 @@ namespace OpenMono.Session;
 /// the pairing is revoked. Escalations (as_root) always re-prompt — allow-all
 /// never covers sudo. The consent vocabulary is shared through
 /// <see cref="HostConsent"/> so every surface means the same thing.
+///
+/// Long-running sessions: while this process lives, a background keepalive
+/// heartbeat refreshes the daemon's idle clock, so idle-token expiry becomes
+/// an orphan-GC for dead agents rather than an ambush on live ones. A pairing
+/// that still goes stale (daemon restart, operator revoke, hard cap) is
+/// silently re-paired once through the daemon's pair_auto lane and the
+/// refused exec is retried once — safe because the refused exec never ran.
+/// Security is unchanged: the daemon restart still wipes every token, an
+/// unknown session still cannot pair without a credential or operator
+/// approval, and <c>pair_auto=strict</c> disables the silent re-pair.
 /// </summary>
-public sealed class HostGateway
+public sealed class HostGateway : IDisposable
 {
     private readonly HostDaemonClient _client;
     private readonly string _sessionId;
@@ -26,6 +61,13 @@ public sealed class HostGateway
     private DateTime? _grantUntilUtc; // null = no blanket grant; DateTime.MaxValue = whole session
     private bool _denyAll;
     private SudoPolicy _sudo = SudoPolicy.Ask;
+    private System.Threading.Timer? _heartbeat;
+    private readonly SemaphoreSlim _repairGate = new(1, 1);
+    private const int HeartbeatDefaultMinutes = 30;
+    private const int HeartbeatFloorSeconds = 60;
+    private volatile bool _disposed;
+    // Test seam: force the heartbeat cadence (set before pairing).
+    internal TimeSpan? HeartbeatIntervalOverride { get; set; }
 
     public string BaseUrl { get; }
     public string? RunAs { get; private set; }
@@ -94,7 +136,82 @@ public sealed class HostGateway
         };
         _grantUntilUtc = null;
         _denyAll = false;
+        await StartHeartbeatAsync(ct);
         return null;
+    }
+
+    /// <summary>
+    /// Heartbeat the daemon's idle clock so a live agent's pairing never
+    /// expires out from under it. The interval is sized to this daemon's
+    /// own idle window (one third of it, clamped to 1m..30m) so the cadence
+    /// adapts to aggressive <c>--idle-timeout</c> settings; old daemons that
+    /// do not report the window get the 30m default, and a daemon with
+    /// expiry disabled (<c>--idle-timeout 0</c>, reported as -1) needs no
+    /// heartbeat at all.
+    /// </summary>
+    private async Task StartHeartbeatAsync(CancellationToken ct)
+    {
+        StopHeartbeat();
+        if (_disposed) return;
+
+        // PairAsync just succeeded, so this round trip is cheap; StatusAsync
+        // never throws (unreachable daemon = Daemon=false = skip — the next
+        // exec's auto-repair re-pairs and re-arms the heartbeat).
+        var status = await _client.StatusAsync(ct);
+        if (_disposed || !status.Daemon || status.IdleTimeoutSeconds < 0)
+            return; // no expiry configured — nothing to keep alive
+
+        var idleSeconds = status.IdleTimeoutSeconds > 0
+            ? status.IdleTimeoutSeconds
+            : HeartbeatDefaultMinutes * 60; // old daemon without the field
+        var intervalSeconds = HeartbeatIntervalSeconds(idleSeconds);
+
+        _heartbeat = new System.Threading.Timer(
+            _ => _ = HeartbeatOnceAsync(),
+            null,
+            HeartbeatIntervalOverride ?? TimeSpan.FromSeconds(intervalSeconds),
+            HeartbeatIntervalOverride ?? TimeSpan.FromSeconds(intervalSeconds));
+    }
+
+    /// <summary>Heartbeat cadence for a daemon reporting the given idle
+    /// window in seconds (-1 = expiry disabled → no heartbeat). One third of
+    /// the window, clamped to 1m..30m.</summary>
+    internal static int HeartbeatIntervalSeconds(int reportedIdleSeconds)
+    {
+        if (reportedIdleSeconds < 0)
+            return -1;
+        var idle = reportedIdleSeconds > 0
+            ? reportedIdleSeconds
+            : HeartbeatDefaultMinutes * 60;
+        return Math.Clamp(idle / 3, HeartbeatFloorSeconds, HeartbeatDefaultMinutes * 60);
+    }
+
+    private async Task HeartbeatOnceAsync()
+    {
+        var token = _token;
+        if (_disposed || token is null) return;
+        try
+        {
+            var resp = await _client.KeepaliveAsync(new RevokeRequest(token, _sessionId), CancellationToken.None);
+            // "daemon unreachable" (old daemon without /keepalive, or a
+            // blip): keep the timer running — exec's auto-repair covers
+            // a genuinely dead pairing. An expired/dropped pairing stops
+            // the heartbeat; the next exec re-pairs through the repair
+            // path, which restarts it.
+            if (!resp.Ok && resp.Error is "token_expired" or "no_such_session_or_token")
+                StopHeartbeat();
+        }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or ObjectDisposedException)
+        {
+            // Swallowed: the next beat or the next exec's auto-repair
+            // handles recovery. Never let a timer callback throw.
+        }
+    }
+
+    private void StopHeartbeat()
+    {
+        var timer = Interlocked.Exchange(ref _heartbeat, null);
+        timer?.Dispose();
     }
 
     /// <summary>
@@ -122,6 +239,7 @@ public sealed class HostGateway
     /// <summary>Drop the pairing on the daemon and locally. Idempotent.</summary>
     public async Task UnpairAsync(CancellationToken ct = default)
     {
+        StopHeartbeat();
         if (_token is not null)
         {
             try { await _client.RevokeAsync(new RevokeRequest(_token, _sessionId), ct); }
@@ -135,22 +253,25 @@ public sealed class HostGateway
     }
 
     /// <summary>
-    /// Run one HOST_EXEC request through consent + daemon relay and return the
-    /// text answer for the model loop. Never throws on policy/denial — those
-    /// come back as textual answers, mirroring the operator bridge exactly.
+    /// Run one HOST_EXEC request through consent + daemon relay. Never throws
+    /// on policy/denial — every refusal comes back as a typed
+    /// <see cref="HostExecOutcome"/> carrying the same textual answers the
+    /// operator bridge produces, so callers can render an honest failure.
     /// <paramref name="consent"/> is the surface-specific human prompt.
     /// </summary>
-    public async Task<string> RunAsync(
+    public async Task<HostExecOutcome> RunAsync(
         HostExecRequest request,
         Func<string, bool, CancellationToken, Task<HostConsentDecision>> consent,
         CancellationToken ct)
     {
         if (_token is null)
-            return "HOST EXECUTION refused: this session is not paired with a host daemon (/host on).";
+            return new HostExecOutcome(false, false, HostExecOutcome.ErrStale,
+                "HOST EXECUTION refused: this session is not paired with a host daemon (/host on).");
 
         if (request.AsRoot && _sudo == SudoPolicy.Deny)
-            return "Host execution refused: as_root was requested but sudo is denied on this host. " +
-                "Re-send without \"as_root\": true, or ask the user to enable sudo (openmono config host.sudo_policy allow).";
+            return new HostExecOutcome(false, true, HostExecOutcome.ErrPolicy,
+                "Host execution refused: as_root was requested but sudo is denied on this host. " +
+                "Re-send without \"as_root\": true, or ask the user to enable sudo (openmono config host.sudo_policy allow).");
 
         var decision = HostConsentDecision.AllowOnce;
         if (_denyAll)
@@ -171,22 +292,111 @@ public sealed class HostGateway
                 break;
             case HostConsentDecision.DenyAll:
                 _denyAll = true;
-                return $"Host execution denied by user (host mode off for this session): {request.Command}";
+                return new HostExecOutcome(false, true, HostExecOutcome.ErrUserDenied,
+                    $"Host execution denied by user (host mode off for this session): {request.Command}");
             case HostConsentDecision.DenyOnce:
-                return $"Host execution denied by user: {request.Command}";
+                return new HostExecOutcome(false, true, HostExecOutcome.ErrUserDenied,
+                    $"Host execution denied by user: {request.Command}");
         }
 
-        var resp = await _client.ExecAsync(new ExecRequest(_token, _sessionId, request), ct);
+        var token = _token;
+        var resp = await _client.ExecAsync(new ExecRequest(token!, _sessionId, request), ct);
+
+        // Stale pairing self-heal: the refused exec never ran, so retrying
+        // after a silent re-pair is safe. One flight at a time so parallel
+        // execs cannot race token rotations against each other.
+        if (resp.Denied && resp.Error == "unpaired_or_bad_token")
+        {
+            resp = await RepairAndRetryAsync(token!, request, ct);
+        }
+
         if (resp.Denied && resp.Error is not null)
         {
             if (resp.Error == "unpaired_or_bad_token")
-                return "HOST EXECUTION refused by the host daemon: the session pairing is stale (token rotated or revoked). Re-pair with /host on.";
-            return $"Host execution denied by host-bridge policy: {request.Command}";
+                return new HostExecOutcome(false, false, HostExecOutcome.ErrStale,
+                    "HOST EXECUTION refused by the host daemon: the session pairing is stale (token rotated or revoked). Re-pair with /host on.");
+            if (resp.Error == "daemon unreachable")
+                return new HostExecOutcome(false, false, HostExecOutcome.ErrUnreachable,
+                    $"HOST EXECUTION refused: the host daemon at {BaseUrl} is unreachable (is it still running?). No host command ran.");
+            return new HostExecOutcome(false, true, HostExecOutcome.ErrPolicy,
+                $"Host execution denied by host-bridge policy: {request.Command}");
+        }
+
+        if (resp.Denied)
+        {
+            // Denied without an error code = the daemon ran the policy gate
+            // (deny-list / sudo refusal) or the executor itself refused
+            // (timeout, sudo password missing, launch failure). The message
+            // text already says which; split by shape so tool results can
+            // carry a precise error code.
+            var policyDenied = resp.Output.StartsWith("Host execution denied by host-bridge policy", StringComparison.Ordinal);
+            return new HostExecOutcome(false, policyDenied,
+                policyDenied ? HostExecOutcome.ErrPolicy : HostExecOutcome.ErrExecFailed,
+                resp.Output);
         }
 
         var targetUser = request.AsRoot ? "root" : RunAs ?? "host user";
         var head = $"[host-exec on {WorkDir} as {targetUser}]";
-        return $"{head}\n$ {request.Command}\n{resp.Output}";
+        return new HostExecOutcome(true, false, null, $"{head}\n$ {request.Command}\n{resp.Output}");
+    }
+
+    /// <summary>
+    /// Silent re-pair + one retry after the daemon refused a stale token.
+    /// Credential-free auto_only lane: the daemon only re-approves a session
+    /// this run already paired (pair_auto=this_session), and fails fast —
+    /// never an operator prompt — otherwise. An idle expiry is therefore
+    /// self-healed invisibly; an operator revoke or a hard-cap expiry is
+    /// not (the daemon cleared its auto-approve memory for those), so the
+    /// exec comes back with the original fail-closed answer.
+    /// Safe to retry because a refused exec never ran.
+    /// </summary>
+    private async Task<ExecResponse> RepairAndRetryAsync(string deadToken, HostExecRequest request, CancellationToken ct)
+    {
+        await _repairGate.WaitAsync(ct);
+        try
+        {
+            // Another exec may already have repaired this pairing while we
+            // queued — only re-pair if our token is still the current one.
+            if (_token == deadToken)
+            {
+                var repaired = await TryAutoRepairAsync(ct);
+                if (!repaired)
+                    return new ExecResponse(false, Denied: true, Error: "unpaired_or_bad_token");
+            }
+            if (_token is null)
+                return new ExecResponse(false, Denied: true, Error: "unpaired_or_bad_token");
+            return await _client.ExecAsync(new ExecRequest(_token, _sessionId, request), ct);
+        }
+        finally
+        {
+            _repairGate.Release();
+        }
+    }
+
+    /// <summary>The daemon-side auto lane for stale-token repair (no secret,
+    /// no invite, auto_only=true). Never revokes the session's consent
+    /// grants: allow-all/deny-all are user decisions, not token decisions.
+    /// Returns true when the pairing was re-minted.</summary>
+    private async Task<bool> TryAutoRepairAsync(CancellationToken ct)
+    {
+        var ping = await _client.PingAsync(ct);
+        if (!ping.Daemon)
+            return false;
+        var resp = await _client.PairAsync(
+            new PairRequest("", _sessionId, WorkDir, Invite: null, AutoOnly: true), ct);
+        if (!resp.Ok || string.IsNullOrEmpty(resp.Token))
+            return false;
+        _token = resp.Token;
+        RunAs = resp.RunAs;
+        HostLogDir = resp.LogDir;
+        _sudo = resp.Sudo switch
+        {
+            "allow" => SudoPolicy.Allow,
+            "deny" => SudoPolicy.Deny,
+            _ => SudoPolicy.Ask,
+        };
+        await StartHeartbeatAsync(ct);
+        return true;
     }
 
     /// <summary>
@@ -197,4 +407,13 @@ public sealed class HostGateway
     public string? BuildStandingOrders() => IsPaired
         ? HostStandingOrders.Build(WorkDir, RunAs ?? "host user", HostLogDir ?? "~/.openmono/logs", _sudo)
         : null;
+
+    public void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true;
+        StopHeartbeat();
+        _repairGate.Dispose();
+        _client.Dispose();
+    }
 }
