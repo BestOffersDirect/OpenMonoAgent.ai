@@ -580,9 +580,10 @@ cmd_setup() {
             --bonsai-ptq1)  export OPENMONO_MODEL=bonsai-ptq1 ;;
             --qwen)         export OPENMONO_MODEL=qwen ;;
             --flash-next)   export OPENMONO_MODEL=flash-next ;;
+            --options)      export OPENMONO_SETUP_OPTIONS=1 ;;
             --verbose|-v)   export OPENMONO_VERBOSE=1 ;;
             --help|-h)
-                echo "Usage: openmono setup [--full|--inference|--agent] [--gpu|--cpu] [--model=NAME] [--vision=on|off] [--verbose]"
+                echo "Usage: openmono setup [--full|--inference|--agent] [--gpu|--cpu] [--model=NAME] [--vision=on|off] [--options] [--verbose]"
                 echo ""
                 echo "Installs one of three roles. Pick based on what the box will do:"
                 echo ""
@@ -595,10 +596,16 @@ cmd_setup() {
                 echo "                Use on the laptop in dual-box mode. Point at a remote"
                 echo "                inference server via 'openmono config set llm.endpoint …'."
                 echo ""
-                echo "Model engine (setup analyzes your hardware and only offers what this box can run; default = Qwen on llama.cpp):"
-                echo "  --model=qwen         Stock Qwen on standard llama.cpp  [DEFAULT]"
-                echo "  --model=bonsai-pq2   Ternary-Bonsai-2-27B PQ2_0 (~7.2GB) [NVIDIA CUDA / 7940HS Vulkan / Apple Silicon 16GB+ experimental]"
-                echo "  --model=bonsai-ptq1  Ternary-Bonsai-2-27B PTQ1_0 (~5.9GB, small cards)"
+                echo "Model engine — by default setup picks the BEST model your hardware can run and does not ask:"
+                echo "  24GB+ VRAM + 48GB-class RAM → Qwen3.8-Flash-Next (Strata)   24GB+ VRAM, less RAM → Qwen3.8-27B"
+                echo "  16GB VRAM → Qwen3.8-27B IQ3_XXS          12GB VRAM / AMD iGPU (32GB+ RAM) → Bonsai PQ2_0"
+                echo "  CPU only → Qwen3.6-35B-A3B              macOS 48GB+ → Qwen3.6-35B-A3B · 24-47GB → PQ2_0 · 16-23GB → PTQ1_0"
+                echo "  (full table: docs/MODELS.md). Pass --options to choose model, vision and parallel slots yourself."
+                echo ""
+                echo "Override the pick with any of:"
+                echo "  --model=qwen         Stock Qwen on standard llama.cpp"
+                echo "  --model=bonsai-pq2   Ternary-Bonsai-2-27B PQ2_0 (~7.2GB) [NVIDIA CUDA / AMD iGPU Vulkan / Apple Silicon]"
+                echo "  --model=bonsai-ptq1  Ternary-Bonsai-2-27B PTQ1_0 (~5.9GB, tightest memory)"
                 echo "  --model=flash-next   Qwen3.8-Flash-Next via Strata (~70GB, Linux + NVIDIA / CUDA 13, 48GB-class RAM+)"
                 echo "  --bonsai / --bonsai-ptq1 / --qwen / --flash-next   shorthands for the above"
                 echo ""
@@ -607,6 +614,8 @@ cmd_setup() {
                 echo "  --cpu         Force CPU mode"
                 echo ""
                 echo "Other:"
+                echo "  --options     Ask about model, vision and parallel slots instead of defaulting them from"
+                echo "                hardware. Role, GPU mode, host-bridge consent and reboot still always ask."
                 echo "  --verbose     Show detailed command output (default: step-level progress)"
                 echo ""
                 echo "Server sub-agent (opt-in add-on, full/agent only — never inference):"

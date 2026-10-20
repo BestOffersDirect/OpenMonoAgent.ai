@@ -42,9 +42,23 @@
 #                               what replaces the hardcoded select_model tables)
 #   mc_files_select <id>        same, using only files.* + accuracy (fixed-identity
 #                               models such as Bonsai — ctx/label come from tiers)
+#   mc_auto_pick                hardware-gated default model id for this box:
+#                               flash-next | bonsai-pq2 | bonsai-ptq1 | qwen
+#                               (reads _GPU_TIER, GPU_MODE, AMD_IGPU_MODE,
+#                               TOTAL_MEM, CAN_STRATA, CAN_BONSAI)
+#   mc_auto_reason              one-line why for the same pick (menu/log text)
+#   mc_vision_default           "yes" when setup should default vision on with no
+#                               prompt, "ask" when it should prompt; honouring
+#                               OPENMONO_SETUP_OPTIONS
+#   mc_parallel_slots_default   parallel-slots value when setup should not ask
+#                               (1), else "ask"
 #
 # <plat> is "linux" or "macos".
 # ──────────────────────────────────────────────────────────────────────────────
+
+# MC_PLATFORM is "macos" on Darwin and "linux" everywhere else — mc_auto_pick
+# uses it to apply the Apple-Silicon unified-memory row of the policy table.
+if [ "$(uname -s)" = "Darwin" ]; then MC_PLATFORM=macos; else MC_PLATFORM=linux; fi
 
 # MC_JSON holds the parsed catalog text once mc_load runs.
 MC_LOADED=0
@@ -208,6 +222,86 @@ _mc_set_identity() {
     IS_BONSAI="${7:-0}"
     _MODEL_ID="${8:-}"
 }
+
+# ── Auto-default model policy (hardware gate, no --options) ────────────────────
+#
+# Without --options, setup picks the best model this box can run instead of
+# asking. The gate is ordered — FIRST MATCH WINS — and the VRAM gate runs before
+# the system-RAM gate, so the same card can land on two different rows depending
+# on how much RAM is behind it. Supported NVIDIA cards start at 12GB; smaller
+# cards keep yesterday's Qwen default (see docs/MODELS.md).
+#   1. NVIDIA ≥24GB VRAM + ≥48GB RAM (CAN_STRATA) → flash-next
+#   2. NVIDIA 12GB VRAM             (CAN_BONSAI)  → bonsai-pq2
+#   3. AMD iGPU / UMA (7940HS, 780M), 32GB RAM+ (CAN_BONSAI) → bonsai-pq2
+#   4. macOS unified 24-47GB       (CAN_BONSAI)  → bonsai-pq2
+#   5. macOS unified 16-23GB       (CAN_BONSAI)  → bonsai-ptq1
+#   6. everything else                            → qwen
+# Row 6 covers NVIDIA 16GB and 24GB+ with under 48GB RAM: both run Qwen3.8-27B
+# (IQ3_XXS and Q4_K_M respectively) — a 27B Qwen fits, so no ternary quant.
+# PQ2_0 (7.21GB) is the better ternary build and is used wherever it fits: the
+# 12GB tier budgets 7.21 + ~0.63mmproj + KV in VRAM, and the iGPU path shares
+# system RAM over UMA, so the higher quant is fine there too.
+mc_auto_pick() {
+    local vram="${_GPU_TIER:-0}" ram="${TOTAL_MEM:-0}"
+    # 44, not 48: a 48GB-class box reports ~46-47 GiB once firmware/kernel
+    # reservations are subtracted, and this is the same bar install.sh uses to
+    # set CAN_STRATA. Using 48 here would silently drop real 48GB boxes to Qwen.
+    if [ "${CAN_STRATA:-0}" = "1" ] && [ "$vram" -ge 24 ] && [ "$ram" -ge 44 ]; then
+        echo flash-next; return
+    fi
+    if [ "${CAN_BONSAI:-0}" = "1" ]; then
+        # NVIDIA 12GB is the only Bonsai band. 16GB and 24GB+ keep Qwen3.8-27B
+        # (IQ3_XXS / Q4_K_M) — a 27B Qwen fits, so there is no reason to drop to
+        # a ternary quant. 12GB is where Qwen has to fall back to 9B, which is
+        # exactly where PQ2_0 (7.2GB) buys a real 27B. The band is the 12GB tier:
+        # install.sh buckets 12000-15999MB there, and NVIDIA ships no 13-15GB card,
+        # so in practice this is 12GB and nothing else.
+        if [ "${GPU_MODE:-0}" = "1" ] && [ "$vram" -ge 12 ] && [ "$vram" -lt 16 ]; then
+            echo bonsai-pq2; return
+        fi
+        # The iGPU is UMA: weights, KV cache and the OS all come out of system
+        # RAM, so the row is documented at 32GB+. Below that the pick is still
+        # Bonsai — PTQ1_0/PQ2_0 need ~7GB and the Qwen CPU model needs ~20GB, so
+        # a smaller box is strictly better off on the ternary build; install.sh
+        # warns rather than downgrading it to a model that cannot load.
+        if [ "${AMD_IGPU_MODE:-0}" = "1" ]; then echo bonsai-pq2; return; fi
+        if [ "$MC_PLATFORM" = "macos" ] && [ "$ram" -ge 24 ] && [ "$ram" -lt 48 ]; then
+            echo bonsai-pq2; return
+        fi
+        if [ "$MC_PLATFORM" = "macos" ] && [ "$ram" -ge 16 ] && [ "$ram" -lt 24 ]; then
+            echo bonsai-ptq1; return
+        fi
+    fi
+    echo qwen
+}
+
+# Human-readable reason for the pick above — logged so a silent default is still
+# an explainable one.
+mc_auto_reason() {
+    local vram="${_GPU_TIER:-0}" ram="${TOTAL_MEM:-0}" id
+    id="$(mc_auto_pick)"
+    case "$id" in
+        flash-next) echo "≥24GB VRAM and ${ram}GB system RAM — Strata runs Qwen3.8-Flash-Next natively" ;;
+        bonsai-pq2) if [ "${AMD_IGPU_MODE:-0}" = "1" ]; then
+                        echo "AMD iGPU (UMA shares system RAM) — PQ2_0 is the better ternary build"
+                    elif [ "$MC_PLATFORM" = "macos" ]; then
+                        echo "${ram}GB unified memory — PQ2_0 leaves room for KV + vision"
+                    else
+                        echo "${vram}GB VRAM — Qwen has to drop to 9B here; PQ2_0 (7.2GB) keeps a real 27B"
+                    fi ;;
+        bonsai-ptq1) echo "${ram}GB unified memory — PTQ1_0 (5.95GB) is the quant that fits" ;;
+        *)           if [ "${GPU_MODE:-0}" = "1" ] && [ "$vram" -ge 16 ]; then
+                        echo "${vram}GB VRAM — Qwen3.8-27B fits, so no ternary fallback needed"
+                     else
+                        echo "no accelerated Bonsai/Strata target — stock Qwen for this tier"
+                     fi ;;
+    esac
+}
+
+# Non-interactive defaults for the two prompts that are hardware-defaulted:
+# "ask" means setup should still prompt (user passed --options).
+mc_vision_default()      { [ "${OPENMONO_SETUP_OPTIONS:-0}" = "1" ] && echo ask || echo yes; }
+mc_parallel_slots_default() { [ "${OPENMONO_SETUP_OPTIONS:-0}" = "1" ] && echo ask || echo 1; }
 
 # mc_files_select <id> — set MODEL_* from files.* + accuracy. For models whose
 # GGUF never changes across tiers (Bonsai): tiers only tune ctx/kv/label.

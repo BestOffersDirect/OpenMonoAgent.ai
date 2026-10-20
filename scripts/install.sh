@@ -26,10 +26,22 @@ set -euo pipefail
 #   OPENMONO_CPU=1        Force CPU mode (removes any GPU override)
 #   OPENMONO_VERBOSE=1    Show detailed command output
 #   INFERENCE_PORT=7474   shared inference port for every backend (default 7474)
-#   OPENMONO_PARALLEL_SLOTS=N  Parallel slots (default 1; asked interactively)
+#   OPENMONO_PARALLEL_SLOTS=N  Parallel slots (default 1; asked with --options)
 #   OPENMONO_MODEL        Model engine: auto (default), qwen, bonsai-pq2, bonsai-ptq1, flash-next
-#                         auto = analyze hardware, then pick (default Qwen on llama.cpp;
-#                                Bonsai/Strata offered only when the box can run them)
+#                         auto = analyze hardware, then pick the best model this box
+#                                can run — the table in docs/MODELS.md. With no
+#                                --options flag setup does NOT ask: ≥24GB VRAM on a
+#                                48GB-class box → Strata (flash-next); 12GB NVIDIA
+#                                VRAM or an AMD iGPU (7940HS/780M, 32GB+ RAM) →
+#                                Bonsai PQ2_0;
+#                                everything else (incl. 16GB and 24GB+ cards that do
+#                                not meet the Strata RAM bar) → Qwen3.8-27B. Pass
+#                                --options to choose.
+#   OPENMONO_SETUP_OPTIONS
+#                         1 = setup asks about model, vision and parallel slots
+#                             (what the --options flag sets). Unset = those three
+#                             are hardware-defaulted; role, GPU choice, host-bridge
+#                             consent, reboot and the AMD config pause still ask.
 #   OPENMONO_PRISM_IMAGE_CUDA   Prism CUDA image ref (default startuphakk/prism-llama.cpp_cuda:latest)
 #   OPENMONO_PRISM_IMAGE_VULKAN Prism Vulkan image ref (default startuphakk/prism-llama.cpp_vulkan:latest)
 #   OPENMONO_PRISM_IMAGE        Legacy single-ref override (wins over both when set)
@@ -397,6 +409,14 @@ if [ "$OPENMONO_ROLE" != "agent" ]; then
             warn "GPU mode selected but nvidia-smi not found. Falling back to CPU mode."
             GPU_MODE=0
         fi
+        # System RAM matters even with a GPU: Strata streams ~70GB of weights
+        # from disk, so the flash-next row of the policy table needs a 48GB-class
+        # box on top of the 24GB+ card. Read it here — the CPU branch below
+        # already does, and mc_auto_pick reads TOTAL_MEM either way.
+        if command -v free &>/dev/null; then
+            TOTAL_MEM=$(free -g | awk '/^Mem:/{print $2}')
+            ok "RAM: ${TOTAL_MEM}GB"
+        fi
     else
         if command -v free &>/dev/null; then
             TOTAL_MEM=$(free -g | awk '/^Mem:/{print $2}')
@@ -435,7 +455,15 @@ if [ "$OPENMONO_ROLE" != "agent" ]; then
             info "RAM: ${_MEM_GB}GB — Strata (Qwen3.8-Flash-Next, ~70GB weights) not offered; it needs a 48GB-class box."
         fi
     fi
-    # Unified picker: defaults to Qwen on stock llama.cpp; Bonsai / Strata are
+    # Unified picker: only offers what this box can run. Sets INFERENCE_BACKEND.
+    # Without --options, hardware decides the model: export the policy pick so the
+    # explicit-selection path in prompt_model_choice runs with no menu. An
+    # explicit OPENMONO_MODEL= (i.e. --model=) always wins over the hardware gate.
+    if [ "${OPENMONO_SETUP_OPTIONS:-0}" != "1" ] && [ "${OPENMONO_MODEL:-auto}" = "auto" ]; then
+        OPENMONO_MODEL="$(mc_auto_pick)"; export OPENMONO_MODEL
+        info "Auto-selected model '$OPENMONO_MODEL' — $(mc_auto_reason)"
+        info "Pass --options to choose the model, vision and parallel slots yourself"
+    fi
     # offered only when this box supports them. Sets INFERENCE_BACKEND.
     prompt_model_choice
     # Vision is a user choice (when the hardware+model allow it): ask it FIRST,
@@ -446,6 +474,10 @@ if [ "$OPENMONO_ROLE" != "agent" ]; then
     # availability still gates whether the question is even possible.
     if [ "$INFERENCE_BACKEND" != "strata" ] && [ -n "${MODEL_MMPROJ:-}" ]; then
         _vision_choice="${OPENMONO_VISION:-}"
+        if [ -z "$_vision_choice" ]; then
+            _vision_choice="$(mc_vision_default)"
+            [ "$_vision_choice" = "ask" ] && _vision_choice=""
+        fi
         if [ -z "$_vision_choice" ] && [ -t 0 ]; then
             flush_stdin
             echo ""
@@ -471,8 +503,13 @@ if [ "$OPENMONO_ROLE" != "agent" ]; then
     # Parallel slots: ask once for every backend/model, persist to settings.json.
     # apply_settings.sh materializes it (INFERENCE_PARALLEL / the Strata config
     # "parallel") on start; the docker/.env writes below keep the very first
-    # start in sync.
-    om_choose_parallel_slots 1
+    # start in sync. Without --options, slots stay at 1 (the safe default).
+    if [ "$(mc_parallel_slots_default)" = "ask" ]; then
+        om_choose_parallel_slots 1
+    else
+        OM_PARALLEL_SLOTS="${OPENMONO_PARALLEL_SLOTS:-1}"
+        info "Parallel slots: $OM_PARALLEL_SLOTS (pass --options to change)"
+    fi
     PARALLEL_SLOTS="$OM_PARALLEL_SLOTS"
     # Warn about what this many slots costs on the backend actually selected.
     # Warn-only by design: Strata silently reduces an over-large count itself and
@@ -491,10 +528,8 @@ if [ "$OPENMONO_ROLE" != "agent" ]; then
     # Early Docker Hub pull: verify the Prism image BEFORE the model download.
     # Explicit --model=bonsai-* + unreachable registry = hard fail (user asked
     # for it). Auto/prompt-selected Bonsai + unreachable registry = fall back
-    # to stock Qwen so setup still yields a working box.
-    # On the AMD iGPU path without an explicit bonsai flag, stay on stock
-    # Qwen (Vulkan Bonsai support is new) — only use the Vulkan Prism image
-    # when Bonsai was explicitly requested or already selected on NVIDIA.
+    # to stock Qwen so setup still yields a working box — that fallback is what
+    # makes Bonsai safe to default on the AMD iGPU (Vulkan) path.
     if [ "${IS_BONSAI:-0}" = "1" ]; then
         _PRISM_BACKEND="$(prism_backend)"
         if ! pull_prism_image "$_PRISM_BACKEND"; then
@@ -521,7 +556,7 @@ if [ "$OPENMONO_ROLE" != "agent" ]; then
     # 5.95GB weights leaves no headroom. Disable it; text inference only.
     # (The user is asked about vision up front, right after model selection,
     # before the parallel-slots prompt; this guard only applies the hard cap.)
-    if [ "${IS_BONSAI:-0}" = "1" ] && [ "${_GPU_TIER:-0}" -le 8 ]; then
+    if [ "${IS_BONSAI:-0}" = "1" ] && [ "${_GPU_TIER:-0}" -le 8 ] && [ "${AMD_IGPU_MODE:-0}" != "1" ]; then
         MODEL_MMPROJ=""
         MODEL_MMPROJ_URL=""
         warn "8GB VRAM: vision (mmproj) disabled to protect VRAM headroom."
@@ -578,11 +613,22 @@ if [ "$INFERENCE_BACKEND" = "strata" ] && [ "$OPENMONO_ROLE" != "agent" ]; then
     next_step "Strata model setup (delegated to Strata installer)"
     info "Strata downloads its own Qwen3.8-Flash-Next weights (~70 GB, resumable)."
     _strata_flags=()
-    if [[ ! -t 0 ]]; then
+    # Default route: Strata must not ask anything. Unlike the llama.cpp backend,
+    # Strata owns its own model/size/context questions, and without --yes its
+    # guided screens prompt even on a plain `openmono setup` — which would break
+    # the "no prompts" default install. --yes accepts Strata's recommended answer
+    # for the box, so the default route is "defaults all the way down". With
+    # --options we deliberately leave Strata's screens alone so the user answers
+    # them; a non-TTY always gets --yes.
+    if [[ ! -t 0 || "${OPENMONO_SETUP_OPTIONS:-0}" != "1" ]]; then
         _strata_flags+=(--yes)
-        info "Non-interactive shell — passing --yes (recommended size for this box)."
+        if [[ ! -t 0 ]]; then
+            info "Non-interactive shell — passing --yes (recommended size for this box)."
+        else
+            info "Default setup — passing --yes (Strata picks the recommended model and context for this box). Pass --options to choose."
+        fi
     fi
-    if ! STRATA_YES="$([[ ! -t 0 ]] && echo 1 || echo 0)" bash "$SCRIPT_DIR/strata.sh" install "${_strata_flags[@]}"; then
+    if ! STRATA_YES="$([[ ! -t 0 || "${OPENMONO_SETUP_OPTIONS:-0}" != "1" ]] && echo 1 || echo 0)" bash "$SCRIPT_DIR/strata.sh" install "${_strata_flags[@]}"; then
         die "Strata install failed — retry: bash scripts/strata.sh install (see docs/STRATA.md). Strata's own output: ~/.openmono/strata-setup.log"
     fi
     ok "Strata model ready (server starts in the final step)"

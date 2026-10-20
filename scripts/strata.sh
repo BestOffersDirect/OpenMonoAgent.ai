@@ -34,7 +34,7 @@ set -euo pipefail
 #   STRATA_FAMILY  qwen|swift|coder|unsloth      (default qwen)
 #   STRATA_MODEL   Q2_0|IQ2_XS|IQ3_XXS|IQ3_S|... (default: setup picks for the RAM)
 #   STRATA_CONTEXT context tokens                (default: setup picks for the VRAM)
-#   STRATA_VISION  yes|no|cpu                    (interactive prompt; "no" when non-interactive)
+#   STRATA_VISION  yes|no|cpu                    (default yes; asked with --options)
 #   INFERENCE_PARALLEL parallel slots (batch)     (default: setup picks, 1)
 #   STRATA_PARALLEL legacy alias for INFERENCE_PARALLEL (read-only migration)
 #   STRATA_DATA_DIR model-file dir               (default <STRATA_DIR>-data next to Strata)
@@ -66,8 +66,8 @@ INFERENCE_PARALLEL="${INFERENCE_PARALLEL:-${STRATA_PARALLEL:-}}"
 STRATA_FAMILY="${STRATA_FAMILY:-qwen}"
 STRATA_MODEL="${STRATA_MODEL:-}"
 STRATA_CONTEXT="${STRATA_CONTEXT:-}"
-# STRATA_VISION empty = not chosen yet: cmd_install asks interactively (or
-# defaults to "no" when non-interactive). Preset it to skip the prompt.
+# STRATA_VISION empty = not chosen yet: cmd_install asks interactively (with
+# --options) or applies the hardware default (yes). Preset it to skip the prompt.
 STRATA_VISION="${STRATA_VISION:-}"
 STRATA_DATA_DIR="${STRATA_DATA_DIR:-}"
 OPENMONO_STATE_DIR="${OPENMONO_STATE_DIR:-$HOME/.openmono}"
@@ -547,12 +547,13 @@ cmd_update_cuda() {
 }
 
 # Ask whether to enable vision (image input). Sets STRATA_VISION to
-# yes|cpu|no. Non-interactive: "no" (fail closed — vision costs ~1-2 GB
-# headroom and downloads ~900 MB of projector weights).
+# yes|cpu|no. Without --options setup defaults it ON (the policy table in
+# docs/MODELS.md: vision is on wherever a projector exists). --options makes it
+# a question; an explicit STRATA_VISION= / --vision= always wins.
 _prompt_vision() {
-    if [[ "${STRATA_YES:-0}" == "1" || "${OPENMONO_ASSUME_YES:-0}" == "1" || ! -t 0 ]]; then
-        STRATA_VISION="no"
-        info "Vision (image input): disabled (non-interactive). Enable later: STRATA_VISION=yes bash scripts/strata.sh install"
+    if [[ "${STRATA_YES:-0}" == "1" || "${OPENMONO_ASSUME_YES:-0}" == "1" || ! -t 0 || "${OPENMONO_SETUP_OPTIONS:-0}" != "1" ]]; then
+        STRATA_VISION="yes"
+        info "Vision (image input): $STRATA_VISION (default). Change it with --options, or later: STRATA_VISION=no bash scripts/strata.sh install"
         return 0
     fi
     echo ""
@@ -626,7 +627,7 @@ cmd_install() {
     if [[ ! "$cuda_v_now" =~ ^13\. ]]; then
         echo ""
         if [[ "${STRATA_YES:-0}" == "1" || "${setup_args[*]:-}" == *--yes* || "${OPENMONO_ASSUME_YES:-0}" == "1" || ! -t 0 ]]; then
-            info "CUDA ${cuda_v_now:-none} does not satisfy the ${CUDA_MIN} requirement — installing it automatically (non-interactive mode) ..."
+            info "CUDA ${cuda_v_now:-none} does not satisfy the ${CUDA_MIN} requirement — installing it now (sudo; ~4 GB) ..."
         else
             printf "  CUDA ${cuda_v_now:-none} does not satisfy the ${CUDA_MIN} requirement. Install CUDA 13.x now? [Y/n] "
             local _cuda_answer
