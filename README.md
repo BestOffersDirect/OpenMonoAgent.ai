@@ -229,16 +229,16 @@ The full agent loop in your editor sidebar — streaming responses, live Markdow
 ## Supported Hardware
 
 <div align="center">
-  <img src="docs/assets/table-hardware-linux.svg" alt="Linux — NVIDIA GPU / CPU: supported models, accuracy, and speed by VRAM/RAM" width="800" />
+  <img src="docs/assets/table-hardware-linux.svg" alt="Linux — NVIDIA GPU and AMD iGPU: the auto-selected model, context size, and speed for each VRAM and RAM configuration" width="800" />
 </div>
 
 <br/>
 
 <div align="center">
-  <img src="docs/assets/table-hardware-macos.svg" alt="macOS — Apple Silicon (Metal): supported models, accuracy, context, and speed by unified memory" width="800" />
+  <img src="docs/assets/table-hardware-macos.svg" alt="macOS — Apple Silicon (Metal): the auto-selected model, context size, and speed for each unified-memory size" width="800" />
 </div>
 
-<sub>Auto-detects GPU · CPU · no config needed. On Linux, 12 GB and 16 GB cards run lower-accuracy models; use a 24 GB card for best results. Requires Ubuntu 26.04 LTS (recommended) or 25.10. On macOS, the full and inference roles require Apple Silicon (M1+); 64 GB+ unified memory is the recommended, tested configuration. Less than 64 GB is not encouraged — smaller model, much tighter context window. Intel Macs: agent-only mode. macOS 14+ (Sonoma/Sequoia) recommended.</sub>
+<sub>Setup auto-detects GPU · CPU · no config needed and picks the best model your hardware can run — no prompts. Pass <code>--options</code> to choose the model, vision, and parallel slots yourself, or <code>--model=&lt;name&gt;</code> to pin one. The pick depends on VRAM <em>and</em> system RAM: on Linux a 24 GB+ card gets Qwen3.8-Flash-Next (Strata) on a 48 GB-class box and Qwen3.8-27B below that, a 16 GB card keeps Qwen3.8-27B, a 12 GB card and AMD 780M iGPUs (32 GB+ RAM) get Ternary-Bonsai-2-27B via Prism. Requires Ubuntu 26.04 LTS (recommended) or 25.10. On macOS, the full and inference roles require Apple Silicon (M1+); 48 GB+ unified memory is the recommended, tested configuration. 24–47 GB and 16–23 GB Macs run Ternary-Bonsai (PQ2_0 / PTQ1_0) with a tighter context window. Intel Macs: agent-only mode. macOS 14+ (Sonoma/Sequoia) recommended.</sub>
 
 
 ---

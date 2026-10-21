@@ -119,7 +119,12 @@ prompt_bonsai_macos() {
     elif [ "$TOTAL_MEM" -ge 24 ]; then
         _CTX_SIZE=65536
     else
-        _CTX_SIZE=32768
+        # 16 GB: Metal caps a process at recommendedMaxWorkingSetSize (~75% of
+        # physical, ~12 GB) and the native server always runs q8_0 KV. PTQ1_0
+        # 5.95 GB + mmproj 0.63 GB + 3.45 GB of KV at 32768 = 10.03 GB, which
+        # leaves macOS only ~2 GB. 16384 costs 8.30 GB — the same 16k the Qwen
+        # Metal tier already uses at 16 GB.
+        _CTX_SIZE=16384
     fi
     ok "Bonsai selected: $MODEL_NAME (ctx: $_CTX_SIZE)"
 }

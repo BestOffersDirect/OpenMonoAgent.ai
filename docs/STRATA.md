@@ -40,8 +40,9 @@ openmono setup            # picks the Strata backend automatically on Linux
 What that does (roles `full` / `inference`):
 
 1. `scripts/strata.sh install` — clones Strata, runs `./setup.sh --no-start`
-   (interactive unless stdin isn't a TTY, in which case `--yes` picks the
-   recommended size for the box). Re-run to resume an interrupted download.
+   (`--yes` is passed unless you used `--options` on a TTY, so the default route
+   takes Strata's recommended size for the box instead of asking). Re-run to
+   resume an interrupted download.
 2. Skips the legacy GGUF download, `llama-server` image build, and override —
    there is no `llama-server` container on this backend.
 3. `scripts/strata.sh start` — launches Strata's `run-<model>.sh` detached and
@@ -103,7 +104,8 @@ and `/status`.
 
 `openmono status` shows desired vs applied values. To check without changing
 anything: `bash scripts/apply_settings.sh --check` (exit 2 = drift).
-Parallel slots are asked during install for every backend.
+Parallel slots are asked during install only **with `--options`**; otherwise the
+default is 1 (`openmono config set inference.parallel N` changes it later).
 
 Strata's slots are **not** a share of the context. `"parallel": N` is the
 engine's `--batch`/`--slots`: the configured context stays whole and **every
@@ -135,10 +137,12 @@ STRATA_FAMILY=qwen STRATA_MODEL=IQ2_XS STRATA_VISION=yes INFERENCE_PORT=7474 \
   bash scripts/strata.sh install
 ```
 
-> **Vision (image input).** Unless `STRATA_VISION` is preset (or `--vision` is
-> passed through), the installer **prompts** for it: `yes` (GPU projector),
-> `cpu` (CPU-encoded, saves VRAM), or `no`. Non-interactive runs default to
-> `no`. Whatever you choose is recorded in `~/.openmono/strata.env` and mirrored
+> **Vision (image input).** Vision is **on by default**. The installer only
+> **prompts** — `yes` (GPU projector), `cpu` (CPU-encoded, saves VRAM), or `no` —
+> when you ran setup with `--options` on a TTY. Otherwise, and always in
+> non-interactive runs, it takes `yes` and logs the choice; preset
+> `STRATA_VISION=no` to opt out without `--options`. Whatever you choose is recorded
+> in `~/.openmono/strata.env` and mirrored
 > to `inference.vision_enabled` in `~/.openmono/settings.json`, so the agent
 > knows to accept image parts. Change it later with
 > `STRATA_VISION=yes bash scripts/strata.sh install` (the ~70 GB base weights are
@@ -217,7 +221,7 @@ and path preserved, while plain `:7474`-style endpoints keep the legacy
 | Port 7474 already in use | Strata is already running — check `curl 127.0.0.1:7474/health`, or choose another port with `openmono config set inference.port 7475` then `openmono restart` |
 | Very slow / "engine stopped unexpectedly" | Not enough free RAM: close programs or install a smaller size (`strata.sh install --yes --family qwen --model Q2_0`) |
 | Download/install interrupted | Re-run the same command — Strata resumes |
-| `prompt exceeds the context` | Re-run setup with a bigger context (`--setup --context N` in Strata terms) |
+| `prompt exceeds the context` | Re-run setup with a bigger context (`bash scripts/strata.sh install --yes --context N`) |
 | Agent connects but auth fails through the relay | Direct-Strata tunnel needs Strata's own `--api-key`; gateway tunnel needs `LLAMA_API_KEY` |
 | Server starts then dies; `openmono logs` ends with "a non-loopback bind requires an inference API key" | Strata refused the `0.0.0.0` bind because no key was set. `openmono restart` repairs it; by hand: `openmono config set llm.api_key "$(openssl rand -hex 24)" && openmono restart` |
 | `MapEndpoint` sends the container to the wrong host | Only loopback `/v1*` endpoints map to `host.docker.internal`; relay URLs pass through untouched |

@@ -200,7 +200,7 @@
           "tiers": {
             "48": { "ctx": 98304, "label": "Ternary-Bonsai-2-27B-PTQ1_0 (~5.9GB) [EXPERIMENTAL on Metal]" },
             "24": { "ctx": 65536, "label": "Ternary-Bonsai-2-27B-PTQ1_0 (~5.9GB) [EXPERIMENTAL on Metal]" },
-            "16": { "ctx": 32768, "label": "Ternary-Bonsai-2-27B-PTQ1_0 (~5.9GB) [EXPERIMENTAL on Metal]" }
+            "16": { "ctx": 16384, "label": "Ternary-Bonsai-2-27B-PTQ1_0 (~5.9GB) [EXPERIMENTAL on Metal]" }
           }
         }
       }

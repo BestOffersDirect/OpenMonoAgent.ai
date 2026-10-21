@@ -4,18 +4,111 @@
 
 ## Model selection
 
-The installer picks the right model automatically based on your hardware. Two models ship:
+Setup reads your hardware and picks the **best** model the box can run — it does not ask.
+Pass `--options` to choose the model, vision and parallel slots yourself; `--model=<name>`
+always wins over the hardware gate. The gate is ordered, **first match wins**, and the
+VRAM check runs before the system-RAM check — so the same card lands on different rows
+depending on how much RAM sits behind it.
+
+### Linux
+
+| # | VRAM | System RAM | Model | Engine | Context / KV | Vision |
+|---|------|------------|-------|--------|--------------|--------|
+| 1 | NVIDIA **24 GB+** | **44 GB+** (48 GB-class) | Qwen3.8-Flash-Next | Strata (CUDA 13) | sized by Strata | on |
+| 2 | NVIDIA **24 GB+** | **under 44 GB** | Qwen3.8-27B-UD-Q4_K_M | llama.cpp (CUDA) | 196608 / q8_0 | on |
+| 3 | NVIDIA **16 GB** | any | Qwen3.8-27B-UD-IQ3_XXS | llama.cpp (CUDA) | 180224 / q4_0 | on |
+| 4 | NVIDIA **12 GB** | any | Ternary-Bonsai-2-27B **PQ2_0** | Prism (CUDA) | 98304 / q4_0 | on |
+| 5 | AMD **iGPU** (Ryzen 9 7940HS / Radeon 780M) | **32 GB+** | Ternary-Bonsai-2-27B **PQ2_0** | Prism (Vulkan) | 196608 / q8_0 | on |
+| 6 | **none** (CPU) | 24 GB+ | Qwen3.6-35B-A3B-UD-Q4_K_XL | llama.cpp (CPU) | 196608 / q8_0 | on |
+
+The **Context / KV** column lists the tier preset, which is what setup writes when
+vision is turned off. As shipped — with vision on — the encoder's ~1–2 GB of VRAM is
+paid for out of the KV budget, so the README tables show the as-installed numbers:
+196608 → 172032 (168k) on the 24 GB+ and iGPU rows, and 180224 → 98304 (96k) on the
+16 GB row. The 12 GB Bonsai row is already sized for the encoder, so vision costs it
+nothing.
+
+Row 1 shows **auto** rather than a number because Strata owns that value: OpenMono
+leaves `STRATA_CONTEXT` unset unless you set it, and Strata's installer sizes the
+context to the box (its guided setup asks, with a recommended answer per card).
+Whatever it picked is the running truth — `openmono status` prints it as `ctx=` from
+the server's `max_context`. We do not print a number we did not choose.
+
+Rows 1 and 2 are the **same card** split by system RAM: the Flash-Next weights are
+~70 GB and stream from disk, so the card alone is not enough — the box needs to be
+48 GB-class. The gate tests 44 GB rather than 48 because a 48 GB box reports 46–47 GB
+once firmware and kernel reservations are subtracted.
+
+Row 3 stays on Qwen3.8-27B: IQ3_XXS (~12 GB) fits a 16 GB card with room for the KV
+cache, so there is no reason to fall back to a ternary quant. Row 4 is where Qwen has
+no 27B option left — a 12 GB card only fits the 9B model — which is exactly where
+PQ2_0 (7.21 GB) buys a real 27B instead. The bucket spans 12–15 GB in the detector but
+is labelled 12 GB because NVIDIA ships no 13–15 GB card. Row 5 uses PQ2_0 rather than
+the smaller PTQ1_0 because the iGPU is UMA: it addresses system RAM, so the extra
+~1.3 GB of weights comes out of the same pool the model already uses — which is why the
+row is documented at 32 GB+ of RAM. Below 32 GB the pick is still Bonsai, because the
+CPU fallback needs ~20 GB and would not load; setup warns instead of downgrading.
+NVIDIA cards below 12 GB are not a supported inference target; those boxes stay on the
+Qwen row that matches their tier.
+
+Bonsai is still *selectable* on the Qwen rows — `--model=bonsai-pq2` works on any
+NVIDIA card from 8 GB up and takes that tier's context and KV settings. Auto-select
+just prefers a 27B Qwen wherever one fits, which is why 16 GB and 24 GB+ cards no
+longer land on a ternary quant.
+
+### macOS (Apple Silicon, unified memory)
+
+| # | VRAM | System RAM | Model | Engine | Context |
+|---|------|------------|-------|--------|---------|
+| 1 | unified | **48 GB+** | Qwen3.6-35B-A3B-UD-Q4_K_XL | llama.cpp (Metal) | 196608 |
+| 2 | unified | **24–47 GB** | Ternary-Bonsai-2-27B **PQ2_0** | Prism (Metal) | 65536 |
+| 3 | unified | **16–23 GB** | Ternary-Bonsai-2-27B **PTQ1_0** | Prism (Metal) | 16384 |
+
+Apple Silicon has no discrete VRAM — weights and KV cache share unified memory — so
+the Mac table has one memory column where the Linux table has two. The context column
+is discrete per memory size, not a range: 48 GB+ → 196608 preset (172032 as shipped
+with vision), 24–47 GB → 65536, 16–23 GB → 16384. Strata is Linux + NVIDIA only, so
+high-memory Macs keep the 35B-A3B MoE. In the 24–47 GB range Bonsai wins: at ~7.2 GB
+of weights it leaves the headroom unified memory needs, and it beats the 9B dense
+model on every agentic-coding benchmark we track. 16–23 GB takes PTQ1_0 (~5.9 GB)
+because PQ2_0 would swap-thrash. Every Mac row ships with vision on.
+
+> [!NOTE]
+> The 16–23 GB row ships 16384, not the 32768 an uncapped box would allow. Metal will
+> not let a process use more than `recommendedMaxWorkingSetSize` (~75% of physical, so
+> ~12 GB on a 16 GB box), and the native server always runs q8_0 KV (`--cache-type-k
+> q8_0 --cache-type-v q8_0`): PTQ1_0 5.95 GB + mmproj 0.63 GB + 3.45 GB of KV at 32768
+> = 10.03 GB, which leaves macOS only ~2 GB of the ~12 GB window. At 16384 the same
+> arithmetic gives 8.30 GB and leaves room to breathe — the same 16k the Qwen Metal
+> tier already uses at 16 GB. The Linux tiers get more context at this size because
+> they can drop KV to q4_0; the macOS tiers carry no `kv` field at all.
+>
+> The ~8–10 tok/s above was measured on a 16 GB M4 Mac mini **at 32768**, so 32k does
+> run there — the margin is tighter than comfortable, not fatal, and 16384 is the safer
+> preset rather than a fix for a failure seen in practice. But it is also probably not
+> the speed a 16k install gets: the M4's ~122 GB/s of memory bandwidth puts the decode
+> floor for 5.95 GB of weights near 20 tok/s, so 8–10 is roughly half the hardware
+> ceiling — the signature of memory pressure at 32k, not a bandwidth limit. 16384
+> should recover some of that; re-measure before quoting a 16k figure.
+
+> [!NOTE]
+> If the Prism image can't be pulled (Linux) or built (macOS), setup falls back to stock
+> Qwen rather than failing — so an auto-selected Bonsai box still ends up running. Pick
+> Qwen up front with `--model=qwen`.
+
+The two llama.cpp models, for reference:
 
 | | GPU | CPU |
 |--|-----|-----|
-| **Model** | Qwen3.8-27B-Q4_K_M | Qwen3.6-35B-A3B-UD-Q4_K_XL |
+| **Model** | Qwen3.8-27B-UD-Q4_K_M | Qwen3.6-35B-A3B-UD-Q4_K_XL |
 | **Type** | Dense | MoE (Mixture of Experts) |
 | **Disk** | ~15.5 GB | ~17.6 GB |
 | **VRAM / RAM** | ~23 GB (model + KV cache) | ~20 GB |
 | **Context** | 192K tokens | 192K tokens |
-| **Trigger** | NVIDIA GPU + nvidia-container-toolkit | No GPU or no nvidia runtime |
+| **When** | 24 GB+ VRAM on a sub-48 GB box, or `--model=qwen` | No GPU, or no nvidia runtime |
 
-### Why different models for GPU vs CPU?
+### Why the llama.cpp models differ between GPU and CPU
+
 
 Token generation speed is memory-bandwidth bound — the bottleneck is how fast you can read model weights per token, not raw compute.
 
@@ -27,18 +120,12 @@ Short version: **dense models are fast on GPU, MoE models are fast on CPU.**
 
 ### Apple Silicon (Metal)
 
-On macOS the model runs natively against the Metal GPU and unified memory — there's no separate "VRAM vs RAM" split, so the MoE model is the right choice on high-memory Macs. The installer picks the tier from unified memory size:
-
-| Unified memory | Model | Type | Accuracy |
-|----------------|-------|------|----------|
-| 48 GB+ | Qwen3.6-35B-A3B-UD-Q4_K_XL | MoE | Full |
-| 32 GB | Qwen3.5-9B-Q4_K_M | Dense | Lower |
-| 16 GB | Qwen3.5-9B-Q4_K_M | Dense | Lower |
+On macOS the model runs natively against the Metal GPU and unified memory — there's no separate "VRAM vs RAM" split. Bonsai is the default from 16 GB up (table above); the 35B-A3B MoE stays on 48 GB+ Macs.
 
 The 35B-A3B MoE activates only ~3B parameters per token, so on a high-bandwidth Apple Silicon chip it hits the same usable-to-fast range as a Linux GPU while keeping full accuracy.
 
 > [!IMPORTANT]
-> Only the 64 GB+ tier (full-accuracy 35B) has been validated as stable. The installer will still configure the lower tiers, but **less than 64 GB is not encouraged** — they fall back to the 9B model with a much tighter context window. 16 GB is the hard floor for native inference; below that, use the agent role with a remote inference box.
+> The 48 GB+ tier (full-accuracy 35B MoE) is the validated reference configuration. Bonsai on 24–47 GB and 16–23 GB installs and runs by default, but it is the newer Metal path — if a Mac of that size misbehaves, `--model=qwen` puts it back on the older Qwen tiers. 16 GB is the hard floor for native inference; below that, use the agent role with a remote inference box.
 
 ---
 
@@ -68,12 +155,30 @@ Both models are designed for agentic workflows, not just benchmark numbers — t
 
 ## Hardware benchmarks
 
+### GPU — Qwen3.8-Flash-Next (Strata)
+
+| Hardware | VRAM / RAM | tok/s | Notes |
+|----------|-----------|-------|-------|
+| 24 GB+ NVIDIA | on a 48 GB-class box | ~80–160 | Strata streams the ~70 GB weights from disk; the spread is drive speed and how much KV is resident |
+
 ### GPU — Qwen3.8-27B-Q4_K_M (192K context)
 
 | Hardware | VRAM | tok/s | Notes |
 |----------|------|-------|-------|
 | RTX 3090 | 24 GB | ~45–70 | Best price/performance used (~$700–800). Same as Qwen3.6-27B — bandwidth-bound on model size, not benchmark quality |
 | RTX 4090 | 24 GB | ~70–100 | ~40% faster, ~2× the cost. Same as Qwen3.6-27B — bandwidth-bound on model size, not benchmark quality |
+
+### GPU — Ternary-Bonsai-2-27B PQ2_0 (Prism)
+
+| Hardware | VRAM | tok/s | Notes |
+|----------|------|-------|-------|
+| NVIDIA 12 GB tier | 12 GB | ~28–32 | PQ2_0 is ~7.2 GB of weights, so it is bandwidth-comfortable on a 12 GB card — the same card on Qwen would have to run the 9B model |
+
+> [!NOTE]
+> The **macOS Bonsai** rows in the policy table above have no measured number yet — that
+> Metal path has never been benched on a box we logged. It is configured and supported,
+> but we do not publish throughput we have not measured. If you run one, Prism's own
+> server log gives a number we can add.
 
 ### CPU — Qwen3.6-35B-A3B-UD-Q4_K_XL (192K context)
 
@@ -87,6 +192,12 @@ Token generation is memory-bandwidth bound — **RAM channel count matters as mu
 
 > Halving RAM channels halves throughput. Always fill both DIMM slots.
 
+### AMD iGPU (Vulkan) — Ternary-Bonsai-2-27B PQ2_0
+
+| Hardware | Memory | tok/s | Notes |
+|----------|--------|-------|-------|
+| Radeon 780M (Ryzen 9 7940HS) | 32 GB+ DDR5 5600, dual-channel, UMA | ~17–20 | The iGPU addresses system RAM over UMA, so throughput tracks the same DDR5 bandwidth as the CPU row above |
+
 ### Apple Silicon (Metal)
 
 Apple Silicon's unified memory has far higher bandwidth than a desktop CPU's DDR5, so the 35B-A3B MoE that runs at ~20 tok/s on a NUC reaches GPU-class speeds on a high-memory Mac.
@@ -94,21 +205,22 @@ Apple Silicon's unified memory has far higher bandwidth than a desktop CPU's DDR
 | Hardware | Unified memory | Model | Context (vision on) | tok/s | Status |
 |----------|----------------|-------|---------------------|-------|--------|
 | M5 Pro | 64 GB | Qwen3.6-35B-A3B-UD-Q4_K_XL (full) | 192k (168k) | ~45–48 | ✅ Recommended / tested |
-| M1 Max | 32 GB | Qwen3.5-9B-Q4_K_M (lower) | 64k (48k) | ~22–27 | ⚠️ Not encouraged |
-| M4 | 16 GB | Qwen3.5-9B-Q4_K_M (lower) | 16k (12k) | ~12–16 | ⚠️ Not encouraged |
+| M-series | 24–47 GB | Ternary-Bonsai-2-27B PQ2_0 | 64k | not benched | Default; Metal path newer than 48 GB+ |
+| M-series | 16–23 GB | Ternary-Bonsai-2-27B PTQ1_0 | 16k | ~8–10 | ✅ Tested (16 GB Mac mini, measured at 32k); 16k is the shipped preset — sized for Metal's ~75% working-set cap, see below |
 
 > [!IMPORTANT]
-> 64 GB+ unified memory is the recommended, tested configuration — full-accuracy 35B model at the full 192k context. The 32 GB and 16 GB tiers install and run, but **less than 64 GB is not encouraged** — they fall back to the 9B model with much tighter context windows. Below 16 GB, native inference doesn't install at all — use the agent role with a remote inference box.
+> 48 GB+ unified memory is the recommended, tested configuration — full-accuracy 35B model at the full 192k context. Below that, setup defaults to Bonsai (PQ2_0 from 24 GB, PTQ1_0 from 16 GB) instead of the old 9B fallback; it is the newer Metal path, so `--model=qwen` is the escape hatch if a smaller Mac misbehaves. Below 16 GB, native inference doesn't install at all — use the agent role with a remote inference box.
 
 ### What the speeds feel like
 
 | Speed | Experience |
 |-------|------------|
 | ~6 tok/s | Unusable for agentic work |
+| ~8–10 tok/s | Slow but usable — every tool round-trip is a visible pause |
 | ~17–20 tok/s | Usable — you notice the wait on long tool chains |
 | ~50–70 tok/s | Feels like a fast cloud API |
 
-For agentic coding tasks the agent typically makes many short tool calls with brief LLM turns between them, so sustained tok/s matters less than it does for long prose generation. 20 tok/s is workable.
+For agentic coding tasks the agent typically makes many short tool calls with brief LLM turns between them, so sustained tok/s matters less than it does for long prose generation. 20 tok/s is workable, and so is ~10 — a 16 GB Mac mini running Bonsai PTQ1_0 sits right there and still completes agentic runs.
 
 ---
 
