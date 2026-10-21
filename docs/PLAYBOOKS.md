@@ -21,7 +21,7 @@ Playbooks are structured, multi-step automation workflows that run inside OpenMo
 - [Gates](#gates)
 - [State and Checkpointing](#state-and-checkpointing)
 - [Playbook Discovery](#playbook-discovery)
-- [Built-in Playbooks](#built-in-playbooks)
+- [Example Playbooks](#example-playbooks)
   - [commit](#commit)
   - [release](#release)
   - [file-scan](#file-scan)
@@ -186,6 +186,9 @@ Both support template variables.
 | `output` | State key name. The AI's final response for this step is stored at `{{state.<output>}}` |
 | `output-schema` | Path to a JSON Schema file. Forces the step's response to conform — see [Output Schema](#output-schema) |
 | `script` | Path to a shell script. Executed alongside the step; its stdout is embedded in the prompt via `{{shell:...}}` |
+| `agent` | Sub-agent type used to execute the step (for example `Coder` or `Verify`) |
+
+Step-level `playbook` and `params` fields are parsed but not currently executed.
 
 ### Output Schema
 
@@ -313,7 +316,7 @@ Safety rules injected into every step's context, not just the preamble.
 
 ```yaml
 constraints:
-  file: constraints/rules.md   # Path to a markdown file of constraints
+  file: constraints/rules.md   # Path to a markdown file of constraints (resolved as given; usually relative to the working directory)
   inline:
     - "Never force-push or rebase the main branch."
     - "Never create a release from a dirty working tree."
@@ -326,14 +329,16 @@ Inline constraints and file constraints are merged. The combined list is availab
 
 ```yaml
 allowed-tools:
-  - "*"                  # All tools (default)
+  - "*"                  # All tools
   # Or a specific subset:
-  - Shell
-  - ReadFile
-  - WriteFile
+  - Bash
+  - FileRead
+  - FileWrite
   - Glob
-  - Search
+  - Grep
 ```
+
+`allowed-tools` is required and must be non-empty; a playbook without it is skipped at load time. Use `"*"` explicitly if the playbook may use every tool.
 
 ### Context Mode
 
@@ -363,7 +368,7 @@ Templates variables are resolved in both `inline-prompt` values and external ste
 | `{{env.CWD}}` | Current working directory |
 | `{{env.GIT_BRANCH}}` | Active git branch |
 | `{{env.DATE}}` | Today's date in ISO 8601 format |
-| `{{file:path/to/file}}` | Contents of a file (path relative to playbook directory) |
+| `{{file:path/to/file}}` | Contents of a file (path relative to the agent's working directory) |
 | `{{shell:command}}` | Stdout of a shell command executed at template-resolution time |
 
 Example — embedding live shell output in a step prompt:
@@ -435,22 +440,23 @@ The runtime searches for playbooks in the following locations, in priority order
 
 | Priority | Path | Scope |
 |----------|------|-------|
-| 1 (highest) | Compiled into binary | Always available |
-| 2 | `~/.openmono/playbooks/<name>/PLAYBOOK.md` | All projects for this user |
-| 3 | `.openmono/playbooks/<name>/PLAYBOOK.md` | This project only |
-| 4 (lowest) | `<added-dir>/.openmono/playbooks/` | Added workspace directories |
+| 1 (highest) | `~/.openmono/playbooks/<name>/PLAYBOOK.md` | All projects for this user |
+| 2 | `.openmono/playbooks/<name>/PLAYBOOK.md` | This project only |
+| 3 (lowest) | `<added-dir>/.openmono/playbooks/` | Added workspace directories |
+
+There are no compiled-in playbooks. The repository ships examples under `docs/playbooks-examples/`, but they are not installed or on the search path automatically — copy one into `.openmono/playbooks/<name>/` or `~/.openmono/playbooks/<name>/`.
 
 ---
 
-## Built-in Playbooks
+## Example Playbooks
 
-Three sample playbooks ship with the project under `.openmono/playbooks/`.
+The examples below live under `docs/playbooks-examples/`. Copy the directory into a playbook search path to use it.
 
 ---
 
 ### commit
 
-**Path:** `.openmono/playbooks/commit/PLAYBOOK.md`
+**Path:** `docs/playbooks-examples/commit/PLAYBOOK.md`
 
 Inspects staged (or unstaged) changes, generates a conventional commit message, and runs `git commit`.
 
@@ -489,7 +495,7 @@ Inspects staged (or unstaged) changes, generates a conventional commit message, 
 
 ### release
 
-**Path:** `.openmono/playbooks/release/PLAYBOOK.md`
+**Path:** `docs/playbooks-examples/release/PLAYBOOK.md`
 
 End-to-end release pipeline covering environment checks, changelog generation, version bumping, test validation, git tagging, and optional Docker push.
 
@@ -547,7 +553,7 @@ Reads the current version from `Directory.Build.props` or the first `.csproj` fo
 
 ### file-scan
 
-**Path:** `.openmono/playbooks/file-scan/PLAYBOOK.md`
+**Path:** `docs/playbooks-examples/file-scan/PLAYBOOK.md`
 
 Creates workspace files and then greps the codebase. A simple two-step example demonstrating shell integration and step dependencies.
 
@@ -655,12 +661,14 @@ Full list of frontmatter fields.
 | `argument-hint` | string | No | — | Usage hint shown in help |
 | `parameters` | map | No | `{}` | Typed parameter declarations |
 | `steps` | list | No | `[]` | Ordered step definitions |
-| `constraints.file` | string | No | — | Path to a constraint markdown file |
+| `constraints.file` | string | No | — | Path to a constraint markdown file (resolved as given) |
 | `constraints.inline` | string[] | No | `[]` | Inline constraint strings |
-| `allowed-tools` | string[] | No | `["*"]` | Tool access list |
+| `allowed-tools` | string[] | Yes | — | Tool access list; must be non-empty |
 | `context-mode` | enum | No | `Selective` | `Full`, `Selective`, or `Fork` |
 | `max-context-tokens` | number | No | `3000` | Token cap for injected context per turn |
-| `depends-on` | string[] | No | `[]` | Names of other playbooks this one can invoke |
+| `report-ctx` | boolean | No | `false` | Report context usage after the run |
+| `retry-on-abort` | boolean | No | `false` | Retry the playbook after a doom-loop abort |
+| `retry-attempt-limit` | number | No | `2` | Max retries when `retry-on-abort` is enabled |
 | `tags` | string[] | No | `[]` | Free-form labels for discovery and filtering |
 | `thinking` | enum | No | `off` | Reasoning level: `off`, `low`, `medium`, `xhigh` (valid set is model-dependent). Sends `chat_template_kwargs` (`enable_thinking` / `reasoning_effort` / `preserve_thinking`) to llama.cpp. Ignored on models without reasoning support |
 | `temperature` | number | No | config value | Sampling temperature override |

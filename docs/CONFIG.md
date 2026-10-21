@@ -8,8 +8,8 @@ Commands are grouped by which box they run on.
 
 | Command | Description |
 |---------|-------------|
-| `openmono setup [--full\|--agent] [--gpu\|--cpu]` | Install and configure a box role |
-| `openmono config <set\|get\|unset> <key> [value]` | Read/write `~/.openmono/settings.json` |
+| `openmono setup [--full\|--inference\|--agent] [--gpu\|--cpu] [--model=NAME] [--vision=on\|off] [--options]` | Install and configure a box role |
+| `openmono config <list\|get\|set\|unset> [key] [value]` | Read/write `~/.openmono/settings.json` |
 | `openmono help` | Show help |
 
 ### Agent box
@@ -59,7 +59,7 @@ WORKSPACE=/my/repo openmono agent # Run agent against a specific repo
 openmono graph /path/to/project   # Index a project for code search
 ```
 
-For the dual-box walkthrough, see `setup/readme.md`.
+For the dual-box walkthrough, see [SETUP.md → Dual-box setup](SETUP.md#dual-box-setup).
 
 ---
 
@@ -85,9 +85,12 @@ Flags passed to `openmono agent` override settings.json and env vars for that se
 | `--config <path>` | — | Load settings from a specific file |
 | `--model <name>` | `llm.model` | Override the model name |
 | `--endpoint <url>` | `llm.endpoint` | Override the LLM server endpoint |
-| `--api-key <key>` | `llm.api_key` | Set API key for cloud providers |
-| `--verbose` | `verbose` | Show full LLM stream, SSE events, and token counts |
+| `--workdir <path>` | — | Override the working directory for this run |
+| `--verbose`, `-v` | — | Show full LLM stream, SSE events, and token counts |
+| `--detail` | — | Show extra detail in TUI panels |
+| `--tui` | — | Force the TUI renderer |
 | `--classic` | — | Use classic scrolling terminal instead of TUI |
+| `--no-acp` | — | Disable the ACP server |
 | `--acp-only` | — | Start in ACP server mode (no TUI) — for VS Code / Cursor extension |
 | `--acp-port <port>` | — | ACP server port (default: `7475`) |
 
@@ -104,7 +107,7 @@ openmono config get llm.endpoint
 openmono config unset llm.api_key
 ```
 
-By default these write to the project-level `.openmono/settings.json`. Pass `--global` to write to `~/.openmono/settings.json` instead.
+These always write to `~/.openmono/settings.json`. Project-level `.openmono/settings.json` is read when present, but `openmono config` does not write it, and there is no `--global` flag.
 
 ---
 
@@ -180,9 +183,7 @@ By default these write to the project-level `.openmono/settings.json`. Pass `--g
     "search": true,
     "scrape": true
   },
-  "auto_detect_code_graph": true,
-  "verbose": false,
-  "data_directory": "~/.openmono"
+  "auto_detect_code_graph": true
 }
 ```
 
@@ -210,7 +211,7 @@ Controls the active LLM connection and sampling parameters. At startup, `model` 
 
 ## `providers`
 
-Named provider configurations. Set `"active": true` on one to use it as the active provider. Switch mid-session with `/model`.
+Named provider configurations. Set `"active": true` on one to use it as the active provider. The provider is selected at startup; `/model` only changes the model name sent to it.
 
 ```jsonc
 "providers": {
@@ -321,7 +322,7 @@ MCP servers started as subprocesses on session init. Each server's tools are reg
 
 ## `model_presets`
 
-Named LLM parameter bundles. Activate one via `"active": true` or the `OPENMONO_MODEL_PRESET` env var. The built-in `qwen` preset ships with the default sampling values for Qwen3.6.
+Named LLM parameter bundles. Activate one via `"active": true` or the `OPENMONO_MODEL_PRESET` env var. Activation is applied at startup; there is no runtime command to switch presets. The built-in `qwen` and `qwen38` presets ship with the default sampling values for their model families.
 
 ```jsonc
 "model_presets": {
@@ -431,16 +432,18 @@ Install-time presets (non-interactive): `OPENMONO_HOST_BRIDGE`, `OPENMONO_HOST_E
 
 ---
 
-## Top-level flags
+## Top-level controls
 
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| `auto_detect_code_graph` | bool | `true` | Auto-register MCP graph servers if found |
-| `verbose` | bool | `false` | Log full LLM stream and tool pipeline |
-| `show_detail` | bool | `false` | Show extra detail in TUI panels |
-| `data_directory` | string | `~/.openmono` | Where sessions, memory, and checkpoints are stored |
-| `working_directory` | string | cwd | Override the workspace root |
-| `host_working_directory` | string | — | Host path when running inside Docker (used for bind-mount mapping) |
+These are resolved from CLI flags or environment variables. The current config loader does not apply their `settings.json` equivalents, except `auto_detect_code_graph`, where only `true` is honored.
+
+| Control | Source | Default | Description |
+|---------|--------|---------|-------------|
+| `auto_detect_code_graph` | settings.json | `true` | Auto-register MCP graph servers if found. A `false` value is currently ignored |
+| `verbose` | `--verbose` | `false` | Log full LLM stream and tool pipeline |
+| `show_detail` | `--detail` | `false` | Show extra detail in TUI panels |
+| `data_directory` | `OPENMONO_DATA_DIR` | `~/.openmono` | Where sessions, memory, and checkpoints are stored |
+| `working_directory` | `--workdir` / `OPENMONO_WORKSPACE` | cwd | Override the workspace root |
+| `host_working_directory` | `OPENMONO_HOST_WORKSPACE` | — | Host path when running inside Docker (used for bind-mount mapping) |
 
 ---
 

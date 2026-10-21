@@ -39,7 +39,7 @@
 
 ---
 
-OpenMono is a coding agent that runs **entirely on your hardware** — no subscriptions, no data leaving your network, no per-token billing. It pairs a .NET 10 CLI with its own llama.cpp inference server, giving you a full agentic loop with **20 built-in tools**, Docker sandboxing, and deep code intelligence. NVIDIA GPU, AMD APU (integrated Radeon iGPU, unified memory), or Apple Silicon (Metal) — **it auto-configures itself**. You own the model, the compute, and the data.
+OpenMono is a coding agent that runs **entirely on your hardware** — no subscriptions, no data leaving your network, no per-token billing. It pairs a .NET 10 CLI with its own llama.cpp inference server, giving you a full agentic loop with **21 built-in tools**, Docker sandboxing, and deep code intelligence. NVIDIA GPU, AMD APU (integrated Radeon iGPU, unified memory), or Apple Silicon (Metal) — **it auto-configures itself**. You own the model, the compute, and the data.
 
 ---
 
@@ -102,7 +102,7 @@ Most coding agents are cloud products wearing an open-source label. Your prompts
 </div>
 
 
-→ [Full architecture + diagram](docs/ARCHITECTURE.md) · [4 providers](docs/MODELS.md) · runs at **~45 tok/s on GPU**, ~20 tok/s on AMD iGPU (APU)
+→ [Full architecture + diagram](docs/ARCHITECTURE.md) · [5 provider backends](docs/MODELS.md) · runs at **~45 tok/s on GPU**, ~20 tok/s on AMD iGPU (APU)
 
 ---
 
@@ -125,15 +125,15 @@ llama.cpp ships inside Docker. Installer detects your hardware and picks the rig
 <td width="50%" valign="top">
 
 <strong style="color:#A3FF66;">02</strong> · **Agentic loop that earns its name**  
-25 iterations per turn. Doom-loop detection aborts if the same tool sequence repeats 3×. Checkpoints at 65% context fill, compacts at 80%. Runs until done — then stops.
+Up to 1,000 iterations per turn. Doom-loop detection nudges on repeated tool batches, escalates the nudge at 3 consecutive detections, and ends the turn at 5. Checkpoints at 65% context fill, compacts at 80%. Runs until done — then stops.
 
 </td>
 </tr>
 <tr>
 <td valign="top">
 
-<strong style="color:#A3FF66;">03</strong> · **[20 tools](docs/ARCHITECTURE.md), 12-step pipeline**  
-Every call: parse → schema validate → path sanity → plan-mode guard → capability check → cache → pre-hook → execute → post-hook → artifact store. Read-only tools run in parallel. Nothing bypasses the pipeline.
+<strong style="color:#A3FF66;">03</strong> · **[21 tools](docs/ARCHITECTURE.md), guarded pipeline**  
+Every call: parse → schema validate → path sanity → plan-mode gate → host-mode gate → permission check → cache → pre-hook → execute → post-hook → artifact store → cache write → invalidate. Read-only tools run in parallel. Nothing bypasses the pipeline.
 
 </td>
 <td valign="top">
@@ -141,11 +141,11 @@ Every call: parse → schema validate → path sanity → plan-mode guard → ca
 <strong style="color:#A3FF66;">04</strong> · **5 specialist sub-agents**  
 Isolated sessions with locked tool sets and turn budgets:
 
-`Explore` · read-only discovery · 15 turns  
-`Plan` · architecture, no writes · 10 turns  
-`Coder` · full file access · 30 turns  
-`Verify` · adversarial + Roslyn · 20 turns  
-`general-purpose` · everything · 25 turns
+`Explore` · read-only discovery · 100 turns  
+`Plan` · architecture, no writes · 100 turns  
+`Coder` · full file access · 300 turns  
+`Verify` · adversarial + Roslyn · 150 turns  
+`general-purpose` · everything · 200 turns
 
 </td>
 </tr>
@@ -153,7 +153,7 @@ Isolated sessions with locked tool sets and turn budgets:
 <td valign="top">
 
 <strong style="color:#A3FF66;">05</strong> · **Docker sandbox**  
-Project mounts as `/workspace`. The agent reads and writes your real files — that's the blast radius. Nothing outside that mount is visible or reachable.
+In sandbox mode the project mounts as `/workspace`. The agent reads and writes your real files — that's the blast radius; nothing outside that mount is visible. Host mode is the explicit exception: machine-level actions run only through approved `HostExec` calls.
 
 </td>
 <td valign="top">
@@ -169,13 +169,13 @@ Auto-detects [graphify](docs/graphify.md) (semantic concept graph, 25+ languages
 <td valign="top">
 
 <strong style="color:#A3FF66;">07</strong> · **[Playbooks](docs/PLAYBOOKS.md)**  
-YAML workflows with typed parameters, conditional gates, and checkpoint/resume. Composable — one playbook can call another.
+YAML workflows with typed parameters, conditional gates, and checkpoint/resume.
 
 </td>
 <td valign="top">
 
-<strong style="color:#A3FF66;">08</strong> · **[4 providers](docs/MODELS.md), hot-swappable**  
-Local llama.cpp is the default and fully supported. OpenAI, Anthropic, and Ollama are available but WIP — see [Models](docs/MODELS.md) for details.
+<strong style="color:#A3FF66;">08</strong> · **[5 provider backends](docs/MODELS.md)**  
+Local llama.cpp is the default; Strata is the supported Linux high-end backend. OpenAI, Anthropic, and Ollama are available but WIP — see [Models](docs/MODELS.md) for details. Providers are selected in `settings.json` at startup; `/model` switches the model on the active provider.
 
 </td>
 </tr>
@@ -191,7 +191,7 @@ Agent on your laptop, inference on a separate GPU machine. No port forwarding �
 <td valign="top">
 
 <strong style="color:#A3FF66;">10</strong> · **Vision**  
-Attach images in chat with `@screenshot.png` or ask the agent to read any image file. The multimodal projector (mmproj) is downloaded automatically at setup. Supported formats: PNG, JPG, GIF, WebP. Large images are auto-resized to fit within VRAM budget. Enable with `OPENMONO_VISION_ENABLED=1`.
+Attach images in chat with `@screenshot.png` or ask the agent to read any image file. The multimodal projector (mmproj) is downloaded automatically at setup. Supported formats: PNG, JPG, GIF, WebP. Large images are auto-resized to fit within the image budget. Enable vision in `settings.json` (`inference.vision_enabled`) or set `OPENMONO_VISION_ENABLED=1`.
 
 → [Vision setup & usage](docs/SETUP.md#vision)
 

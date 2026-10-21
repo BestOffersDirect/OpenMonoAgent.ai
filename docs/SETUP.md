@@ -202,10 +202,10 @@ Refactor this function to be async
 Add error handling to the payment flow
 ```
 
-OpenMono navigates your codebase, proposes solutions, and executes changes with full transparency. You stay in control throughout — the agent shows its work at every step and asks before making any major actions, including file reads, edits, and running commands.
+OpenMono navigates your codebase, proposes solutions, and executes changes with full transparency. You stay in control throughout — the agent shows its work at every step and asks before writes and commands. Read-only tools are auto-approved.
 
 > [!TIP]
-> Type `/think` or press `Ctrl+T` to enable step-by-step reasoning mode — best for complex bugs, large refactors, and architecture decisions. Turn it off for simple lookups and quick edits.
+> Type `/think` to enable step-by-step reasoning mode — best for complex bugs, large refactors, and architecture decisions. Turn it off for simple lookups and quick edits.
 
 ---
 
@@ -552,9 +552,12 @@ Both fall back gracefully (DuckDuckGo / direct fetch) when the gateway is unavai
 | `/help` | List all commands and keyboard shortcuts |
 | `/think` | Toggle step-by-step reasoning mode |
 | `/plan` | Restrict agent to read-only tools for safe exploration |
-| `/model <name>` | Switch model mid-session |
+| `/mode` | Toggle between Plan (read-only) and Build mode |
+| `/model` | List the models advertised by the active backend |
+| `/model refresh` | Re-query the backend's model list |
+| `/model <name\|index>` | Change the model name sent to the active provider |
 | `/compact [focus]` | Summarize history to free up context |
-| `/checkpoint` | Save a named checkpoint in the conversation |
+| `/checkpoint` | Summarize history into a checkpoint to free context |
 | `/undo [n]` | Revert the last n file changes |
 | `/resume [id]` | Resume a previous session |
 | `/export [format] [path]` | Export as `markdown`, `json`, or `html` |
@@ -564,6 +567,10 @@ Both fall back gracefully (DuckDuckGo / direct fetch) when the gateway is unavai
 | `/clear` | Clear context and start fresh |
 | `/debug` | Toggle verbose debug output |
 | `/retry` | Resend the last message |
+| `/btw <question>` | Ask a quick aside without touching tools or main context |
+| `/host [status\|on\|off]` | Show or switch host scope (sandboxed vs whole-machine) |
+| `/prompt [system\|plan] [global\|project]` | Create or override the system or Plan-mode prompt |
+| `/playbook <name> [args]` | Run a playbook directly |
 | `/quit` | Exit OpenMono |
 
 ---
@@ -578,17 +585,16 @@ Both fall back gracefully (DuckDuckGo / direct fetch) when the gateway is unavai
 | <kbd>Ctrl</kbd>+<kbd>P</kbd> | Open command picker |
 | <kbd>Tab</kbd> | Autocomplete command or file path |
 | <kbd>Esc</kbd> | Cancel active request · dismiss suggestions |
-| <kbd>F1</kbd> | Help overlay |
 | <kbd>↑</kbd> / <kbd>↓</kbd> | Navigate input history |
 | <kbd>PageUp</kbd> / <kbd>PageDown</kbd> | Scroll conversation |
 
-Shortcuts can be customised in `~/.openmono/tui.json` (user-wide) or `.openmono/tui.json` (per project).
+The TUI does not currently read a user keybinding file.
 
 ---
 
 ## Configuration
 
-Settings live in `~/.openmono/settings.json` (user-wide) or `.openmono/settings.json` (per project):
+Settings are read from `~/.openmono/settings.json` (user-wide) or `.openmono/settings.json` (per project). `openmono config` writes the user-wide file:
 
 ```bash
 openmono config set llm.endpoint http://localhost:7474

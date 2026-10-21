@@ -1,6 +1,6 @@
 # Architecture
 
-OpenMono is a .NET 10 CLI that runs a local agentic loop against a llama.cpp inference server (or any OpenAI-compatible endpoint). Everything runs in Docker — your project folder bind-mounts in as `/workspace`, the agent can't escape it.
+OpenMono is a .NET 10 CLI that runs a local agentic loop against a llama.cpp inference server (or any OpenAI-compatible endpoint). The agent normally runs in a Docker sandbox — your project folder bind-mounts in as `/workspace`. macOS inference and the Strata backend run natively on the host, and host mode is a deliberate, permission-gated escape hatch.
 
 <p align="center">
   <picture>
@@ -22,7 +22,7 @@ OpenMono is a .NET 10 CLI that runs a local agentic loop against a llama.cpp inf
 │  ConversationLoop                │   │   · streams responses            │
 │    └── ILlmClient (streaming SSE)│   │   · executes workspace tools     │
 │    └── ToolDispatcher            │   │     (file edits, bash, grep,     │
-│         └── 20 built-in tools   │   │      patches, permission prompts) │
+│         └── 21 built-in tools   │   │      patches, permission prompts) │
 │         └── MCP tools (dynamic) │   └──────────────┬───────────────────┘
 │         └── LSP tools           │                  │ HTTP/SSE (ACP) :7475
 │         └── RoslynTool          │                  ▼
@@ -181,7 +181,7 @@ User input
        ├─ Checkpoint if >65% context used  (LLM-generated summary, preferred)
        ├─ Compact   if >80% context used   (fallback — summarise + keep last 4 turns)
        │
-       └─ Stream LLM  (up to 25 iterations)
+       └─ Stream LLM  (up to 1,000 iterations)
             │
             ├─ ThinkingDelta   → thinking panel (collapsed on first text)
             ├─ TextDelta       → streamed to output
@@ -195,7 +195,7 @@ User input
 
 Turn ends when the LLM produces text with no tool calls. Session saved to JSONL.
 
-**Doom loop detection**: 3 identical tool call sequences in a row → abort.
+**Doom loop detection**: repeated tool-call batches (period 1–4) are detected and handled in tiers. The first detection adds a nudge, the third consecutive detection escalates to a strong nudge, and the fifth ends the turn. The streak clears after a full clean detection window.
 
 ---
 
@@ -207,18 +207,19 @@ Every tool call goes through this pipeline before touching anything:
 1.  Parse JSON arguments
 2.  Schema validation (required fields, types, enums)
 3.  Sanity check (e.g. path outside workspace → reject)
-4.  Plan mode guard (read-only tools only when in plan mode)
-5.  Capability check → PermissionEngine
+4.  Plan mode gate (read-only tools only when in plan mode)
+5.  Host mode gate (HostExec only when host mode is enabled)
+6.  Capability check → PermissionEngine
          ├─ Auto-allowed  (FileRead, Glob, Grep, …)
-         ├─ Config rules  (allow/deny regex patterns per tool)
+         ├─ Config rules  (allow/deny patterns per tool)
          └─ Interactive   (prompt user → once / session / deny)
-6.  Result cache lookup (read-only tools)
-7.  Pre-tool hook
-8.  Execute
-9.  Post-tool hook
-10. Artifact store (>10 KB results → stored, reference returned to model)
-11. Cache write
-12. File cache invalidation (FileWrite/FileEdit/ApplyPatch)
+7.  Result cache lookup (read-only tools)
+8.  Pre-tool hook
+9.  Execute
+10. Post-tool hook
+11. Artifact store (>10 KB results → stored, reference returned to model)
+12. Cache write
+13. File cache invalidation (FileWrite/FileEdit/ApplyPatch)
 ```
 
 **Concurrency**: read-only + concurrency-safe tools run in parallel (`Task.WhenAll`). Writable tools run serially. Read-only tasks can start while the LLM is still streaming.
@@ -229,7 +230,7 @@ Every tool call goes through this pipeline before touching anything:
 ### Persistence (`SessionManager`)
 - Format: JSONL — line 1 is a header record, subsequent lines are messages
 - Path: `~/.openmono/sessions/{date}_{sessionId}.jsonl`
-- Checkpoints stored alongside: `{sessionId}.checkpoints.json`
+- Checkpoints stored alongside: `{date}_{sessionId}.checkpoints.json`
 
 ### Context window management
 
@@ -248,11 +249,11 @@ Spawns an isolated session with a restricted tool set and a dedicated system pro
 
 | Agent | Max turns | Allowed tools | Purpose |
 |-------|-----------|---------------|---------|
-| `general-purpose` | 25 | all | generic tasks |
-| `Explore` | 15 | FileRead, Glob, Grep, MCP | read-only discovery |
-| `Plan` | 10 | + TodoWrite (no writes) | architecture planning |
-| `Coder` | 30 | FileRead/Write/Edit, Glob, Grep, Bash | implementation |
-| `Verify` | 20 | FileRead, Glob, Grep, Bash, Roslyn, LSP, MCP | adversarial testing |
+| `general-purpose` | 200 | all | generic tasks |
+| `Explore` | 100 | FileRead, Glob, Grep, ListDirectory, WebSearch, WebFetch, ToolSearch, MCP | read-only discovery |
+| `Plan` | 100 | FileRead, Glob, Grep, ListDirectory, WebSearch, WebFetch, ToolSearch, TodoWrite, MCP (no writes) | architecture planning |
+| `Coder` | 300 | FileRead/Write/Edit, ApplyPatch, Glob, Grep, ListDirectory, Bash, AskUser, TodoWrite, WebSearch, WebFetch, ToolSearch, MCP | implementation |
+| `Verify` | 150 | FileRead, Glob, Grep, ListDirectory, Bash, Roslyn, LSP, MCP | adversarial testing |
 
 Tool allow-lists support wildcards (`*`, `mcp__*`).
 
@@ -269,7 +270,7 @@ On startup, for each enabled MCP server in config:
 
 `McpClient` serialises requests, reads responses, and exposes `CallToolAsync`, `ListResourcesAsync`, `ReadResourceAsync`.
 
-**Auto-detected servers**: `code-review-graph` (if in PATH + graph DB exists) and `graphify` (if in PATH + `graphify-out/graph.json` exists) are registered automatically without config.
+**Auto-detected servers**: `code-review-graph` is registered automatically when it is in `PATH` and a graph DB exists. `graphify` is not an MCP server; when `graphify-out/graph.json` exists, OpenMono detects it and tells the agent to use the `graphify` CLI through `Bash`.
 
 ---
 
@@ -285,7 +286,7 @@ Language servers start lazily on first call. File extension → language mapping
 | `.go` | gopls |
 | `.rs` | rust-analyzer |
 
-`LspTool` exposes: `hover`, `definition`, `references`, `completion`, `diagnostic`.
+`LspTool` exposes: `hover`, `definition`, `references`.
 
 ---
 
@@ -301,6 +302,7 @@ Actions:
 | `find-references` | Every usage of a symbol |
 | `callers` | Methods that call a given method |
 | `diagnostics` | Compiler errors and warnings |
+| `capture-baseline` | Snapshot diagnostics as a baseline for later comparison |
 | `search` | Symbols matching a name pattern |
 | `type-hierarchy` | Base types, interfaces, derived types |
 | `blast-radius` | Direct + transitive dependents |
@@ -411,19 +413,24 @@ record StreamChunk
 src/OpenMono.Cli/
 ├── Program.cs              entry point, DI wiring, startup sequence
 ├── Session/                ConversationLoop, SessionManager, Compactor, Checkpointer, TokenTracker
-├── Tools/                  20 built-in tools + ToolRegistry, ToolDispatcher, SchemaBuilder
-├── Llm/                    ProviderRegistry, AnthropicClient, OpenAiCompatClient, OllamaClient
+├── Tools/                  21 built-in tools + ToolRegistry, ToolDispatcher, SchemaValidator, AgentTool, LspTool, RoslynTool
+├── Llm/                    ProviderRegistry, AnthropicClient, OpenAiCompatClient
 ├── Permissions/            PermissionEngine, Capability, PermissionLevel
-├── Agents/                 AgentDefinition, AgentTool (sub-agent runner)
+├── Agents/                 AgentDefinition (built-in sub-agent presets)
 ├── Mcp/                    McpClient, McpServerManager, McpToolAdapter
-├── Lsp/                    LspClient, LspServerManager, LspTool
-├── Roslyn/                 RoslynTool (AdhocWorkspace, 8 actions)
+├── Lsp/                    LspClient, LspServerManager
 ├── Playbooks/              PlaybookExecutor, PlaybookLoader, TemplateEngine, ParameterValidator
-├── Commands/               17 slash commands (/help, /status, /model, /compact, /undo, /btw, …)
+├── Commands/               20 slash commands (/help, /status, /model, /compact, /undo, /btw, …)
 ├── Memory/                 Cross-session memory (YAML frontmatter files)
-├── History/                File snapshots for /undo
-├── Hooks/                  HookRunner, HookDefinition
+├── Hooks/                  HookRunner
 ├── Rendering/              AnsiTuiRenderer, TerminalRenderer, IRenderer
-├── Config/                 AppConfig, multi-source loader
 └── Utils/                  Git, process, path helpers
+
+src/OpenMono.Core/
+├── Config/                 AppConfig, ConfigLoader, HookDefinition
+├── Session/                SessionState
+├── History/                File snapshots for /undo
+├── HostExec/               Host daemon client and consent
+├── Permissions/            PermissionStore, PathGuard
+└── Playbooks/              PlaybookDefinition
 ```

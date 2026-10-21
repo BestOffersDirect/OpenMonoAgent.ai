@@ -10,6 +10,21 @@ always wins over the hardware gate. The gate is ordered, **first match wins**, a
 VRAM check runs before the system-RAM check — so the same card lands on different rows
 depending on how much RAM sits behind it.
 
+### Switching models at runtime
+
+- `/model` lists the models advertised by the active backend and marks the current one.
+- `/model refresh` re-queries the backend's `/v1/models` endpoint.
+- `/model <name|index>` changes the model name sent to the active provider; it takes
+  effect on the next turn.
+
+This does not change the provider and does not start a second local model. A llama.cpp
+server normally serves one model per process, so in practice the list contains that
+model; backends such as Ollama may advertise several.
+
+For multiple sampling configurations, define `model_presets` in `settings.json` and
+activate one with `"active": true` or `OPENMONO_MODEL_PRESET` at startup. There is no
+runtime preset-switch command yet.
+
 ### Linux
 
 | # | VRAM | System RAM | Model | Engine | Context / KV | Vision |
@@ -149,7 +164,7 @@ Qwen was chosen because it's the best open-weight model family for agentic codin
 Both models are designed for agentic workflows, not just benchmark numbers — the training emphasises tool calling, code iteration, and multi-turn task completion.
 
 > [!NOTE]
-> You're not locked to Qwen. Any GGUF model that fits your hardware can be configured via `settings.json` — point `llm.model_path` to a local GGUF file or use `/model <name>` to switch providers mid-session.
+> You're not locked to Qwen. Any GGUF model that fits your hardware can be served by llama.cpp and selected with `llm.model` in `settings.json`. Use `/model <name>` to change the model name sent to the active provider; providers themselves are selected at startup.
 
 ---
 
@@ -226,7 +241,7 @@ For agentic coding tasks the agent typically makes many short tool calls with br
 
 ## Reasoning mode (`/think`)
 
-Qwen has a native reasoning mode that makes the model think step-by-step before responding. Toggle it with `/think` or `Ctrl+T`.
+Qwen has a native reasoning mode that makes the model think step-by-step before responding. Toggle it with `/think`.
 
 ### How it works
 
@@ -236,17 +251,18 @@ When enabled, the model emits a hidden `reasoning_content` stream alongside its 
 ◈ Thinking [312 tok]
 ```
 
-The block expands on `Ctrl+T`. It collapses automatically once the model starts its visible response.
+The block collapses automatically once the model starts its visible response. There is currently no keybinding to expand or collapse it manually.
 
 ### What the agent changes when thinking is on
 
 | Parameter | Normal | Thinking |
 |-----------|--------|----------|
-| Temperature | 0.7 (Qwen preset) | **0.6** |
+| Temperature | 0.7 (Qwen preset) | **0.6** (Qwen3.x) / **1.0** (Qwen3.8) |
+| Top-P | 0.8 | **0.95** |
 | Presence penalty | 1.5 | **0.0** |
 | `enable_thinking` | — | **true** |
 
-Lower temperature keeps reasoning chains consistent. Zero presence penalty lets the model repeat terms as needed without being penalised — important for logical chains that revisit the same concepts.
+Qwen3.x uses a lower thinking temperature (0.6) for consistency; Qwen3.8 uses 1.0. Zero presence penalty lets the model repeat terms as needed without being penalised — important for logical chains that revisit the same concepts.
 
 ### When to use it
 
@@ -279,7 +295,7 @@ The defaults are tuned for Qwen3's training distribution:
 | Min-P | 0.0 | Disabled |
 | Repetition penalty | 1.0 | Neutral |
 
-Override any of these in `settings.json` under `llm.*` or per-model under `modelPresets.qwen`.
+Override any of these in `settings.json` under `llm.*` or per-model under `model_presets.qwen`.
 
 ---
 
@@ -300,16 +316,9 @@ For a single-user setup (typical), keep `--parallel 1` to maximise context. To a
 ## Using cloud models instead
 
 > [!CAUTION]
-> Cloud providers (OpenAI, Anthropic, Ollama) are WIP and untested. Local llama.cpp is the only fully supported provider.
+> Cloud providers (OpenAI, Anthropic, Ollama) are WIP and untested. Local llama.cpp and Strata are the fully supported backends.
 
-If you prefer a cloud model for a session, switch without restarting:
-
-```bash
-/model claude-sonnet-4-20250514   # Anthropic (requires ANTHROPIC_API_KEY)
-/model gpt-4o                     # OpenAI (requires OPENAI_API_KEY)
-```
-
-Or set permanently in `settings.json`:
+Providers are selected at agent startup. To use a cloud provider, configure it in `settings.json` and restart the agent:
 
 ```jsonc
 {
@@ -319,7 +328,7 @@ Or set permanently in `settings.json`:
 }
 ```
 
-The local llama-server keeps running in the background — switch back to it any time with `/model qwen3.8-27b` (GPU) or `/model qwen3.6-35b-a3b` (CPU).
+The local llama-server keeps running in the background. To switch back, mark the local provider active in `settings.json` and restart the agent; `/model` then selects the model name served by that backend.
 
 ---
 
