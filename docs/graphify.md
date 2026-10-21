@@ -68,7 +68,7 @@ The agent then uses Bash to run graphify commands when answering conceptual ques
 
 ### Playbook
 
-A built-in playbook at `.openmono/playbooks/graphify/PLAYBOOK.md` exposes explicit graph actions:
+An example playbook at `docs/playbooks-examples/graphify/PLAYBOOK.md` exposes explicit graph actions. Copy it into `.openmono/playbooks/graphify/` (or `~/.openmono/playbooks/graphify/`) to use it:
 
 ```
 # Inside the agent REPL:

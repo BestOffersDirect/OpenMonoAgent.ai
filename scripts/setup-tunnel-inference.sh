@@ -4,7 +4,8 @@ set -euo pipefail
 # ─────────────────────────────────────────────────────────────────────
 # OpenMono.ai — Set up frp client on the inference box.
 # Connects outbound to an OpenMonoAgent Relay instance so the agent box
-# can reach this machine's llama-server without port forwarding.
+# can reach this machine's inference backend (Strata or llama-server)
+# without port forwarding.
 #
 # Usage: openmono tunnel setup
 # ─────────────────────────────────────────────────────────────────────
@@ -17,16 +18,31 @@ RELAY_CACHE="$HOME/.openmono/relay.json"
 API_BASE="https://app.openmonoagent.ai"
 RELAY_PUBLIC_HOST="relay.openmonoagent.ai"
 
-# If the Caddy web gateway is installed, tunnel it instead of llama directly —
-# the single remote port then reaches llama + search + scrape via path routing.
+# If the Caddy web gateway is installed, tunnel it instead of the inference
+# backend directly — the single remote port then reaches inference + search +
+# scrape via path routing.
 GATEWAY_PORT="$(grep '^GATEWAY_PORT=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]' || true)"
 GATEWAY_PORT="${GATEWAY_PORT:-47480}"
-# Tunnel the gateway (which fronts llama + any web services) whenever it's
-# installed; otherwise fall back to tunneling llama-server directly.
+# Backend-aware direct port: Strata serves host-native :7474/v1 (Linux
+# default, see docs/STRATA.md); the legacy llama.cpp path also serves :7474.
+# settings.json inference.port is desired state and wins when present.
+INFERENCE_BACKEND="$(grep '^INFERENCE_BACKEND=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]' || true)"
+SETTINGS="$HOME/.openmono/settings.json"
+SETTINGS_PORT=""
+if command -v jq &>/dev/null && [[ -f "$SETTINGS" ]]; then
+    SETTINGS_PORT="$(jq -r '.inference.port // empty' "$SETTINGS" 2>/dev/null || true)"
+fi
+INFERENCE_PORT="$(grep '^INFERENCE_PORT=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]' || true)"
+[[ -n "$INFERENCE_PORT" ]] || INFERENCE_PORT="$(grep '^STRATA_PORT=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]' || true)"
+[[ -n "$INFERENCE_PORT" ]] || INFERENCE_PORT="$(grep '^LLAMA_PORT=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]' || true)"
+INFERENCE_PORT="${SETTINGS_PORT:-${INFERENCE_PORT:-7474}}"
+DIRECT_PORT="$INFERENCE_PORT"
+# Tunnel the gateway (which fronts the inference backend + any web services)
+# whenever it's installed; otherwise fall back to tunneling the backend directly.
 if grep -q '^GATEWAY_ENABLED=true' "$ENV_FILE" 2>/dev/null || grep -qE '^WEB_(SEARCH|SCRAPE)_ENABLED=true' "$ENV_FILE" 2>/dev/null; then
     TUNNEL_LOCAL_PORT="$GATEWAY_PORT"
 else
-    TUNNEL_LOCAL_PORT=7474
+    TUNNEL_LOCAL_PORT="$DIRECT_PORT"
 fi
 # The agent box probes the gateway's /services registry (same relay URL as
 # llm.endpoint) and routes WebSearch/WebFetch through whatever this box exposes,
@@ -449,9 +465,21 @@ if [[ "$NATIVE_INFERENCE" != "true" && -f "$OVERRIDE_FILE" ]] && ! grep -q -- '-
     ok "Patched $OVERRIDE_FILE"
 fi
 
-# ── Restart llama-server so it picks up the new API key ──────────────
+# ── Restart inference backend so it picks up the new API key ──────────────
 
-if [[ "$NATIVE_INFERENCE" == "true" ]]; then
+if [[ "${INFERENCE_BACKEND:-}" == "strata" && "$NATIVE_INFERENCE" != "true" ]]; then
+    # Strata backend: the key in docker/.env guards the Caddy gateway. If the
+    # tunnel points at Strata directly (no gateway), the agent-box key must be
+    # the Strata server's own --api-key instead (set at Strata setup time;
+    # see docs/STRATA.md). Restart Strata only if it is running.
+    if curl -sf "http://127.0.0.1:${INFERENCE_PORT}/health" &>/dev/null; then
+        info "Restarting Strata so a server-side key change (if any) applies..."
+        bash "$REPO_DIR/scripts/strata.sh" start || \
+            warn "Strata restart hit an issue — run manually: bash scripts/strata.sh start"
+    else
+        info "Strata not running yet. Start it with: openmono start"
+    fi
+elif [[ "$NATIVE_INFERENCE" == "true" ]]; then
     # macOS native: source inference.sh and use native restart
     # shellcheck source=/dev/null
     source "$REPO_DIR/scripts/macos/inference.sh" 2>/dev/null || true
@@ -470,8 +498,8 @@ else
             (cd "$REPO_DIR/docker" && docker compose up -d llama-server) || \
                 warn "Restart failed — run manually: cd ${REPO_DIR}/docker && docker compose up -d llama-server"
             sleep 2
-            LLAMA_PORT="$(grep '^LLAMA_PORT=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]' || true)"
-            _probe_code=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:${LLAMA_PORT:-7474}/v1/models" 2>/dev/null || echo "000")
+            _probe_port="$(grep '^INFERENCE_PORT=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]' || true)"
+            _probe_code=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:${_probe_port:-${INFERENCE_PORT:-7474}}/v1/models" 2>/dev/null || echo "000")
             if [[ "$_probe_code" == "200" ]]; then
                 warn "llama-server answered without an API key (HTTP 200) — auth is NOT applied. Check $OVERRIDE_FILE"
             elif [[ "$_probe_code" == "401" ]]; then
@@ -499,6 +527,17 @@ ${BLUE}ON THE AGENT BOX, run:${NC}
 
   openmono config set llm.endpoint  http://$RELAY_PUBLIC_HOST:$REMOTE_PORT
   openmono config set llm.api_key   $LLAMA_API_KEY
+EOF
+if [[ "${INFERENCE_BACKEND:-}" == "strata" ]]; then
+cat <<EOF
+${YELLOW}Strata backend note:${NC} the key above guards the Caddy gateway when the
+tunnel targets it. If this box tunnels Strata directly (no gateway), use the
+Strata server's own API key instead (the --api-key from Strata setup).
+See docs/STRATA.md (dual-box section).
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+EOF
+fi
+cat <<EOF
 
 Then:  openmono agent
 

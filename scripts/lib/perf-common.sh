@@ -19,6 +19,19 @@ WARMUP_ENABLED="${PERF_WARMUP:-1}"
 MAX_PROMPT_PROCESSING_S="${PERF_PROMPT_TIMEOUT:-120}"
 MAX_DECODE_S="${PERF_DECODE_TIMEOUT:-300}"
 
+# Shared bearer key for the inference endpoint. llama.cpp serves /health without
+# a key, but /props and /v1/chat/completions are gated behind it.
+PERF_ENV_FILE="${PERF_ENV_FILE:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/docker/.env}"
+PERF_API_KEY="${OPENMONO_API_KEY:-$(grep '^LLAMA_API_KEY=' "$PERF_ENV_FILE" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]' || true)}"
+
+perf_curl() {
+    if [ -n "$PERF_API_KEY" ]; then
+        curl -H "Authorization: Bearer $PERF_API_KEY" "$@"
+    else
+        curl "$@"
+    fi
+}
+
 # ── ANSI colors ──────────────────────────────────────────────────────────────
 if [ -t 1 ]; then
     RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[1;33m'
@@ -53,7 +66,7 @@ perf_check_server() {
     # is diagnostic, not "connection failed" with no context.
     local tmp status body
     tmp=$(mktemp)
-    status=$(curl -sS -o "$tmp" -w '%{http_code}' --max-time 10 \
+    status=$(perf_curl -sS -o "$tmp" -w '%{http_code}' --max-time 10 \
         "${ENDPOINT}/health" 2>&1) || status="000"
     body=$(head -c 200 "$tmp" 2>/dev/null); rm -f "$tmp"
 
@@ -151,7 +164,7 @@ perf_gpu_info() {
 # ── Model info (asks the llama-server what it's running) ─────────────────────
 perf_model_info() {
     local props
-    props=$(curl -sf --max-time 5 "${ENDPOINT}/props" 2>/dev/null || echo '{}')
+    props=$(perf_curl -sf --max-time 5 "${ENDPOINT}/props" 2>/dev/null || echo '{}')
     local model_path ctx_size
     model_path=$(echo "$props" | jq -r '.model_path // .default_generation_settings.model // "unknown"')
     ctx_size=$(echo "$props" | jq -r '.default_generation_settings.n_ctx // .n_ctx // "unknown"')
@@ -194,7 +207,7 @@ perf_run_once() {
 
     local start end total_ms resp http_code
     start=$(date +%s%3N)
-    resp=$(curl -sS \
+    resp=$(perf_curl -sS \
         --max-time "$((MAX_PROMPT_PROCESSING_S + MAX_DECODE_S))" \
         -H 'Content-Type: application/json' \
         -w '\n__HTTP__%{http_code}' \
@@ -630,7 +643,7 @@ perf_llama_config() {
     echo "### llama-server configuration (from /props)"
     echo ""
     local props
-    props=$(curl -sf --max-time 5 "${ENDPOINT}/props" 2>/dev/null || echo '{}')
+    props=$(perf_curl -sf --max-time 5 "${ENDPOINT}/props" 2>/dev/null || echo '{}')
 
     # /props shape has changed across llama.cpp versions — probe the most useful
     # fields with jq fallback to "?".

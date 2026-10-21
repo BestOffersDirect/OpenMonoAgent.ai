@@ -43,14 +43,22 @@ trap _cleanup_terminal EXIT INT TERM HUP
 # ERR trap — fires when any command exits non-zero under set -e.
 # Logs the failing command and line number so the log is always useful.
 # Does not fire for intentionally handled errors (||, if, &&).
-set -o errtrace
-_trap_err() {
-    local exit_code=$?
-    local line="${BASH_LINENO[0]:-?}"
-    local cmd="${BASH_COMMAND:-?}"
-    _log "FATAL: exit $exit_code at line $line — $cmd"
-}
-trap '_trap_err' ERR
+#
+# errtrace / BASH_LINENO / BASH_COMMAND / `local` / `${var:0}` are all bash-isms.
+# macOS default shells (zsh) reject `set -o errtrace` and would abort a
+# `set -e` script right here, so enable the trap only when actually running
+# under bash. Under any other shell the install still works; it just loses the
+# extra "FATAL: line N" detail in the log.
+if [ -n "${BASH_VERSION:-}" ]; then
+    set -o errtrace
+    _trap_err() {
+        local exit_code=$?
+        local line="${BASH_LINENO[0]:-?}"
+        local cmd="${BASH_COMMAND:-?}"
+        _log "FATAL: exit $exit_code at line $line — $cmd"
+    }
+    trap '_trap_err' ERR
+fi
 
 OPENMONO_VERBOSE="${OPENMONO_VERBOSE:-0}"
 
@@ -97,6 +105,12 @@ step() {
 info()  { printf "  ${BLUE}ℹ${NC}  %s\n" "$*"; _log "INFO: $*"; }
 ok()    { printf "  ${GREEN}✓${NC}  %s\n" "$*"; _log "OK: $*"; }
 warn()  { printf "  ${YELLOW}⚠${NC}  %s\n" "$*"; _log "WARN: $*"; }
+
+# Convention in this repo: stdout is the display channel (info/ok/warn and every
+# interactive prompt all write there), stderr is the diagnostic channel. openmono
+# setup runs the installers as `bash install.sh 2>> $OPENMONO_LOG_FILE` and on
+# failure prints show_log_tail, so stderr is deliberately off-screen — anything
+# the user has to READ or ANSWER must go to stdout, never here.
 err()   { printf "  ${RED}✗${NC}  %s\n" "$*" >&2; _log "ERROR: $*"; }
 
 # detail — only shown in verbose mode, always logged
@@ -126,6 +140,36 @@ run() {
 run_live() {
     _log "RUN_LIVE: $*"
     "$@" 2>&1 | tee -a "$OPENMONO_LOG_FILE"
+    return "${PIPESTATUS[0]}"
+}
+
+# run_progress — quiet build runner with an in-place progress bar.
+# For commands whose output carries cmake-style "[ 42%]" markers (cmake
+# --build, make). Every line still goes to the log; the user sees one
+# updating bar instead of hundreds of compile lines. OPENMONO_VERBOSE=1
+# falls back to streaming everything.
+run_progress() {
+    _log "RUN_PROGRESS: $*"
+    if [ "$OPENMONO_VERBOSE" = "1" ]; then
+        printf "     ${DIM}\$ %s${NC}\n" "$*"
+        "$@" 2>&1 | tee -a "$OPENMONO_LOG_FILE"
+        return "${PIPESTATUS[0]}"
+    fi
+    if [ ! -t 1 ]; then
+        "$@" >> "$OPENMONO_LOG_FILE" 2>&1
+        return "$?"
+    fi
+    "$@" 2>&1 | tee -a "$OPENMONO_LOG_FILE" | awk '
+        match($0, /\[[ ]*[0-9]+%\]/) {
+            p = substr($0, RSTART + 1, RLENGTH - 2)
+            gsub(/[^0-9]/, "", p)
+            bar = ""; filled = int(p / 2)
+            for (i = 0; i < 50; i++) bar = bar (i < filled ? "#" : ".")
+            printf "\r  [%s] %3d%%", bar, p + 0
+            fflush(stdout)
+        }
+        END { printf "\n" }
+    '
     return "${PIPESTATUS[0]}"
 }
 
@@ -211,7 +255,13 @@ flush_stdin() {
     local _discard
     # Tiny non-zero timeout: each buffered line is consumed at once; when the
     # buffer empties, read blocks for the timeout, fails (>128), and we stop.
-    while read -r -t 0.1 _discard 2>/dev/null; do :; done
+    # Guarded so a shell without fractional `read -t` support (or a read that
+    # keeps returning success) can never hang the installer.
+    local _guard=0
+    while read -r -t 0.1 _discard 2>/dev/null; do
+        _guard=$((_guard + 1))
+        (( _guard > 200 )) && break
+    done
     return 0
 }
 

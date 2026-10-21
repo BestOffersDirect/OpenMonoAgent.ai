@@ -1,5 +1,13 @@
 # Setup & Commands
 
+> [!NOTE]
+> **Strata (Qwen3.8-Flash-Next) is the default on high-end Linux boxes** — an NVIDIA
+> card with 24 GB+ VRAM behind 48 GB-class RAM. Other Linux boxes default to
+> Qwen3.8-27B or Bonsai on llama.cpp; see [MODELS.md](MODELS.md). On a qualifying
+> box Strata serves an OpenAI-compatible API at `http://127.0.0.1:7474/v1`. See
+> [STRATA.md](STRATA.md) for requirements, install/start/stop, dual-box relay, and
+> switching back to the legacy llama.cpp path (`OPENMONO_INFERENCE_BACKEND=llama`).
+
 ## Requirements
 
 | | |
@@ -7,7 +15,7 @@
 | **OS** | Ubuntu 26.04 LTS (recommended) · 25.10 · **macOS 14+** (Sonoma/Sequoia) |
 | **GPU mode** (Linux) | NVIDIA GPU · 12 GB VRAM minimum · 24 GB recommended |
 | **CPU mode** (Linux) | 24 GB RAM |
-| **Apple Silicon** (macOS) | M1+ · **64 GB+ unified memory recommended** (tested) · less than 64 GB not encouraged |
+| **Apple Silicon** (macOS) | M1+ · **48 GB+ unified memory recommended** (tested) · 24–47 GB and 16–23 GB run Bonsai with a tighter context · 16 GB minimum |
 | **Disk** | ~22 GB free (model + ~900 MB vision projector) |
 
 > [!NOTE]
@@ -82,14 +90,21 @@ If the NVIDIA drivers are being installed fresh, a reboot is required:
 
 ### Model download
 
-The only slow step. The installer picks the right model based on your VRAM:
+The only slow step. The installer picks the right model from your GPU **and** system
+RAM — first match wins, and the full policy is in [MODELS.md](MODELS.md):
 
-| VRAM | Model | Size | Accuracy | Context (vision on) |
-|------|-------|------|----------|---------------------|
-| 24 GB+ | Qwen3.8-27B-Q4_K_M | ~15.5 GB | Full | 168k |
-| 16 GB | Qwen3.8-27B-UD-IQ3_XXS | ~12 GB | Lower | 96k |
-| 12 GB | Qwen3.5-9B-Q4_K_M | ~5 GB | Lower | 168k |
+| GPU / RAM | Model | Size | Accuracy | Context (vision on) |
+|-----------|-------|------|----------|---------------------|
+| NVIDIA 24 GB+ VRAM **and** 48 GB-class RAM | Qwen3.8-Flash-Next (Strata) | ~70 GB | Full | Strata picks per box |
+| NVIDIA 24 GB+ | Qwen3.8-27B-Q4_K_M | ~15.5 GB | Full | 168k |
+| NVIDIA 16 GB | Qwen3.8-27B-UD-IQ3_XXS | ~12 GB | Lower | 96k |
+| NVIDIA 12 GB | Ternary-Bonsai-2-27B **PQ2_0** | ~7.2 GB | 27B (ternary) | 96k |
+| AMD iGPU (7940HS / 780M), 32 GB+ RAM | Ternary-Bonsai-2-27B **PQ2_0** | ~7.2 GB | 27B (ternary) | 168k |
 | CPU | Qwen3.6-35B-A3B-UD-Q4_K_XL | ~17.6 GB | Full | 168k |
+
+Model, vision and parallel slots are hardware-defaulted — none of the three is
+asked. Pass `--options` to choose them yourself, or `--model=<name>` to pin one.
+(The role and GPU prompts in Phase 1 still ask; see above.)
 
 The installer also downloads the **multimodal projector** (mmproj, ~900 MB) for each model, which enables vision. A reduced context size is set automatically to keep the projector within VRAM/RAM budget. To disable vision and recover the extra context, see [disabling vision](#vision) below.
 
@@ -187,10 +202,10 @@ Refactor this function to be async
 Add error handling to the payment flow
 ```
 
-OpenMono navigates your codebase, proposes solutions, and executes changes with full transparency. You stay in control throughout — the agent shows its work at every step and asks before making any major actions, including file reads, edits, and running commands.
+OpenMono navigates your codebase, proposes solutions, and executes changes with full transparency. You stay in control throughout — the agent shows its work at every step and asks before writes and commands. Read-only tools are auto-approved.
 
 > [!TIP]
-> Type `/think` or press `Ctrl+T` to enable step-by-step reasoning mode — best for complex bugs, large refactors, and architecture decisions. Turn it off for simple lookups and quick edits.
+> Type `/think` to enable step-by-step reasoning mode — best for complex bugs, large refactors, and architecture decisions. Turn it off for simple lookups and quick edits.
 
 ---
 
@@ -242,12 +257,12 @@ The installer reads `hw.memsize` and picks the model for your memory tier:
 
 | Unified memory | Model | Accuracy | Context (vision on) | Status |
 |----------------|-------|----------|---------------------|--------|
-| 64 GB+ | Qwen3.6-35B-A3B-UD-Q4_K_XL | Full | 192k (168k) | ✅ Recommended / tested |
-| 32 GB | Qwen3.5-9B-Q4_K_M | Lower | 64k (48k) | ⚠️ Not encouraged |
-| 16 GB | Qwen3.5-9B-Q4_K_M | Lower | 16k (12k) | ⚠️ Not encouraged |
+| 48 GB+ | Qwen3.6-35B-A3B-UD-Q4_K_XL | Full | 192k (168k) | ✅ Recommended / tested |
+| 24–47 GB | Ternary-Bonsai-2-27B **PQ2_0** | 27B (ternary) | 64k | Default; newer Metal path |
+| 16–23 GB | Ternary-Bonsai-2-27B **PTQ1_0** | 27B (ternary) | 16k | Default; ~8–10 tok/s on a 16 GB M4 mini (see [MODELS.md](MODELS.md)) |
 
 > [!IMPORTANT]
-> **64 GB+ unified memory is the recommended, tested configuration** — full-accuracy 35B model at the full 192k context. The installer will still configure the 16 GB and 32 GB tiers (smaller 9B model, much tighter context), but **less than 64 GB is not encouraged** — they fall back to a smaller model with a much tighter context window. 16 GB is the hard floor: below it the full and inference roles refuse to install — use the **agent** role and point it at a separate inference server. As on Linux, vision (mmproj) downloads automatically and trims the context to keep the encoder within the memory budget.
+> **48 GB+ unified memory is the recommended, tested configuration** — full-accuracy 35B model at the full 192k context. 24–47 GB and 16–23 GB Macs default to **Bonsai** (PQ2_0 / PTQ1_0), which replaced the old 9B fallback: at ~7.2 GB and ~5.9 GB of weights it leaves the headroom unified memory needs while still being a real 27B. Bonsai is the newer Metal path, so `--model=qwen` is the escape hatch if a Mac of that size misbehaves — on the Qwen tiers a 32 GB Mac gets 64k (48k with vision) and a 16 GB Mac gets 16k (12k). 16 GB is the hard floor: below it the full and inference roles refuse to install — use the **agent** role and point it at a separate inference server. Vision (mmproj) downloads automatically and trims the context on the Qwen tiers to keep the encoder within the memory budget; the Bonsai presets are already sized for it, so vision costs them nothing.
 
 ### Intel Macs
 
@@ -258,6 +273,11 @@ Intel Macs have no Metal GPU and no unified memory, so native inference is unsup
 ## Dual-box setup
 
 Run the model on a dedicated inference box and connect from your laptop over the internet. No port forwarding required — the tunnel is established outbound from the inference box.
+
+> On the same LAN/VPN, or running the agent on a server box? See
+> [DEPLOYMENT-MODES.md](DEPLOYMENT-MODES.md) — it covers single-box mode, the
+> direct-LAN split (no relay account), and the server-ops runbook (pull a repo,
+> deploy, troubleshoot a backend).
 
 ![Dual-box setup diagram](assets/dual-box-server.png)
 
@@ -369,7 +389,32 @@ openmono tunnel logs     # tail frpc logs
 
 ## Vision
 
-Vision is enabled by default when the mmproj is present. Set `OPENMONO_VISION_ENABLED=1` (or add `"vision_enabled": true` to `settings.json`) so the agent accepts and processes images.
+Vision is **on by default on inference boxes**, and **asked during install only
+with `--options`** — the llama.cpp and Strata installers otherwise take the
+default, because on those boxes the choice controls a real ~900 MB download. On
+an **agent box** nothing
+is asked: whether the remote endpoint actually serves images is detected at
+startup from the server's own `/props` capabilities (`modalities.vision`), so
+there is no install-time guess to go stale. The install choice is persisted to
+`~/.openmono/settings.json` under `"inference": { "vision_enabled": true }`,
+which is the single source of truth for every launch path (extension,
+host-bridge, and compose all mount `~/.openmono` into the agent container).
+An explicit value there also overrides the agent-side auto-detection — to
+change it later:
+
+```bash
+openmono config set inference.vision_enabled true    # allow image input
+openmono config set inference.vision_enabled false   # text only
+```
+
+The `OPENMONO_VISION_ENABLED=1` environment variable still works as a one-off
+override when the setting is unset. Non-interactive installs take the default:
+vision **on** for Strata (it needs ~1–2 GB extra headroom — opt out with
+`STRATA_VISION=no`) and the catalog default on llama.cpp (on when the model
+ships a projector). To toggle
+the projector weights themselves, re-run `openmono setup` — or on an existing
+Strata install: `STRATA_VISION=yes bash scripts/strata.sh install` (reconfigures
+without re-downloading the base model).
 
 ### Attaching images in chat
 
@@ -507,9 +552,12 @@ Both fall back gracefully (DuckDuckGo / direct fetch) when the gateway is unavai
 | `/help` | List all commands and keyboard shortcuts |
 | `/think` | Toggle step-by-step reasoning mode |
 | `/plan` | Restrict agent to read-only tools for safe exploration |
-| `/model <name>` | Switch model mid-session |
+| `/mode` | Toggle between Plan (read-only) and Build mode |
+| `/model` | List the models advertised by the active backend |
+| `/model refresh` | Re-query the backend's model list |
+| `/model <name\|index>` | Change the model name sent to the active provider |
 | `/compact [focus]` | Summarize history to free up context |
-| `/checkpoint` | Save a named checkpoint in the conversation |
+| `/checkpoint` | Summarize history into a checkpoint to free context |
 | `/undo [n]` | Revert the last n file changes |
 | `/resume [id]` | Resume a previous session |
 | `/export [format] [path]` | Export as `markdown`, `json`, or `html` |
@@ -519,6 +567,10 @@ Both fall back gracefully (DuckDuckGo / direct fetch) when the gateway is unavai
 | `/clear` | Clear context and start fresh |
 | `/debug` | Toggle verbose debug output |
 | `/retry` | Resend the last message |
+| `/btw <question>` | Ask a quick aside without touching tools or main context |
+| `/host [status\|on\|off]` | Show or switch host scope (sandboxed vs whole-machine) |
+| `/prompt [system\|plan] [global\|project]` | Create or override the system or Plan-mode prompt |
+| `/playbook <name> [args]` | Run a playbook directly |
 | `/quit` | Exit OpenMono |
 
 ---
@@ -533,17 +585,16 @@ Both fall back gracefully (DuckDuckGo / direct fetch) when the gateway is unavai
 | <kbd>Ctrl</kbd>+<kbd>P</kbd> | Open command picker |
 | <kbd>Tab</kbd> | Autocomplete command or file path |
 | <kbd>Esc</kbd> | Cancel active request · dismiss suggestions |
-| <kbd>F1</kbd> | Help overlay |
 | <kbd>↑</kbd> / <kbd>↓</kbd> | Navigate input history |
 | <kbd>PageUp</kbd> / <kbd>PageDown</kbd> | Scroll conversation |
 
-Shortcuts can be customised in `~/.openmono/tui.json` (user-wide) or `.openmono/tui.json` (per project).
+The TUI does not currently read a user keybinding file.
 
 ---
 
 ## Configuration
 
-Settings live in `~/.openmono/settings.json` (user-wide) or `.openmono/settings.json` (per project):
+Settings are read from `~/.openmono/settings.json` (user-wide) or `.openmono/settings.json` (per project). `openmono config` writes the user-wide file:
 
 ```bash
 openmono config set llm.endpoint http://localhost:7474

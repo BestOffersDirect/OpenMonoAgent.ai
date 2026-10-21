@@ -39,7 +39,7 @@
 
 ---
 
-OpenMono is a coding agent that runs **entirely on your hardware** — no subscriptions, no data leaving your network, no per-token billing. It pairs a .NET 10 CLI with its own llama.cpp inference server, giving you a full agentic loop with **20 built-in tools**, Docker sandboxing, and deep code intelligence. NVIDIA GPU, CPU, or Apple Silicon (Metal) — **it auto-configures itself**. You own the model, the compute, and the data.
+OpenMono is a coding agent that runs **entirely on your hardware** — no subscriptions, no data leaving your network, no per-token billing. It pairs a .NET 10 CLI with its own llama.cpp inference server, giving you a full agentic loop with **21 built-in tools**, Docker sandboxing, and deep code intelligence. NVIDIA GPU, AMD APU (integrated Radeon iGPU, unified memory), or Apple Silicon (Metal) — **it auto-configures itself**. You own the model, the compute, and the data.
 
 ---
 
@@ -50,13 +50,15 @@ OpenMono is a coding agent that runs **entirely on your hardware** — no subscr
   <a href="https://www.youtube.com/playlist?list=PLJ7vIYQ-dfw4">
     <img src="docs/assets/free-course-banner.svg" alt="A FREE COURSE on how to get up and running with OMA — build your site, build your web-game, publish it live on the web. Click to watch the full playlist on YouTube." width="800" />
   </a>
+  <br/>
+  <sub><a href="https://openmonoagent.ai/contact">Need help? Contact us — we'll help you get set up.</a></sub>
 </div>
 
 ---
 
 ## Quickstart
 
-One command. Auto-detects GPU · CPU · Apple Silicon. Installs model, runtime, and Docker containers.
+One command. Auto-detects GPU · APU/iGPU · Apple Silicon. Installs model, runtime, and Docker containers.
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/StartupHakk/OpenMonoAgent.ai/refs/heads/main/get-openmono.sh)
@@ -69,7 +71,7 @@ openmono agent            # TUI mode (default)
 openmono agent --classic  # classic scrolling terminal
 ```
 
-<sub><a href="docs/SETUP.md">→ Full command reference</a> — daily commands, setup flags, GPU/CPU options</sub>
+<sub><a href="docs/SETUP.md">→ Full command reference</a> — daily commands, setup flags, GPU/iGPU options · <a href="https://openmonoagent.ai/contact">Need help? Book a call</a></sub>
 
 <br/>
 
@@ -100,7 +102,7 @@ Most coding agents are cloud products wearing an open-source label. Your prompts
 </div>
 
 
-→ [Full architecture + diagram](docs/ARCHITECTURE.md) · [4 providers](docs/MODELS.md) · runs at **~45 tok/s on GPU**, ~20 tok/s on CPU
+→ [Full architecture + diagram](docs/ARCHITECTURE.md) · [5 provider backends](docs/MODELS.md) · runs at **~45 tok/s on GPU**, ~20 tok/s on AMD iGPU (APU)
 
 ---
 
@@ -114,7 +116,7 @@ Most coding agents are cloud products wearing an open-source label. Your prompts
 llama.cpp ships inside Docker. Installer detects your hardware and picks the right model. After setup, every token is free.
 
 `GPU` Qwen3.8-27B dense · ~60 tok/s  
-`CPU` Qwen3.6-35B-A3B MoE · ~20 tok/s  
+`iGPU` Qwen3.6-35B-A3B MoE · APU unified memory · ~20 tok/s  
 `Mac` Qwen3.6-35B-A3B MoE · Metal · ~45–48 tok/s
 
 → [Models & reasoning mode](docs/MODELS.md)
@@ -123,15 +125,15 @@ llama.cpp ships inside Docker. Installer detects your hardware and picks the rig
 <td width="50%" valign="top">
 
 <strong style="color:#A3FF66;">02</strong> · **Agentic loop that earns its name**  
-25 iterations per turn. Doom-loop detection aborts if the same tool sequence repeats 3×. Checkpoints at 65% context fill, compacts at 80%. Runs until done — then stops.
+Up to 1,000 iterations per turn. Doom-loop detection nudges on repeated tool batches, escalates the nudge at 3 consecutive detections, and ends the turn at 5. Checkpoints at 65% context fill, compacts at 80%. Runs until done — then stops.
 
 </td>
 </tr>
 <tr>
 <td valign="top">
 
-<strong style="color:#A3FF66;">03</strong> · **[20 tools](docs/ARCHITECTURE.md), 12-step pipeline**  
-Every call: parse → schema validate → path sanity → plan-mode guard → capability check → cache → pre-hook → execute → post-hook → artifact store. Read-only tools run in parallel. Nothing bypasses the pipeline.
+<strong style="color:#A3FF66;">03</strong> · **[21 tools](docs/ARCHITECTURE.md), guarded pipeline**  
+Every call: parse → schema validate → path sanity → plan-mode gate → host-mode gate → permission check → cache → pre-hook → execute → post-hook → artifact store → cache write → invalidate. Read-only tools run in parallel. Nothing bypasses the pipeline.
 
 </td>
 <td valign="top">
@@ -139,11 +141,11 @@ Every call: parse → schema validate → path sanity → plan-mode guard → ca
 <strong style="color:#A3FF66;">04</strong> · **5 specialist sub-agents**  
 Isolated sessions with locked tool sets and turn budgets:
 
-`Explore` · read-only discovery · 15 turns  
-`Plan` · architecture, no writes · 10 turns  
-`Coder` · full file access · 30 turns  
-`Verify` · adversarial + Roslyn · 20 turns  
-`general-purpose` · everything · 25 turns
+`Explore` · read-only discovery · 100 turns  
+`Plan` · architecture, no writes · 100 turns  
+`Coder` · full file access · 300 turns  
+`Verify` · adversarial + Roslyn · 150 turns  
+`general-purpose` · everything · 200 turns
 
 </td>
 </tr>
@@ -151,7 +153,7 @@ Isolated sessions with locked tool sets and turn budgets:
 <td valign="top">
 
 <strong style="color:#A3FF66;">05</strong> · **Docker sandbox**  
-Project mounts as `/workspace`. The agent reads and writes your real files — that's the blast radius. Nothing outside that mount is visible or reachable.
+In sandbox mode the project mounts as `/workspace`. The agent reads and writes your real files — that's the blast radius; nothing outside that mount is visible. Host mode is the explicit exception: machine-level actions run only through approved `HostExec` calls.
 
 </td>
 <td valign="top">
@@ -167,13 +169,13 @@ Auto-detects [graphify](docs/graphify.md) (semantic concept graph, 25+ languages
 <td valign="top">
 
 <strong style="color:#A3FF66;">07</strong> · **[Playbooks](docs/PLAYBOOKS.md)**  
-YAML workflows with typed parameters, conditional gates, and checkpoint/resume. Composable — one playbook can call another.
+YAML workflows with typed parameters, conditional gates, and checkpoint/resume.
 
 </td>
 <td valign="top">
 
-<strong style="color:#A3FF66;">08</strong> · **[4 providers](docs/MODELS.md), hot-swappable**  
-Local llama.cpp is the default and fully supported. OpenAI, Anthropic, and Ollama are available but WIP — see [Models](docs/MODELS.md) for details.
+<strong style="color:#A3FF66;">08</strong> · **[5 provider backends](docs/MODELS.md)**  
+Local llama.cpp is the default; Strata is the supported Linux high-end backend. OpenAI, Anthropic, and Ollama are available but WIP — see [Models](docs/MODELS.md) for details. Providers are selected in `settings.json` at startup; `/model` switches the model on the active provider.
 
 </td>
 </tr>
@@ -189,7 +191,7 @@ Agent on your laptop, inference on a separate GPU machine. No port forwarding �
 <td valign="top">
 
 <strong style="color:#A3FF66;">10</strong> · **Vision**  
-Attach images in chat with `@screenshot.png` or ask the agent to read any image file. The multimodal projector (mmproj) is downloaded automatically at setup. Supported formats: PNG, JPG, GIF, WebP. Large images are auto-resized to fit within VRAM budget. Enable with `OPENMONO_VISION_ENABLED=1`.
+Attach images in chat with `@screenshot.png` or ask the agent to read any image file. The multimodal projector (mmproj) is downloaded automatically at setup. Supported formats: PNG, JPG, GIF, WebP. Large images are auto-resized to fit within the image budget. Enable vision in `settings.json` (`inference.vision_enabled`) or set `OPENMONO_VISION_ENABLED=1`.
 
 → [Vision setup & usage](docs/SETUP.md#vision)
 
@@ -229,17 +231,30 @@ The full agent loop in your editor sidebar — streaming responses, live Markdow
 ## Supported Hardware
 
 <div align="center">
-  <img src="docs/assets/table-hardware-linux.svg" alt="Linux — NVIDIA GPU / CPU: supported models, accuracy, and speed by VRAM/RAM" width="800" />
+  <img src="docs/assets/table-hardware-linux.svg" alt="Linux — NVIDIA GPU and AMD iGPU: the auto-selected model, context size, and speed for each VRAM and RAM configuration" width="800" />
 </div>
 
 <br/>
 
 <div align="center">
-  <img src="docs/assets/table-hardware-macos.svg" alt="macOS — Apple Silicon (Metal): supported models, accuracy, context, and speed by unified memory" width="800" />
+  <img src="docs/assets/table-hardware-macos.svg" alt="macOS — Apple Silicon (Metal): the auto-selected model, context size, and speed for each unified-memory size" width="800" />
 </div>
 
-<sub>Auto-detects GPU · CPU · no config needed. On Linux, 12 GB and 16 GB cards run lower-accuracy models; use a 24 GB card for best results. Requires Ubuntu 26.04 LTS (recommended) or 25.10. On macOS, the full and inference roles require Apple Silicon (M1+); 64 GB+ unified memory is the recommended, tested configuration. Less than 64 GB is not encouraged — smaller model, much tighter context window. Intel Macs: agent-only mode. macOS 14+ (Sonoma/Sequoia) recommended.</sub>
+<sub>Setup auto-detects GPU · iGPU/APU · no config needed and picks the best model your hardware can run — no prompts. Pass <code>--options</code> to choose the model, vision, and parallel slots yourself, or <code>--model=&lt;name&gt;</code> to pin one. The pick depends on VRAM <em>and</em> system RAM: on Linux a 24 GB+ card gets Qwen3.8-Flash-Next (Strata) on a 48 GB-class box and Qwen3.8-27B below that, a 16 GB card keeps Qwen3.8-27B, a 12 GB card and AMD 780M iGPUs (32 GB+ RAM) get Ternary-Bonsai-2-27B via Prism. Requires Ubuntu 26.04 LTS (recommended) or 25.10. On macOS, the full and inference roles require Apple Silicon (M1+); 48 GB+ unified memory is the recommended, tested configuration. 24–47 GB and 16–23 GB Macs run Ternary-Bonsai (PQ2_0 / PTQ1_0) with a tighter context window. Intel Macs: agent-only mode. macOS 14+ (Sonoma/Sequoia) recommended.</sub>
 
+
+---
+
+<!--  ── NEED HELP ───────────────────────────────────────────── -->
+## Need Help?
+
+Stuck on setup, or want OpenMono on your own servers? We install and support private OpenMono deployments — contact us, book a call, and we'll walk you through getting it running on your hardware. Pick your hardware. We handle the rest.
+
+<div align="center">
+  <a href="https://openmonoagent.ai/contact">
+    <img src="https://img.shields.io/badge/Need_Help%3F-Book_a_call-FF8C00?style=for-the-badge&labelColor=555555" alt="Need help? Contact us to book a setup call" />
+  </a>
+</div>
 
 ---
 
@@ -254,6 +269,10 @@ The full agent loop in your editor sidebar — streaming responses, live Markdow
   <tr>
     <td style="padding:9px 16px;border-bottom:1px solid #1A1A1A;border-right:1px solid #232323;"><a href="docs/SETUP.md"><code style="font-size:12px;">Setup &amp; commands</code></a></td>
     <td style="padding:9px 16px;border-bottom:1px solid #1A1A1A;"><sub style="color:#C8C8C0;">Daily commands, TUI vs classic, flags</sub></td>
+  </tr>
+  <tr>
+    <td style="padding:9px 16px;border-bottom:1px solid #1A1A1A;border-right:1px solid #232323;"><a href="docs/DEPLOYMENT-MODES.md"><code style="font-size:12px;">Deployment modes</code></a></td>
+    <td style="padding:9px 16px;border-bottom:1px solid #1A1A1A;"><sub style="color:#C8C8C0;">Single-box vs split-box, server-ops runbook</sub></td>
   </tr>
   <tr>
     <td style="padding:9px 16px;border-bottom:1px solid #1A1A1A;border-right:1px solid #232323;"><a href="docs/ARCHITECTURE.md"><code style="font-size:12px;">Architecture</code></a></td>
@@ -316,6 +335,12 @@ The full agent loop in your editor sidebar — streaming responses, live Markdow
   <br>
   <em>"AI shouldn't be a subscription you rent. It should be infrastructure you own —<br>sitting on your desk, serving your code, answering only to you."</em><br><br>
   <sub>— Startup Hakk</sub>
+</div>
+
+<br>
+
+<div align="center">
+  <a href="https://openmonoagent.ai/contact"><strong>Need Help?</strong></a> · <a href="CONTRIBUTING.md"><strong>Contributing</strong></a>
 </div>
 
 <br>

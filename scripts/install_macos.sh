@@ -11,13 +11,21 @@ set -euo pipefail
 # Options (via env or openmono CLI flags):
 #   OPENMONO_ROLE         Install role: full (default), inference, or agent
 #   OPENMONO_VERBOSE=1    Show detailed command output
-#   LLAMA_PORT=7474       llama-server host port (default 7474)
+#   INFERENCE_PORT=7474   llama-server host port (default 7474)
 # ──────────────────────────────────────────────────────────────────────────────
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_DIR="$(dirname "$SCRIPT_DIR")"  # repo root (parent of scripts/)
 # shellcheck source=lib/log.sh
 source "$SCRIPT_DIR/lib/log.sh"
+# shellcheck source=lib/prism.sh
+source "$SCRIPT_DIR/lib/prism.sh"
+# shellcheck source=lib/model-catalog.sh
+source "$SCRIPT_DIR/lib/model-catalog.sh"
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR/lib/vision.sh"
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR/lib/inference-settings.sh"
 
 # ── Context size presets (tokens) — edit here to change globally ──────────────
 CTX_48G=196608       # >=48 GB Metal  q8_0 KV
@@ -37,44 +45,88 @@ CTX_VISION_16G=12288 # 16 GB + mmproj   (~25% reduction)
 #   27B dense    — 52 layers, 8 KV heads, head_dim 128 → KV  ~6.5 GB @ q8_0/65536
 #   9B dense     — 36 layers, 8 KV heads, head_dim 128 → KV  ~1.1 GB @ q8_0/16384
 select_model() {
-    local ram_gb="${1:-0}"
-    if [ "$ram_gb" -ge 48 ]; then
-        # ~17.6 GB weights + ~18.5 GB KV + ~6 GB OS ≈ 42 GB on 48 GB Mac
-        MODEL_NAME="Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"
-        MODEL_URL="https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/main/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"
-        MODEL_ACCURACY="standard"
-        MODEL_MMPROJ="mmproj-qwen3.6-35B-A3B-F16.gguf"
-        MODEL_MMPROJ_URL="https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/main/mmproj-F16.gguf"
-        _MODEL_LABEL="Qwen3.6-35B-A3B (~17.6GB) [Apple Silicon >=48GB — standard]"
-        _CTX_SIZE=$CTX_48G
-    elif [ "$ram_gb" -ge 32 ]; then
-        # ~5 GB weights + ~1.1 GB KV + ~6 GB OS ≈ 12 GB on 32 GB Mac
-        MODEL_NAME="Qwen3.5-9B-UD-Q4_K_XL.gguf"
-        MODEL_URL="https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-UD-Q4_K_XL.gguf"
-        MODEL_ACCURACY="lower"
-        MODEL_MMPROJ="mmproj-qwen3.5-9B-F16.gguf"
-        MODEL_MMPROJ_URL="https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/mmproj-F16.gguf"
-        _MODEL_LABEL="Qwen3.5-9B-UD-Q4_K_XL (~5GB) [Apple Silicon 32GB]"
-        _CTX_SIZE=$CTX_32G
-    elif [ "$ram_gb" -ge 16 ]; then
-        # ~5 GB weights + ~1.1 GB KV + ~6 GB OS ≈ 12 GB on 16 GB Mac
-        MODEL_NAME="Qwen3.5-9B-UD-Q4_K_XL.gguf"
-        MODEL_URL="https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-UD-Q4_K_XL.gguf"
-        MODEL_ACCURACY="lower"
-        MODEL_MMPROJ="mmproj-qwen3.5-9B-F16.gguf"
-        MODEL_MMPROJ_URL="https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/mmproj-F16.gguf"
-        _MODEL_LABEL="Qwen3.5-9B-UD-Q4_K_XL (~5GB) [Apple Silicon 16GB — lower accuracy]"
-        _CTX_SIZE=$CTX_16G
-    else
-        MODEL_NAME="Qwen3.5-9B-UD-Q4_K_XL.gguf"
-        MODEL_URL="https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-UD-Q4_K_XL.gguf"
-        MODEL_ACCURACY="lower"
-        MODEL_MMPROJ=""
-        MODEL_MMPROJ_URL=""
-        _MODEL_LABEL="Qwen3.5-9B-UD-Q4_K_XL (~5GB) [Apple Silicon <16GB]"
-        _CTX_SIZE=$CTX_8G
+    local ram_gb="${1:-0}" key
+    # Data-driven: the macos tier ladder (>=48/32/16/else->8) and per-tier
+    # ctx/name/url/label live in scripts/models.json. mc_pick_tier mirrors the
+    # old >= ladders (largest tier key <= ram_gb, clamped to the smallest).
+    key="$(mc_pick_tier qwen macos "$ram_gb")"
+    [ -n "$key" ] || key=8
+    mc_select qwen macos "$key"
+    _CTX_SIZE="$(mc_tier_field qwen macos "$key" ctx)"
+}
+
+# Bonsai picker for Apple Silicon. Called AFTER unified-memory detection in
+# Step 2 (TOTAL_MEM must be set). Sets IS_BONSAI=1 and overrides
+# MODEL_*/_MODEL_LABEL/_CTX_SIZE when Bonsai is chosen.
+#
+# Tiering (unified memory is shared with the OS, so budget ~6-8GB for macOS):
+#   ≥24GB → PQ2_0 (7.2GB weights leave ample room for KV + mmproj)
+#   16-23GB → PTQ1_0 only (5.95GB; PQ2_0 would swap-thrash)
+# Bonsai is the default on both tiers — it is the better model on this hardware.
+# Pass --options to pick Qwen instead. An explicit --model=bonsai-pq2 below 24GB
+# still fails here, before any multi-GB download.
+prompt_bonsai_macos() {
+    local choice="${OPENMONO_MODEL:-auto}" _bonsai_want=""
+    if [ "$choice" = "auto" ] && [ "${OPENMONO_SETUP_OPTIONS:-0}" != "1" ]; then
+        choice="$(mc_auto_pick)"
+        info "Auto-selected model '$choice' — $(mc_auto_reason)"
+        info "Pass --options to choose the model, vision and parallel slots yourself"
     fi
-    MODEL_ALIAS="${MODEL_NAME%.gguf}"
+    case "$choice" in
+        bonsai-pq2|bonsai|pq2) _bonsai_want=pq2 ;;
+        bonsai-ptq1|ptq1)      _bonsai_want=ptq1 ;;
+        qwen) return 0 ;;
+        auto) ;;
+        *) warn "Unknown --model=$choice — using Qwen"; return 0 ;;
+    esac
+    if [ -z "$_bonsai_want" ]; then
+        # --options with no explicit flag: ask. 16GB Macs are offered PTQ1_0
+        # only; PQ2_0 appears from 24GB up.
+        if [ ! -t 0 ] || [ "${TOTAL_MEM:-0}" -lt 16 ]; then return 0; fi
+        flush_stdin
+        echo ""
+        echo "  Which model for this Mac? (${TOTAL_MEM}GB unified memory)"
+        echo ""
+        if [ "$TOTAL_MEM" -ge 24 ]; then
+        echo "  1) Ternary-Bonsai-2-27B PQ2_0 (~7.2GB) (default)"
+        echo "  2) Ternary-Bonsai-2-27B PTQ1_0 (~5.9GB)"
+        echo "  3) Qwen (tested on Metal)"
+        else
+        echo "  1) Ternary-Bonsai-2-27B PTQ1_0 (~5.9GB) (default)"
+        echo "  2) Qwen (tested on Metal)"
+        fi
+        echo ""
+        printf "  Enter a number [default: 1]: "
+        read -r -n 1 _bmc_choice; echo ""
+        case "${_bmc_choice:-1}" in
+            1) _bonsai_want=$([ "$TOTAL_MEM" -ge 24 ] && echo pq2 || echo ptq1) ;;
+            2) _bonsai_want=$([ "$TOTAL_MEM" -ge 24 ] && echo ptq1 || echo qwen) ;;
+            3) [ "$TOTAL_MEM" -ge 24 ] && _bonsai_want=qwen || return 0 ;;
+            *) return 0 ;;
+        esac
+        [ "$_bonsai_want" = "qwen" ] && return 0
+        [ -z "$_bonsai_want" ] && return 0
+    fi
+    if [ "$_bonsai_want" = "pq2" ] && [ "${TOTAL_MEM:-0}" -lt 24 ]; then
+        die "Bonsai PQ2_0 on macOS needs ≥24GB unified memory (this Mac: ${TOTAL_MEM}GB). Use --model=bonsai-ptq1 or --model=qwen."
+    fi
+    if [ "${TOTAL_MEM:-0}" -lt 16 ]; then
+        die "Bonsai on macOS needs ≥16GB unified memory (this Mac: ${TOTAL_MEM}GB). Re-run with --model=qwen."
+    fi
+    select_bonsai_model "$_bonsai_want"
+    if [ "$TOTAL_MEM" -ge 48 ]; then
+        _CTX_SIZE=98304
+    elif [ "$TOTAL_MEM" -ge 24 ]; then
+        _CTX_SIZE=65536
+    else
+        # 16 GB: Metal caps a process at recommendedMaxWorkingSetSize (~75% of
+        # physical, ~12 GB) and the native server always runs q8_0 KV. PTQ1_0
+        # 5.95 GB + mmproj 0.63 GB + 3.45 GB of KV at 32768 = 10.03 GB, which
+        # leaves macOS only ~2 GB. 16384 costs 8.30 GB — the same 16k the Qwen
+        # Metal tier already uses at 16 GB.
+        _CTX_SIZE=16384
+    fi
+    ok "Bonsai selected: $MODEL_NAME (ctx: $_CTX_SIZE)"
 }
 
 # Initialize Homebrew in PATH (installed by install_prereqs_macos.sh)
@@ -106,7 +158,7 @@ role_prompt
 
 case "$OPENMONO_ROLE" in
     full|inference|agent) ;;
-    *) echo "ERROR: Invalid OPENMONO_ROLE='$OPENMONO_ROLE' (expected: full, inference, agent)" >&2; exit 1 ;;
+    *) err "Invalid OPENMONO_ROLE='$OPENMONO_ROLE' (expected: full, inference, agent)"; exit 1 ;;
 esac
 
 # Step counts vary by role.
@@ -216,10 +268,50 @@ if [ "$OPENMONO_ROLE" != "agent" ]; then
         die "Only ${TOTAL_MEM}GB RAM detected. 16GB unified memory is the minimum for inference.
 Upgrade to a Mac with at least 16GB, or use the 'agent' role and connect to a separate inference server."
     fi
+    IS_BONSAI=0
     select_model "$TOTAL_MEM"
+    # Model policy: Bonsai is the default from 16GB unified memory up (PQ2_0 at
+    # ≥24GB, PTQ1_0 at 16-23GB) — see mc_auto_pick in lib/model-catalog.sh and
+    # docs/MODELS.md. Without --options setup does not ask; --model=bonsai-* /
+    # --model=qwen always wins. Metal has no Strata build, so CAN_STRATA stays 0.
+    CAN_BONSAI=1
+    # Bonsai picker fires here — AFTER unified-memory detection.
+    prompt_bonsai_macos
 
-    # Reduce context when mmproj is active (encoder needs ~1-2 GB burst)
+    # Vision is a user choice (when the model offers a projector): ask before
+    # deciding context size — declining restores the full context. OPENMONO_VISION=
+    # yes|no presets it non-interactively.
     if [ -n "${MODEL_MMPROJ:-}" ]; then
+        _vision_choice="${OPENMONO_VISION:-}"
+        if [ -z "$_vision_choice" ]; then
+            _vision_choice="$(mc_vision_default)"
+            [ "$_vision_choice" = "ask" ] && _vision_choice=""
+        fi
+        if [ -z "$_vision_choice" ] && [ -t 0 ]; then
+            flush_stdin
+            echo ""
+            echo "  Enable vision (image input)? The projector adds ~900 MB of"
+            echo "  weights and ~1-2 GB of unified-memory headroom; it lets the"
+            echo "  agent read screenshots and image files (@image.png in chat)."
+            printf "  Enable vision? [Y/n]: "
+            read -r _vision_answer || _vision_answer=""
+            case "${_vision_answer:-Y}" in
+                [Nn]*) _vision_choice="no" ;;
+                *)     _vision_choice="yes" ;;
+            esac
+        elif [ -z "$_vision_choice" ]; then
+            _vision_choice="yes"   # non-interactive: catalog default (on when available)
+        fi
+        if [ "$_vision_choice" = "no" ] || [ "$_vision_choice" = "off" ]; then
+            MODEL_MMPROJ=""
+            MODEL_MMPROJ_URL=""
+            info "Vision disabled by choice — full context kept (no mmproj)."
+        fi
+    fi
+
+    # Reduce context when mmproj is active (encoder needs ~1-2 GB burst).
+    # Qwen presets only — Bonsai ctx is already sized conservatively above.
+    if [ "${IS_BONSAI:-0}" != "1" ] && [ -n "${MODEL_MMPROJ:-}" ]; then
         _CTX_ORIG=$_CTX_SIZE
         if   [ "$TOTAL_MEM" -ge 48 ]; then _CTX_SIZE=$CTX_VISION
         elif [ "$TOTAL_MEM" -ge 32 ]; then _CTX_SIZE=$CTX_VISION_32G
@@ -413,8 +505,12 @@ if [ "$OPENMONO_ROLE" != "agent" ]; then
     next_step "Installing llama.cpp (Metal)"
 
     # llama.cpp from Homebrew runs natively on the host, enabling Metal GPU
-    # acceleration on Apple Silicon. The agent Docker container reaches it via
-    # host.docker.internal, which Docker Desktop resolves automatically on macOS.
+    # acceleration on Apple Silicon. The endpoint is stored as 127.0.0.1
+    # (resolves everywhere on the host); every container consumer maps it
+    # for its own network — the bridge and the openmono CLI rewrite loopback
+    # to host.docker.internal on macOS (Docker Desktop) and to the compose
+    # service names on Linux. Never store host.docker.internal here: macOS
+    # itself does not resolve it, so host-side readers would break.
     if ! command -v llama-server &>/dev/null; then
         info "Installing llama.cpp via Homebrew..."
         run brew install llama.cpp || die "brew install llama.cpp failed"
@@ -422,11 +518,31 @@ if [ "$OPENMONO_ROLE" != "agent" ]; then
         ok "llama-server already installed: $(command -v llama-server)"
     fi
 
+    # Prism fork for Bonsai (Metal ternary kernels) — built on-machine, kept
+    # outside the repo so `openmono upgrade` never touches it. The brew stock
+    # binary above stays untouched for the Qwen path.
+    PRISM_BINARY=""
+    if [ "${IS_BONSAI:-0}" = "1" ]; then
+        build_prism_macos || die "Prism fork build failed — cannot run Bonsai without it"
+        PRISM_BINARY="$(prism_macos_bin)"
+        warn "First llama-server start compiles Metal shaders — can take several minutes."
+        warn "Don't kill it; watch progress with: openmono logs"
+    fi
+
     # Write the full inference config to ~/.openmono/settings.json.
     # This is the single source of truth for all runtime commands (start/stop/status).
     SETTINGS_FILE="$HOME/.openmono/settings.json"
     mkdir -p "$(dirname "$SETTINGS_FILE")"
     [ ! -f "$SETTINGS_FILE" ] && echo '{}' > "$SETTINGS_FILE"
+
+    # Preserve an existing port when re-running setup; default 7474.
+    INFERENCE_PORT="${INFERENCE_PORT:-${LLAMA_PORT:-}}"
+    if [ -z "${INFERENCE_PORT:-}" ] && command -v jq &>/dev/null; then
+        INFERENCE_PORT="$(jq -r '.inference.port // empty' "$SETTINGS_FILE" 2>/dev/null || true)"
+    fi
+    [ "${INFERENCE_PORT:-}" = "8080" ] && INFERENCE_PORT=7474
+    INFERENCE_PORT="${INFERENCE_PORT:-7474}"
+    export INFERENCE_PORT
 
     # Generate a new API key for this install (stored in docker/.env — single source of truth)
     LLAMA_API_KEY="$(openssl rand -hex 24)"
@@ -441,19 +557,33 @@ if [ "$OPENMONO_ROLE" != "agent" ]; then
     mv /tmp/env.tmp "$ENV_FILE"
     chmod 0600 "$ENV_FILE"
 
+    if [ "$(mc_parallel_slots_default)" = "ask" ]; then
+        om_choose_parallel_slots 1
+    else
+        OM_PARALLEL_SLOTS="${OPENMONO_PARALLEL_SLOTS:-1}"
+        info "Parallel slots: $OM_PARALLEL_SLOTS (pass --options to change)"
+    fi
+    PARALLEL_SLOTS="$OM_PARALLEL_SLOTS"
+    # Warn-only: llama.cpp --parallel N reserves N independent full-context KV
+    # buffers, so on unified memory the slot count competes with the weights.
+    om_warn_parallel_slots native-metal "$PARALLEL_SLOTS" "${_CTX_SIZE:-}"
+    export PARALLEL_SLOTS
+
     python3 - "$SETTINGS_FILE" \
-        "${LLAMA_PORT:-7474}" \
+        "${INFERENCE_PORT:-7474}" \
         "$MODEL_NAME" \
         "$MODEL_ALIAS" \
         "$_CTX_SIZE" \
         "$INSTALL_DIR" \
         "$LLAMA_API_KEY" \
-        "${MMPROJ_FILE:-}" <<'PYEOF'
+        "${MMPROJ_FILE:-}" \
+        "${PRISM_BINARY:-}" \
+        "$PARALLEL_SLOTS" <<'PYEOF'
 import json, sys
-path, port, model_name, model_alias, ctx_size, install_dir, api_key, mmproj_path = sys.argv[1:9]
+path, port, model_name, model_alias, ctx_size, install_dir, api_key, mmproj_path, binary, parallel_slots = sys.argv[1:11]
 with open(path) as f:
     cfg = json.load(f)
-cfg.setdefault("llm", {})["endpoint"] = f"http://host.docker.internal:{port}"
+cfg.setdefault("llm", {})["endpoint"] = f"http://127.0.0.1:{port}"
 cfg.setdefault("llm", {})["api_key"] = api_key
 cfg["inference"] = {
     "mode": "native-metal",
@@ -461,32 +591,62 @@ cfg["inference"] = {
     "model_alias": model_alias,
     "ctx_size": int(ctx_size),
     "port": int(port),
+    "parallel_slots": int(parallel_slots),
     "install_dir": install_dir,
-    "mmproj_path": mmproj_path if mmproj_path else ""
+    "mmproj_path": mmproj_path if mmproj_path else "",
+    "binary": binary if binary else ""
 }
 with open(path, "w") as f:
     json.dump(cfg, f, indent=2)
 PYEOF
     ok "Inference config written to: $SETTINGS_FILE"
     detail "  model     : $MODEL_NAME"
+    detail "  binary    : ${PRISM_BINARY:-$(command -v llama-server)}"
     detail "  ctx_size  : $_CTX_SIZE"
-    detail "  endpoint  : http://host.docker.internal:${LLAMA_PORT:-7474}"
+    detail "  slots     : $PARALLEL_SLOTS"
+    detail "  endpoint  : http://127.0.0.1:${INFERENCE_PORT:-7474}"
     detail "  api_key   : [generated, stored in docker/.env]"
 
     # Update docker/.env with model and vision state
-    grep -v -E "^MODEL_MMPROJ=|^OPENMONO_VISION_ENABLED=" "$ENV_FILE" > /tmp/env.tmp 2>/dev/null || true
+    grep -v -E "^MODEL_MMPROJ=|^OPENMONO_VISION_ENABLED=|^INFERENCE_PARALLEL=|^LLAMA_PARALLEL=|^STRATA_PARALLEL=" "$ENV_FILE" > /tmp/env.tmp 2>/dev/null || true
     mv /tmp/env.tmp "$ENV_FILE"
     printf "MODEL_MMPROJ=%s\n" "${MODEL_MMPROJ:-}" >> "$ENV_FILE"
+    printf "INFERENCE_PARALLEL=%s\n" "$PARALLEL_SLOTS" >> "$ENV_FILE"
     if [ -n "${MODEL_MMPROJ:-}" ]; then
         printf "OPENMONO_VISION_ENABLED=1\n" >> "$ENV_FILE"
+        om_persist_vision true
     else
         printf "OPENMONO_VISION_ENABLED=0\n" >> "$ENV_FILE"
+        om_persist_vision false
     fi
 fi
 
-# ── Step 7: Build Docker images (skipped for inference) ──────────────────────
+# ── Step 7: Build Docker images ──────────────────────────────────────────────
 
-if [ "$OPENMONO_ROLE" != "inference" ]; then
+# Inference-only boxes don't need the agent image — ask instead of silently
+# skipping. Non-interactive defaults to No (preset OPENMONO_BUILD_AGENT=1).
+_build_agent=1
+if [ "$OPENMONO_ROLE" = "inference" ]; then
+    _build_agent="${OPENMONO_BUILD_AGENT:-}"
+    if [ -z "$_build_agent" ]; then
+        if [ ! -t 0 ]; then
+            _build_agent=0
+        else
+            echo ""
+            printf "  Build the agent Docker image on this inference box? Default No [y/N]: "
+            read -r _ba || _ba=""
+            echo ""
+            case "${_ba:-}" in
+                [Yy]|[Yy]es) _build_agent=1 ;;
+                *) _build_agent=0 ;;
+            esac
+        fi
+    fi
+fi
+
+if [ "$OPENMONO_ROLE" != "inference" ] || [ "$_build_agent" = "1" ]; then
+    # The inference role only counts this step when the build is actually run.
+    [ "$OPENMONO_ROLE" = "inference" ] && TOTAL_STEPS=7
     next_step "Building Docker images"
 
     cd "$INSTALL_DIR/docker"
@@ -509,6 +669,8 @@ if [ "$OPENMONO_ROLE" != "inference" ]; then
     fi
 
     ok "Docker images built"
+else
+    detail "Skipping agent image (inference-only box). Add later: docker compose build agent"
 fi
 
 # ── Step 8: Start llama-server (inference + full only) ──────────────────────
@@ -518,12 +680,114 @@ if [ "$OPENMONO_ROLE" != "agent" ]; then
 
     # Use openmono start to launch llama-server via scripts/macos/inference.sh
     # This ensures consistency between install and runtime startup paths.
-    export LLAMA_PORT="${LLAMA_PORT:-7474}"
+    export INFERENCE_PORT="${INFERENCE_PORT:-7474}"
     if ! "$INSTALL_DIR/openmono" start; then
         warn "llama-server startup did not complete cleanly"
         warn "Check the log: openmono logs"
         warn "Or restart manually: openmono start"
     fi
+fi
+
+# ── Optional: bare-metal host sub-agent (agent roles only — never inference)
+# Mirrors the Linux installer: prompt (TTY only; non-interactive defaults to
+# No), then host-command policy, then sudo policy, then install-host-bridge.sh
+# with the answers as non-interactive presets. Deliberately outside the step
+# counter so TOTAL_STEPS stays valid for every role.
+if [ "$OPENMONO_ROLE" != "inference" ]; then
+    _bridge_answer="${OPENMONO_HOST_BRIDGE:-}"
+    if [[ -z "$_bridge_answer" ]]; then
+        if [[ ! -t 0 ]]; then
+            info "Skipping host sub-agent (non-interactive, default No). Add it later with:"
+            info "  OPENMONO_HOST_BRIDGE=1 bash scripts/install_macos.sh  # or: bash scripts/install-host-bridge.sh"
+        else
+            echo ""
+            echo "  ── OPTIONAL: bare-metal host operator (DEFAULT: No) ──"
+            echo "  This BREAKS the container sandbox. If installed, the agent can"
+            echo "  run HOST commands directly on THIS MAC as your user (pull, build,"
+            echo "  install, docker, launchctl, redeploy, troubleshoot). Every command"
+            echo "  is audit-logged, sudo stays OFF unless you separately opt in."
+            echo "  Only install on a Mac you operate. Coding laptops: say No."
+            echo "  You can add it later with: bash scripts/install-host-bridge.sh"
+            echo ""
+            printf "  Install the host sub-agent? Default No [y/N] (Enter=No): "
+            read -r _bridge_answer || _bridge_answer=""
+            echo ""
+        fi
+    fi
+    case "${_bridge_answer:-}" in
+        1|[Yy]|[Yy]es)
+            # Second explicit consent: "allow" must be chosen, never assumed.
+            # OPENMONO_HOST_EXEC_DEFAULT=ask|allow presets it non-interactively.
+            _bridge_policy="${OPENMONO_HOST_EXEC_DEFAULT:-}"
+            if [[ -z "$_bridge_policy" && -t 0 ]]; then
+                echo "  Host commands run as your user. Choose how to confirm them:"
+                echo "    1) Ask every time (recommended) — prompt [y/N] per host command"
+                echo "    2) Allow routine without asking — git/docker/status run immediately"
+                echo "       (deny list + sudo rules + audit log still apply)"
+                echo ""
+                printf "  Host command policy? [1/2] (Default 1=Ask): "
+                read -r _bridge_policy_answer || _bridge_policy_answer=""
+                echo ""
+                case "${_bridge_policy_answer:-}" in
+                    2|[Aa]llow) _bridge_policy="allow" ;;
+                    *) _bridge_policy="ask" ;;
+                esac
+            fi
+            # Fail closed: anything but an explicit "allow" becomes "ask".
+            case "${_bridge_policy:-}" in
+                [Aa]llow) export OPENMONO_HOST_EXEC_DEFAULT="allow" ;;
+                *) export OPENMONO_HOST_EXEC_DEFAULT="ask" ;;
+            esac
+            # Sudo policy preset (never silent): OPENMONO_HOST_SUDO presets
+            # it non-interactively. When unset and on a TTY, ask; fail
+            # closed to the default (ask) otherwise. install-host-bridge.sh
+            # turns this into the --allow-sudo / --no-sudo --init flag.
+            _bridge_sudo="${OPENMONO_HOST_SUDO:-}"
+            if [[ -z "$_bridge_sudo" && -t 0 ]]; then
+                echo "  The agent may need sudo for host commands that require it"
+                echo "  (service restarts, package installs, log reads). Note: Touch ID"
+                echo "  does not satisfy bridge sudo — the typed password is required."
+                echo "  Choose how to handle privilege escalation:"
+                echo "    1) Ask (recommended) — confirm each escalation with [y/N];"
+                echo "       non-interactive sessions fail closed to No"
+                echo "    2) Allow — run escalations without confirming (still audited)"
+                echo "    3) Deny — never escalate; host commands run as your user only"
+                echo ""
+                printf "  Sudo policy? [1/2/3] (Default 1=Ask): "
+                read -r _bridge_sudo_answer || _bridge_sudo_answer=""
+                echo ""
+                case "${_bridge_sudo_answer:-}" in
+                    2|[Aa]llow|[Yy]|[Yy]es) _bridge_sudo="1" ;;
+                    3|[Dd]eny|[Nn]|[Nn]o)  _bridge_sudo="0" ;;
+                    *) _bridge_sudo="" ;;   # default: ask
+                esac
+            fi
+            case "${_bridge_sudo:-}" in
+                1|[Yy]|[Yy]es) export OPENMONO_HOST_SUDO="1" ;;
+                0|[Nn]|[Nn]o)  export OPENMONO_HOST_SUDO="0" ;;
+                *) : ;;   # leave unset → bridge defaults to "ask"
+            esac
+            info "Installing host sub-agent (host-exec default: $OPENMONO_HOST_EXEC_DEFAULT)..."
+            if bash "$SCRIPT_DIR/install-host-bridge.sh"; then
+                ok "Host sub-agent installed"
+                export OPENMONO_HOST_BRIDGE=1
+                case "${OPENMONO_HOST_SUDO:-}" in
+                    1|[Yy]|[Yy]es)
+                        info "Sudo: allow — privilege escalations run without confirming (still audited)." ;;
+                    0|[Nn]|[Nn]o)
+                        info "Sudo: deny — host commands run as your user only; escalation is refused." ;;
+                    *)
+                        info "Sudo: ask — each escalation is confirmed [y/N]; non-interactive sessions fail closed to No." ;;
+                esac
+                info "First run of 'openmono agent --host' confirms the run-as user."
+                info "Change later with: openmono config set host.sudo_policy ask|allow|deny"
+                info "Host settings: openmono config set host.exec_default|host.run_as|host.timeout_ms <value>"
+            else
+                warn "Host sub-agent install failed — container agent still works; retry: bash scripts/install-host-bridge.sh"
+                export OPENMONO_HOST_BRIDGE=0
+            fi
+            ;;
+    esac
 fi
 
 # ── Shell integration ─────────────────────────────────────────────────────────
@@ -549,7 +813,7 @@ echo ""
 
 case "$OPENMONO_ROLE" in
     full)
-        echo "  llama-server port : ${LLAMA_PORT:-7474}"
+        echo "  llama-server port : ${INFERENCE_PORT:-7474}"
         echo "  mode              : Metal GPU (native llama.cpp)"
         echo "  model             : ${MODEL_NAME:-}"
         if [ -n "${MODEL_MMPROJ:-}" ]; then
@@ -557,7 +821,7 @@ case "$OPENMONO_ROLE" in
         fi
         ;;
     inference)
-        echo "  llama-server port : ${LLAMA_PORT:-7474}"
+        echo "  llama-server port : ${INFERENCE_PORT:-7474}"
         echo "  mode              : Metal GPU (native llama.cpp)"
         echo "  model             : ${MODEL_NAME:-}"
         if [ -n "${MODEL_MMPROJ:-}" ]; then
@@ -576,7 +840,13 @@ if [ "${OPENMONO_ROLE}" != "agent" ] && [ -n "${MODEL_MMPROJ:-}" ]; then
     echo ""
     printf "${BOLD}${CYAN}Vision (LLaVA) — Enabled${NC}\n"
     printf "  ${DIM}Vision encoder (mmproj) loaded with the model (~1-2 GB unified memory)${NC}\n"
-    printf "  ${DIM}Context: reduced $((_CTX_ORIG/1024))k → $((_CTX_SIZE/1024))k to fit encoder burst${NC}\n"
+    # Bonsai sizes ctx conservatively up front — no reduction step ran, so
+    # _CTX_ORIG only exists on the Qwen path.
+    if [ -n "${_CTX_ORIG:-}" ] && [ "${_CTX_ORIG}" != "${_CTX_SIZE}" ]; then
+        printf "  ${DIM}Context: reduced $((_CTX_ORIG/1024))k → $((_CTX_SIZE/1024))k to fit encoder burst${NC}\n"
+    else
+        printf "  ${DIM}Context: $_CTX_SIZE tokens (unchanged — sized for the encoder burst)${NC}\n"
+    fi
     printf "\n"
     printf "  ${DIM}Usage: type @image.png or @screenshot.png in chat${NC}\n"
     printf "  ${DIM}  Examples:${NC}\n"
@@ -588,6 +858,12 @@ if [ "${OPENMONO_ROLE}" != "agent" ] && [ -n "${MODEL_MMPROJ:-}" ]; then
     echo ""
 fi
 
+# ── Vision note (agent role) ────────────────────────────────────────────
+# Whether the remote endpoint actually serves images is detected at startup
+# from the server's /props capabilities (modalities.vision) — no install-time
+# guess to go stale. Optional manual override:
+#   openmono config set inference.vision_enabled true|false
+
 # ── Done ──────────────────────────────────────────────────────────────────────
 # The shell restart and docker group activation is handled by openmono cmd_setup
 # so that the post-install guidance is shown before the shell restarts.
@@ -596,8 +872,10 @@ fi
 if [[ -n "${OPENMONO_ENV_FILE:-}" ]]; then
     cat > "$OPENMONO_ENV_FILE" <<ENVEOF
 export INSTALL_DIR="$INSTALL_DIR"
-export LLAMA_PORT="${LLAMA_PORT:-7474}"
+export INFERENCE_PORT="${INFERENCE_PORT:-7474}"
+export INFERENCE_PARALLEL="${INFERENCE_PARALLEL:-${PARALLEL_SLOTS:-1}}"
 export OPENMONO_ROLE="$OPENMONO_ROLE"
+export OPENMONO_HOST_BRIDGE="${OPENMONO_HOST_BRIDGE:-0}"
 export MODEL_NAME="${MODEL_NAME:-}"
 export MODEL_ACCURACY="${MODEL_ACCURACY:-standard}"
 ENVEOF

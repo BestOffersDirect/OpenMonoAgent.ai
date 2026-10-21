@@ -1,0 +1,11 @@
+{
+  "llm": {
+    "endpoint": "http://localhost:7474",
+    "model": "Qwen3.8-Flash-Next",
+    "api_key": ""
+  },
+  "inference": {
+    "port": 7474,
+    "parallel_slots": 1
+  }
+}
