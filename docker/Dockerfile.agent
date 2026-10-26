@@ -10,7 +10,7 @@
 # Build from the `public/` directory:
 #   docker build -f public/docker/Dockerfile.agent -t openmono/agent:latest public/
 
-FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
+FROM mcr.microsoft.com/dotnet/sdk:10.0.403 AS build
 WORKDIR /src
 
 # Solution-level files for restore layer caching.
@@ -35,7 +35,7 @@ RUN dotnet publish src/OpenMono.Cli/OpenMono.Cli.csproj \
 # out to git / ripgrep / patch / python and the slim aspnet image doesn't ship
 # those.
 
-FROM mcr.microsoft.com/dotnet/sdk:10.0 AS runtime
+FROM mcr.microsoft.com/dotnet/sdk:10.0.403 AS runtime
 
 # Optional apt mirror override. Leave empty (default) to use the base image's
 # mirror (ports.ubuntu.com on arm64 / archive.ubuntu.com on amd64). Set it when

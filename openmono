@@ -617,6 +617,8 @@ cmd_setup() {
                 echo "  --options     Ask about model, vision and parallel slots instead of defaulting them from"
                 echo "                hardware. Role, GPU mode, host-bridge consent and reboot still always ask."
                 echo "  --verbose     Show detailed command output (default: step-level progress)"
+                echo "  OPENMONO_DOTNET_UPDATE=0  Skip upgrading an older .NET SDK (setup prompts;"
+                echo "                non-interactive installs upgrade automatically to the patched SDK)."
                 echo ""
                 echo "Server sub-agent (opt-in add-on, full/agent only — never inference):"
                 echo "  Setup asks once (default No, breaks container sandbox when installed)."

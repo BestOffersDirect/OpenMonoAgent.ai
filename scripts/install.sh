@@ -58,6 +58,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_DIR="$(dirname "$SCRIPT_DIR")"  # repo root (parent of scripts/)
 # shellcheck source=lib/log.sh
 source "$SCRIPT_DIR/lib/log.sh"
+# shellcheck source=lib/dotnet.sh
+source "$SCRIPT_DIR/lib/dotnet.sh"
 # shellcheck source=lib/prism.sh
 source "$SCRIPT_DIR/lib/prism.sh"
 # shellcheck source=/dev/null
@@ -309,9 +311,15 @@ check_prerequisites() {
         fi
     fi
 
-    # .NET SDK (optional but recommended)
-    if ! command -v dotnet &>/dev/null; then
+    # .NET SDK: required for host-bridge / source builds. global.json enforces
+    # 10.0.403+ (Oct 2026 OOB); warn when the installed SDK predates it.
+    if ! command -v dotnet &>/dev/null && [[ ! -x "$DOTNET_INSTALL_DIR/dotnet" ]]; then
         warnings+=(".NET SDK not installed (optional, but recommended)")
+    else
+        _dotnet_sdk="$(dotnet_best_sdk)"
+        if ! dotnet_version_ge "$_dotnet_sdk" "$DOTNET_SDK_FLOOR"; then
+            warnings+=(".NET SDK ${_dotnet_sdk:-unknown} predates $DOTNET_SDK_FLOOR — update it for the Oct 2026 security fixes")
+        fi
     fi
 
     # Check for NVIDIA requirements if GPU is present

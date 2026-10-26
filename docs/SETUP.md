@@ -56,7 +56,7 @@ The installer will ask you one question before it does anything:
 
 The install runs in two phases, each with its own `[1/8]` → `[8/8]` progress.
 
-**Phase 1** installs prerequisites: Docker, .NET 10, build tools, and the NVIDIA stack if a GPU is found.
+**Phase 1** installs prerequisites: Docker, .NET 10 SDK 10.0.403+ (the October 2026 security patch), build tools, and the NVIDIA stack if a GPU is found. If an older .NET 10 SDK is already present, setup offers to install the patched SDK side-by-side; non-interactive runs do so automatically (`OPENMONO_DOTNET_UPDATE=0` opts out).
 
 **Phase 2** downloads the model, builds Docker images, and starts the inference server.
 
@@ -249,7 +249,7 @@ Phase 1 installs, via Homebrew where needed:
 - Core tools: `git`, `curl`, `jq`, `cmake`, `ripgrep`, `openblas`, `pkg-config`, `python3` (3.10+)
 - **llama.cpp** (Metal backend) — Apple Silicon only
 - **Docker** — Docker Desktop if present, otherwise Colima is installed and started
-- **.NET 10 SDK** (to `~/.dotnet`)
+- **.NET 10 SDK 10.0.403+** (to `~/.dotnet`; an older 10.x is upgraded side-by-side after a prompt)
 
 ### Model tiers (Apple Silicon unified memory)
 
