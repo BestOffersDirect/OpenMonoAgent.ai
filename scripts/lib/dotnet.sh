@@ -98,6 +98,29 @@ dotnet_activate_best() {
     fi
 }
 
+# Re-create the dotnet host binary so it gets a fresh vnode (same bytes, new
+# inode). macOS caches code-signature validation per vnode: if the file was
+# rewritten in place, the cache can keep reporting "Invalid Signature" and the
+# kernel SIGKILLs every exec (exit 137) even though `codesign --verify` passes
+# and the contents are intact. A new inode clears that state. Safe/idempotent
+# on Linux too — it is just an atomic copy.
+_dotnet_refresh_host() {
+    local bin="$DOTNET_INSTALL_DIR/dotnet" tmp
+    [[ -x "$bin" ]] || return 1
+    tmp="$(mktemp "$DOTNET_INSTALL_DIR/.dotnet.XXXXXX" 2>/dev/null)" || return 1
+    if ! cp -p "$bin" "$tmp" 2>/dev/null; then
+        rm -f "$tmp"
+        return 1
+    fi
+    chmod +x "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+    if ! mv -f "$tmp" "$bin" 2>/dev/null; then
+        rm -f "$tmp"
+        return 1
+    fi
+    hash -r 2>/dev/null || true
+    return 0
+}
+
 # Decide whether an older SDK should be replaced. Returns 1 when the user or
 # OPENMONO_DOTNET_UPDATE opts out.
 dotnet_should_update() {
@@ -138,6 +161,18 @@ dotnet_ensure_sdk() {
     local -a rc_files=("$@")
     local current rc
 
+    # A host that exists but reports no SDKs is broken, not absent. Recover it
+    # before prompting/downloading; on macOS this is the stale-vnode case above.
+    # Checked directly (not via dotnet_best_sdk) so a healthy dotnet on PATH
+    # cannot hide a broken ~/.dotnet host that the shell rc files will use later.
+    if [[ -x "$DOTNET_INSTALL_DIR/dotnet" ]] \
+        && [[ -z "$(_dotnet_sdk_of "$DOTNET_INSTALL_DIR/dotnet" || true)" ]]; then
+        if _dotnet_refresh_host \
+            && [[ -n "$(_dotnet_sdk_of "$DOTNET_INSTALL_DIR/dotnet" || true)" ]]; then
+            detail "Re-created the .NET host binary to clear a stale code-signature state."
+        fi
+    fi
+
     dotnet_activate_best || true
     current="$(dotnet_best_sdk)"
 
@@ -174,13 +209,27 @@ dotnet_ensure_sdk() {
         {
             echo ""
             echo "# .NET SDK"
+            # These must stay literal so the rc file expands them at login.
+            # shellcheck disable=SC2016
             echo 'export DOTNET_ROOT="$HOME/.dotnet"'
+            # shellcheck disable=SC2016
             echo 'export PATH="$DOTNET_ROOT:$PATH"'
         } >> "$rc"
         detail "Added .NET to PATH in $(basename "$rc")"
     done
 
     current="$(dotnet_best_sdk)"
+    if ! dotnet_version_ge "$current" "$DOTNET_SDK_FLOOR" && [[ -x "$DOTNET_INSTALL_DIR/dotnet" ]]; then
+        # Past in-place overwrites can leave macOS denying exec for this vnode.
+        # Re-create the host file, then re-check before deciding it failed.
+        if _dotnet_refresh_host; then
+            dotnet_activate_best || true
+            current="$(dotnet_best_sdk)"
+            if dotnet_version_ge "$current" "$DOTNET_SDK_FLOOR"; then
+                detail "Re-created the .NET host binary to clear a stale code-signature state."
+            fi
+        fi
+    fi
     if ! dotnet_version_ge "$current" "$DOTNET_SDK_FLOOR"; then
         # The SDK files can be present even when the freshly installed host is
         # not runnable from this process (Gatekeeper/quarantine, arch mismatch,
@@ -208,6 +257,9 @@ _dotnet_diagnose() {
         warn "'$bin --list-sdks' exited $rc: $out"
     else
         warn "'$bin --list-sdks' exited $rc with no output."
+    fi
+    if [[ "$rc" == "137" ]]; then
+        warn "Exit 137 means the OS killed the host before .NET started (macOS: stale code-signature state for this file). Setup re-created the binary; if this persists, reinstall .NET or reboot."
     fi
     if [[ -d "$DOTNET_INSTALL_DIR/sdk/$DOTNET_SDK_FLOOR" ]]; then
         warn "SDK files present: $DOTNET_INSTALL_DIR/sdk/$DOTNET_SDK_FLOOR"

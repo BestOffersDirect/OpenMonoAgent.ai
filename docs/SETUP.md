@@ -385,6 +385,18 @@ openmono tunnel logs     # tail frpc logs
 > openmono config set llm.api_key <value-from-inference-box>
 > ```
 
+> [!NOTE]
+> **`dotnet --list-sdks` exits 137 on macOS** — the OS killed the .NET host
+> before it started (`Taskgated Invalid Signature`). A previous install rewrote
+> `~/.dotnet/dotnet` in place, and macOS keeps the old code-signature state for
+> that file even though the binary is valid. Setup detects this and re-creates
+> the host automatically; to fix an existing install by hand:
+> ```bash
+> cd ~/.dotnet
+> cp -p dotnet .dotnet.new && mv -f .dotnet.new dotnet
+> ./dotnet --list-sdks
+> ```
+
 ---
 
 ## Vision
