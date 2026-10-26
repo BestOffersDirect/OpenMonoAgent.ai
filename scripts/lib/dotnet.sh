@@ -15,26 +15,49 @@
 # release. Installations are pinned to this exact SDK (not a floating channel).
 DOTNET_SDK_FLOOR="${DOTNET_SDK_FLOOR:-10.0.403}"
 DOTNET_INSTALL_DIR="${DOTNET_INSTALL_DIR:-$HOME/.dotnet}"
+# Remember the dotnet that was on PATH before we prepend ~/.dotnet. If the new
+# host cannot execute, this keeps detection/reporting honest instead of
+# collapsing to "0".
+DOTNET_ORIGINAL_BIN="${DOTNET_ORIGINAL_BIN:-$(command -v dotnet 2>/dev/null || true)}"
 
 # dotnet_version_ge <have> [floor] — true when <have> is >= <floor>.
+# Pure awk comparison: BSD/GNU sort and pipefail differences cannot break it.
 dotnet_version_ge() {
     local have="${1:-}" floor="${2:-$DOTNET_SDK_FLOOR}"
     [[ -n "$have" && "$have" != "0" ]] || return 1
-    # sed (not head) keeps the upstream `sort` from getting SIGPIPE under pipefail.
-    [[ "$(printf '%s\n%s\n' "$floor" "$have" | sort -V | sed -n '1p')" == "$floor" ]]
+    awk -v have="$have" -v floor="$floor" 'BEGIN {
+        nh = split(have, h, ".")
+        nf = split(floor, f, ".")
+        for (i = 1; i <= 3; i++) {
+            hv = (i <= nh) ? h[i] + 0 : 0
+            fv = (i <= nf) ? f[i] + 0 : 0
+            if (hv > fv) exit 0
+            if (hv < fv) exit 1
+        }
+        exit 0
+    }'
 }
 
-# Print the highest SDK version exposed by one dotnet binary.
+# Print the highest SDK version exposed by one dotnet binary. Prints nothing
+# when the binary produced no SDK list (missing, killed, or otherwise broken).
 _dotnet_sdk_of() {
-    local bin="${1:-}"
+    local bin="${1:-}" best="0" ver
     [[ -n "$bin" && -x "$bin" ]] || return 1
-    "$bin" --list-sdks 2>/dev/null | awk '{print $1}' | sort -V | tail -n1
+    while IFS= read -r ver; do
+        [[ -n "$ver" ]] || continue
+        if [[ "$best" == "0" ]] || dotnet_version_ge "$ver" "$best"; then
+            best="$ver"
+        fi
+    done < <("$bin" --list-sdks 2>/dev/null | awk '{print $1}')
+    [[ "$best" == "0" ]] || printf '%s' "$best"
 }
 
-# Print the highest SDK version available from PATH or ~/.dotnet. "0" means none.
+# Print the highest SDK version available from the pre-install PATH dotnet,
+# the current PATH dotnet, or ~/.dotnet. "0" means none was readable.
 dotnet_best_sdk() {
     local bin ver best="0"
-    for bin in "$(command -v dotnet 2>/dev/null || true)" "$DOTNET_INSTALL_DIR/dotnet"; do
+    hash -r 2>/dev/null || true
+    for bin in "$DOTNET_ORIGINAL_BIN" "$(command -v dotnet 2>/dev/null || true)" "$DOTNET_INSTALL_DIR/dotnet"; do
         [[ -n "$bin" ]] || continue
         ver="$(_dotnet_sdk_of "$bin" || true)"
         [[ -n "$ver" ]] || continue
@@ -54,6 +77,9 @@ dotnet_activate_local() {
         *":$DOTNET_INSTALL_DIR:"*) ;;
         *) export PATH="$DOTNET_INSTALL_DIR:$PATH" ;;
     esac
+    # PATH changed; drop bash's cached command locations so `dotnet` resolves
+    # to the newly installed host instead of a stale entry.
+    hash -r 2>/dev/null || true
 }
 
 # Prefer ~/.dotnet when it has an SDK at least as new as the one on PATH. This
@@ -136,7 +162,9 @@ dotnet_ensure_sdk() {
         || die ".NET install failed"
     rm -f /tmp/dotnet-install.sh
 
-    dotnet_activate_local || true
+    # Activate only if the new host can actually report its SDKs. If it cannot,
+    # leave the previous PATH intact and let the verification below diagnose it.
+    dotnet_activate_best || true
 
     for rc in ${rc_files[@]+"${rc_files[@]}"}; do
         [[ -f "$rc" ]] || continue
@@ -154,7 +182,37 @@ dotnet_ensure_sdk() {
 
     current="$(dotnet_best_sdk)"
     if ! dotnet_version_ge "$current" "$DOTNET_SDK_FLOOR"; then
+        # The SDK files can be present even when the freshly installed host is
+        # not runnable from this process (Gatekeeper/quarantine, arch mismatch,
+        # sandbox kill). Report the real error instead of a bare "found 0".
+        if [[ -d "$DOTNET_INSTALL_DIR/sdk/$DOTNET_SDK_FLOOR" ]]; then
+            warn ".NET SDK $DOTNET_SDK_FLOOR is installed under $DOTNET_INSTALL_DIR, but the dotnet CLI did not report it (found ${current:-none})."
+            _dotnet_diagnose
+            warn "Setup will continue, but repo builds may fail until '$DOTNET_INSTALL_DIR/dotnet --list-sdks' reports $DOTNET_SDK_FLOOR."
+            return 0
+        fi
         die ".NET SDK $DOTNET_SDK_FLOOR was installed but is not active (found ${current:-none}). Ensure $DOTNET_INSTALL_DIR is on PATH and retry."
     fi
     ok ".NET SDK $current installed"
+}
+
+# Print the exact failure from the installed host so the log/user can act on it.
+_dotnet_diagnose() {
+    local bin="$DOTNET_INSTALL_DIR/dotnet" out="" rc=0
+    if [[ ! -x "$bin" ]]; then
+        warn "$bin is missing or not executable."
+        return 0
+    fi
+    out="$("$bin" --list-sdks 2>&1)" || rc=$?
+    if [[ -n "$out" ]]; then
+        warn "'$bin --list-sdks' exited $rc: $out"
+    else
+        warn "'$bin --list-sdks' exited $rc with no output."
+    fi
+    if [[ -d "$DOTNET_INSTALL_DIR/sdk/$DOTNET_SDK_FLOOR" ]]; then
+        warn "SDK files present: $DOTNET_INSTALL_DIR/sdk/$DOTNET_SDK_FLOOR"
+    else
+        warn "SDK files missing: $DOTNET_INSTALL_DIR/sdk/$DOTNET_SDK_FLOOR"
+    fi
+    return 0
 }
