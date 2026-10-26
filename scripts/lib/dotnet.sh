@@ -14,6 +14,10 @@
 # Bump this in the same change that bumps global.json on a future .NET servicing
 # release. Installations are pinned to this exact SDK (not a floating channel).
 DOTNET_SDK_FLOOR="${DOTNET_SDK_FLOOR:-10.0.403}"
+# The Oct 2026 OOB fix ships in the runtime too. An SDK install always carries
+# the matching runtime, so this is a verification belt for machines whose
+# DOTNET_ROOT points at an older side-by-side runtime.
+DOTNET_RUNTIME_FLOOR="${DOTNET_RUNTIME_FLOOR:-10.0.14}"
 DOTNET_INSTALL_DIR="${DOTNET_INSTALL_DIR:-$HOME/.dotnet}"
 # Remember the dotnet that was on PATH before we prepend ~/.dotnet. If the new
 # host cannot execute, this keeps detection/reporting honest instead of
@@ -50,6 +54,31 @@ _dotnet_sdk_of() {
         fi
     done < <("$bin" --list-sdks 2>/dev/null | awk '{print $1}')
     [[ "$best" == "0" ]] || printf '%s' "$best"
+}
+
+# Print the highest Microsoft.NETCore.App runtime version exposed by a binary.
+_dotnet_runtime_of() {
+    local bin="${1:-}" best="0" ver
+    [[ -n "$bin" && -x "$bin" ]] || return 1
+    while IFS= read -r ver; do
+        [[ -n "$ver" ]] || continue
+        if [[ "$best" == "0" ]] || dotnet_version_ge "$ver" "$best"; then
+            best="$ver"
+        fi
+    done < <("$bin" --list-runtimes 2>/dev/null \
+        | awk '$1 == "Microsoft.NETCore.App" {print $2}')
+    [[ "$best" == "0" ]] || printf '%s' "$best"
+}
+
+# Warn (not fail) when the local install's runtime predates the security floor.
+_dotnet_verify_runtime() {
+    local rt
+    rt="$(_dotnet_runtime_of "$DOTNET_INSTALL_DIR/dotnet" || true)"
+    [[ -n "$rt" ]] || return 0
+    dotnet_version_ge "$rt" "$DOTNET_RUNTIME_FLOOR" && return 0
+    warn "Microsoft.NETCore.App $rt is older than $DOTNET_RUNTIME_FLOOR (Oct 2026 security update)."
+    warn "An older runtime is still active under DOTNET_ROOT=$DOTNET_INSTALL_DIR."
+    return 1
 }
 
 # Print the highest SDK version available from the pre-install PATH dotnet,
@@ -153,13 +182,36 @@ dotnet_should_update() {
     esac
 }
 
+# Add the ~/.dotnet PATH block to each rc file that lacks it. No-op when the
+# local install is absent (nothing to point at) or a block already exists.
+_dotnet_persist_path() {
+    local rc
+    [[ -x "$DOTNET_INSTALL_DIR/dotnet" ]] || return 0
+    for rc in "$@"; do
+        [[ -f "$rc" ]] || continue
+        if grep -q "DOTNET_ROOT" "$rc"; then
+            continue
+        fi
+        {
+            echo ""
+            echo "# .NET SDK"
+            # These must stay literal so the rc file expands them at login.
+            # shellcheck disable=SC2016
+            echo 'export DOTNET_ROOT="$HOME/.dotnet"'
+            # shellcheck disable=SC2016
+            echo 'export PATH="$DOTNET_ROOT:$PATH"'
+        } >> "$rc"
+        detail "Added .NET to PATH in $(basename "$rc")"
+    done
+}
+
 # dotnet_ensure_sdk [rc-file ...]
 # Installs the pinned patched SDK when missing/older, then verifies the floor.
 # A declined prompt leaves the old SDK in place (with a loud warning) so a
 # later `global.json` build failure is predictable rather than silent.
 dotnet_ensure_sdk() {
     local -a rc_files=("$@")
-    local current rc
+    local current
 
     # A host that exists but reports no SDKs is broken, not absent. Recover it
     # before prompting/downloading; on macOS this is the stale-vnode case above.
@@ -178,6 +230,7 @@ dotnet_ensure_sdk() {
 
     if dotnet_version_ge "$current" "$DOTNET_SDK_FLOOR"; then
         ok ".NET SDK $current already installed"
+        _dotnet_verify_runtime || true
         return 0
     fi
 
@@ -201,22 +254,7 @@ dotnet_ensure_sdk() {
     # leave the previous PATH intact and let the verification below diagnose it.
     dotnet_activate_best || true
 
-    for rc in ${rc_files[@]+"${rc_files[@]}"}; do
-        [[ -f "$rc" ]] || continue
-        if grep -q "DOTNET_ROOT" "$rc"; then
-            continue
-        fi
-        {
-            echo ""
-            echo "# .NET SDK"
-            # These must stay literal so the rc file expands them at login.
-            # shellcheck disable=SC2016
-            echo 'export DOTNET_ROOT="$HOME/.dotnet"'
-            # shellcheck disable=SC2016
-            echo 'export PATH="$DOTNET_ROOT:$PATH"'
-        } >> "$rc"
-        detail "Added .NET to PATH in $(basename "$rc")"
-    done
+    _dotnet_persist_path ${rc_files[@]+"${rc_files[@]}"}
 
     current="$(dotnet_best_sdk)"
     if ! dotnet_version_ge "$current" "$DOTNET_SDK_FLOOR" && [[ -x "$DOTNET_INSTALL_DIR/dotnet" ]]; then
@@ -243,6 +281,7 @@ dotnet_ensure_sdk() {
         die ".NET SDK $DOTNET_SDK_FLOOR was installed but is not active (found ${current:-none}). Ensure $DOTNET_INSTALL_DIR is on PATH and retry."
     fi
     ok ".NET SDK $current installed"
+    _dotnet_verify_runtime || true
 }
 
 # Print the exact failure from the installed host so the log/user can act on it.

@@ -37,8 +37,9 @@ dotnet10_present() {
 
 # A .NET installed under ~/.dotnet (our prereqs path) is only on PATH via rc
 # files, which this non-interactive shell never sourced — pick it up first so
-# an already-installed SDK is found without re-running prerequisites.
-dotnet_activate_local || true
+# an already-installed SDK is found without re-running prerequisites. Prefer
+# whichever install is newer instead of shadowing a patched system SDK.
+dotnet_activate_best || true
 
 if ! dotnet10_present; then
     echo "[host-bridge] .NET 10 SDK not found — running the existing prerequisites installer..."
@@ -53,8 +54,8 @@ if ! dotnet10_present; then
             || { echo "ERROR: prerequisites installer failed." >&2; exit 1; }
     fi
     # prereqs installs the SDK under ~/.dotnet and updates rc files, neither of
-    # which affects this shell — pick it up explicitly.
-    dotnet_activate_local || true
+    # which affects this shell — pick it up explicitly (newest wins).
+    dotnet_activate_best || true
 fi
 
 dotnet10_present || {
