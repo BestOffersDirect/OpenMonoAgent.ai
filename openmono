@@ -25,6 +25,15 @@ DOCKER_DIR="$REPO_DIR/docker"
 INFERENCE_PORT="${INFERENCE_PORT:-7474}"
 OPENMONO_VERSION="$(cat "$REPO_DIR/VERSION" 2>/dev/null | tr -d '[:space:]' || echo "unknown")"
 
+# The prereqs installer keeps the patched .NET under ~/.dotnet and wires it
+# into login shells only. IDE extensions, cron and non-interactive `openmono`
+# runs never source those rc files — the published host-bridge apphost needs
+# DOTNET_ROOT to find a runtime at all, and it must be the patched one. Pick
+# the newest of ~/.dotnet and PATH here so every host path uses it.
+# shellcheck source=scripts/lib/dotnet.sh
+source "$REPO_DIR/scripts/lib/dotnet.sh"
+dotnet_activate_best || true
+
 # On macOS Apple Silicon, llama-server runs natively via Homebrew (Metal GPU).
 # It is never started/stopped via Docker on this platform.
 _OPENMONO_OS=$(uname -s)
@@ -617,6 +626,8 @@ cmd_setup() {
                 echo "  --options     Ask about model, vision and parallel slots instead of defaulting them from"
                 echo "                hardware. Role, GPU mode, host-bridge consent and reboot still always ask."
                 echo "  --verbose     Show detailed command output (default: step-level progress)"
+                echo "  OPENMONO_DOTNET_UPDATE=0  Skip upgrading an older .NET SDK (setup prompts;"
+                echo "                non-interactive installs upgrade automatically to the patched SDK)."
                 echo ""
                 echo "Server sub-agent (opt-in add-on, full/agent only — never inference):"
                 echo "  Setup asks once (default No, breaks container sandbox when installed)."

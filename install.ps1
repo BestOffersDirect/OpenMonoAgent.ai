@@ -20,8 +20,16 @@ if (-not (Get-Command dotnet -ErrorAction SilentlyContinue)) {
 
 $sdkVersion = (& dotnet --version)
 Write-Host "Found .NET SDK $sdkVersion"
-if ([int]($sdkVersion.Split('.')[0]) -lt 10) {
-    Write-Error "OpenMono needs .NET 10 or newer. Found $sdkVersion."
+# Oct 2026 OOB security release: .NET 10 runtime 10.0.14 / SDK 10.0.403.
+$minSdkVersion = [version]"10.0.403"
+try {
+    $parsedVersion = [version]$sdkVersion
+} catch {
+    Write-Error "Could not parse .NET SDK version '$sdkVersion'. Install .NET 10 SDK 10.0.403 or newer from https://dotnet.microsoft.com/download, then re-run."
+    exit 1
+}
+if ($parsedVersion -lt $minSdkVersion) {
+    Write-Error "OpenMono needs .NET SDK 10.0.403 or newer (Oct 2026 security update). Found $sdkVersion. Install it from https://dotnet.microsoft.com/download, then re-run."
     exit 1
 }
 

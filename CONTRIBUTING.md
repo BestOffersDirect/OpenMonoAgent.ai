@@ -28,7 +28,7 @@ Look for issues tagged `help wanted` or `good first issue` if you're just gettin
 
 ## Development setup
 
-**Requirements:** .NET 10 SDK, Docker
+**Requirements:** .NET 10 SDK **10.0.403+** (includes the October 2026 security update), Docker
 
 ```bash
 git clone https://github.com/your-org/openmono

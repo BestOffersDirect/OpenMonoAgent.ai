@@ -15,7 +15,9 @@ set -euo pipefail
 # Ubuntu base codename (e.g. "noble") for apt repositories — see ubuntu_codename.
 #
 # Options:
-#   OPENMONO_VERBOSE=1    Show detailed command output
+#   OPENMONO_VERBOSE=1       Show detailed command output
+#   OPENMONO_DOTNET_UPDATE=0 Skip upgrading an older .NET SDK (default: prompt;
+#                            non-interactive installs upgrade automatically)
 #
 # Tested on: Ubuntu 24.04 LTS, Linux Mint 22.x
 # ──────────────────────────────────────────────────────────────────────────────
@@ -23,6 +25,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/log.sh
 source "$SCRIPT_DIR/lib/log.sh"
+# shellcheck source=lib/dotnet.sh
+source "$SCRIPT_DIR/lib/dotnet.sh"
 
 # Ensure REPO_DIR is set (exported from openmono script)
 if [[ -z "${REPO_DIR:-}" ]]; then
@@ -718,39 +722,12 @@ if [ "$HAS_NVIDIA_HW" = true ] && command -v nvidia-ctk &>/dev/null; then
 fi
 
 # ── Step 7: .NET 10 SDK ──────────────────────────────────────────────────────
+# Oct 2026 OOB security update: runtime 10.0.14 / SDK 10.0.403. The helper
+# installs that exact SDK side-by-side when missing or older and verifies it.
 
 step 7 $TOTAL_STEPS "Installing .NET 10 SDK"
 
-if command -v dotnet &>/dev/null && dotnet --list-sdks 2>/dev/null | grep -q "^10\."; then
-    ok ".NET 10 SDK already installed"
-    detail "$(dotnet --version)"
-else
-    info "Downloading Microsoft dotnet-install script..."
-    run curl -fsSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh
-    chmod +x /tmp/dotnet-install.sh
-    info "Installing .NET 10 to \$HOME/.dotnet (this can take a minute)..."
-    run /tmp/dotnet-install.sh --channel 10.0 --install-dir "$HOME/.dotnet" \
-        || die ".NET install failed"
-    rm -f /tmp/dotnet-install.sh
-
-    export DOTNET_ROOT="$HOME/.dotnet"
-    export PATH="$DOTNET_ROOT:$PATH"
-
-    for rc in "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.profile"; do
-        if [ -f "$rc" ] && ! grep -q "DOTNET_ROOT" "$rc"; then
-            {
-                echo ""
-                echo "# .NET SDK"
-                echo 'export DOTNET_ROOT="$HOME/.dotnet"'
-                echo 'export PATH="$DOTNET_ROOT:$PATH"'
-            } >> "$rc"
-            detail "Added .NET to PATH in $(basename "$rc")"
-        fi
-    done
-    ok ".NET 10 SDK installed ($(dotnet --version 2>/dev/null || echo 'reload shell'))"
-fi
-
-# ── Step 8: Summary ──────────────────────────────────────────────────────────
+dotnet_ensure_sdk "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.profile"
 
 step 8 $TOTAL_STEPS "Verifying install"
 

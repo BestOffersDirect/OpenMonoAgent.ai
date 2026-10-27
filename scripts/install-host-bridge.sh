@@ -28,20 +28,18 @@ REPO_DIR="$(dirname "$SCRIPT_DIR")"
 CSPROJ="$REPO_DIR/src/OpenMono.HostBridge/OpenMono.HostBridge.csproj"
 BIN_DIR="${OPENMONO_HOST_BRIDGE_BIN_DIR:-$HOME/.openmono/bin/host-bridge}"
 
+# shellcheck source=lib/dotnet.sh
+source "$SCRIPT_DIR/lib/dotnet.sh"
+
 dotnet10_present() {
-    command -v dotnet &>/dev/null || return 1
-    local major
-    major="$(dotnet --version 2>/dev/null | cut -d. -f1 || echo 0)"
-    [[ "$major" =~ ^[0-9]+$ && "$major" -ge 10 ]]
+    dotnet_version_ge "$(dotnet_best_sdk)" "$DOTNET_SDK_FLOOR"
 }
 
 # A .NET installed under ~/.dotnet (our prereqs path) is only on PATH via rc
 # files, which this non-interactive shell never sourced — pick it up first so
-# an already-installed SDK is found without re-running prerequisites.
-if ! dotnet10_present && [[ -x "$HOME/.dotnet/dotnet" ]]; then
-    export DOTNET_ROOT="${DOTNET_ROOT:-$HOME/.dotnet}"
-    export PATH="$DOTNET_ROOT:$PATH"
-fi
+# an already-installed SDK is found without re-running prerequisites. Prefer
+# whichever install is newer instead of shadowing a patched system SDK.
+dotnet_activate_best || true
 
 if ! dotnet10_present; then
     echo "[host-bridge] .NET 10 SDK not found — running the existing prerequisites installer..."
@@ -56,15 +54,12 @@ if ! dotnet10_present; then
             || { echo "ERROR: prerequisites installer failed." >&2; exit 1; }
     fi
     # prereqs installs the SDK under ~/.dotnet and updates rc files, neither of
-    # which affects this shell — pick it up explicitly.
-    if [[ -x "$HOME/.dotnet/dotnet" ]]; then
-        export DOTNET_ROOT="${DOTNET_ROOT:-$HOME/.dotnet}"
-        export PATH="$DOTNET_ROOT:$PATH"
-    fi
+    # which affects this shell — pick it up explicitly (newest wins).
+    dotnet_activate_best || true
 fi
 
 dotnet10_present || {
-    echo "ERROR: .NET 10 SDK still not available after prerequisites." >&2
+    echo "ERROR: .NET SDK 10.0.403+ still not available after prerequisites." >&2
     echo "Install it via scripts/install_prereqs.sh, then retry." >&2
     exit 1
 }
