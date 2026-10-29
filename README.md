@@ -39,7 +39,7 @@
 
 ---
 
-OpenMono is a coding agent that runs **entirely on your hardware**. No subscriptions, no data leaving your network, no per-token billing. It pairs a .NET 10 CLI with its own llama.cpp inference server, giving you a full agentic loop with **21 built-in tools**, Docker sandboxing, and deep code intelligence. NVIDIA GPU, CPU, or Apple Silicon (Metal). AMD and other GPUs are not supported yet. **It auto-configures itself**. You own the model, the compute, and the data.
+OpenMono is a coding agent that runs **entirely on your hardware**. No subscriptions, no data leaving your network, no per-token billing. It pairs a .NET 10 CLI with its own llama.cpp inference server, giving you a full agentic loop with **21 built-in tools**, Docker sandboxing, and deep code intelligence. NVIDIA GPU, AMD APU (Ryzen 9 7940HS / Radeon 780M iGPU, unified memory), CPU, or Apple Silicon (Metal). **It auto-configures itself**. You own the model, the compute, and the data.
 
 ---
 
@@ -58,7 +58,7 @@ OpenMono is a coding agent that runs **entirely on your hardware**. No subscript
 
 ## Quickstart
 
-One command. Auto-detects an NVIDIA GPU, CPU, or Apple Silicon. Installs model, runtime, and Docker containers. AMD and other GPUs are not supported yet.
+One command. Auto-detects an NVIDIA GPU, the AMD Ryzen 9 7940HS iGPU (Radeon 780M), CPU, or Apple Silicon. Installs model, runtime, and Docker containers.
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/StartupHakk/OpenMonoAgent.ai/refs/heads/main/get-openmono.sh)
@@ -71,7 +71,7 @@ openmono agent            # TUI mode (default)
 openmono agent --classic  # classic scrolling terminal
 ```
 
-<sub><a href="docs/SETUP.md">→ Full command reference</a>. Daily commands, setup flags, GPU and CPU options · <a href="https://openmonoagent.ai/contact">Need help? Book a call</a></sub>
+<sub><a href="docs/SETUP.md">→ Full command reference</a>. Daily commands, setup flags, GPU/iGPU options · <a href="https://openmonoagent.ai/contact">Need help? Book a call</a></sub>
 
 <br/>
 
@@ -102,7 +102,7 @@ Most coding agents are cloud products wearing an open-source label. Your prompts
 </div>
 
 
-→ [Full architecture + diagram](docs/ARCHITECTURE.md) · [5 provider backends](docs/MODELS.md) · runs at **~45 tok/s on an NVIDIA GPU**
+→ [Full architecture + diagram](docs/ARCHITECTURE.md) · [5 provider backends](docs/MODELS.md) · runs at **~45 tok/s on GPU**, ~20 tok/s on AMD iGPU (APU)
 
 ---
 
@@ -115,8 +115,8 @@ Most coding agents are cloud products wearing an open-source label. Your prompts
 <strong style="color:#A3FF66;">01</strong> · **Bundled inference — zero config, zero cost**  
 llama.cpp ships inside Docker. Installer detects your hardware and picks the right model. After setup, every token is free.
 
-`GPU` Qwen3.8-27B dense · NVIDIA · ~60 tok/s  
-`CPU` Qwen3.6-35B-A3B MoE · stock llama.cpp · about 20 GB RAM  
+`GPU` Qwen3.8-27B dense · ~60 tok/s  
+`iGPU` Qwen3.6-35B-A3B MoE · APU unified memory · ~20 tok/s  
 `Mac` Qwen3.6-35B-A3B MoE · Metal · ~45 to 48 tok/s
 
 → [Models & reasoning mode](docs/MODELS.md)
@@ -256,7 +256,7 @@ Stand up a server, trace a crash from system logs, or install and configure soft
 ## Supported Hardware
 
 <div align="center">
-  <img src="docs/assets/table-hardware-linux.svg" alt="Linux. NVIDIA GPU and CPU: the auto-selected model, context size, and speed for each VRAM and RAM configuration. AMD and other GPUs are not supported yet." width="800" />
+  <img src="docs/assets/table-hardware-linux.svg" alt="Linux. NVIDIA GPU and AMD iGPU (Ryzen 9 7940HS / Radeon 780M): the auto-selected model, context size, and speed for each VRAM and RAM configuration" width="800" />
 </div>
 
 <br/>
@@ -265,13 +265,13 @@ Stand up a server, trace a crash from system logs, or install and configure soft
   <img src="docs/assets/table-hardware-macos.svg" alt="macOS — Apple Silicon (Metal): the auto-selected model, context size, and speed for each unified-memory size" width="800" />
 </div>
 
-<sub>Setup auto-detects an NVIDIA GPU or CPU mode and picks the best model that hardware can run. No prompts. AMD and other GPUs are not supported yet. Pass <code>--options</code> to choose the model, vision, and parallel slots yourself, or <code>--model=&lt;name&gt;</code> to pin one. See <a href="#pick-your-model">Pick your model</a> for the menu, flags, and Linux context presets. The pick depends on VRAM <em>and</em> system RAM: on Linux a 24 GB+ NVIDIA card gets Qwen3.8-Flash-Next (Strata) on a 48 GB-class box and Qwen3.8-27B below that, a 16 GB card keeps Qwen3.8-27B, and a 12 GB card gets Ternary-Bonsai-2-27B via Prism. CPU mode runs Qwen on stock llama.cpp (about 20 GB RAM). Linux setup is for Ubuntu and Ubuntu derivatives, tested on Ubuntu 24.04 LTS. On macOS, the full and inference roles require Apple Silicon (M1+); 48 GB+ unified memory is the recommended, tested configuration. 24 to 47 GB and 16 to 23 GB Macs run Ternary-Bonsai (PQ2_0 / PTQ1_0) with a tighter context window. Intel Macs: agent-only mode. macOS 14+ (Sonoma/Sequoia) recommended.</sub>
+<sub>Setup auto-detects GPU, iGPU/APU, and Apple Silicon. No prompts. Pass <code>--options</code> to choose the model, vision, and parallel slots yourself, or <code>--model=&lt;name&gt;</code> to pin one. See <a href="#pick-your-model">Pick your model</a> for the menu, flags, and Linux context presets. The pick depends on VRAM <em>and</em> system RAM: on Linux a 24 GB+ card gets Qwen3.8-Flash-Next (Strata) on a 48 GB-class box and Qwen3.8-27B below that, a 16 GB card keeps Qwen3.8-27B, and a 12 GB card and AMD 780M iGPUs (Ryzen 9 7940HS, 32 GB+ RAM) get Ternary-Bonsai-2-27B via Prism. CPU mode runs Qwen on stock llama.cpp (about 20 GB RAM). Linux setup is for Ubuntu and Ubuntu derivatives, tested on Ubuntu 24.04 LTS. On macOS, the full and inference roles require Apple Silicon (M1+); 48 GB+ unified memory is the recommended, tested configuration. 24 to 47 GB and 16 to 23 GB Macs run Ternary-Bonsai (PQ2_0 / PTQ1_0) with a tighter context window. Intel Macs: agent-only mode. macOS 14+ (Sonoma/Sequoia) recommended.</sub>
 
 ### Pick your model
 
 By default, setup picks a model for the hardware and does not ask. On a terminal, `openmono setup --options` shows a menu of what this machine can run. The default answer is 1, Qwen on stock llama.cpp (always available, the safe default). Pin one with `--model=qwen|bonsai-pq2|bonsai-ptq1|flash-next`. Shorthands: `--qwen`, `--bonsai`, `--bonsai-ptq1`, `--flash-next`.
 
-**Qwen** is stock llama.cpp, including CPU mode (about 20 GB RAM). **Bonsai 2 27B** is a ternary build on the PrismML llama.cpp fork (PQ2_0 about 7.2 GB, PTQ1_0 about 5.9 GB). On Linux it needs an NVIDIA GPU. There is no CPU image. AMD and other GPUs are not supported yet. It keeps a real 27B on 12 GB NVIDIA cards, where Qwen drops to a 9B. **Qwen3.8-Flash-Next** runs on Strata: Linux, an NVIDIA GPU, and a 48 GB-class box (about 44 GiB or more of system RAM), with weights streamed from disk. Setup auto-picks it on those boxes when the card has 24 GB or more of VRAM. Otherwise it appears only in the `--options` menu, and only when the machine can run it.
+**Qwen** is stock llama.cpp, including CPU mode (about 20 GB RAM). **Bonsai 2 27B** is a ternary build on the PrismML llama.cpp fork (PQ2_0 about 7.2 GB, PTQ1_0 about 5.9 GB). On Linux it runs on an NVIDIA GPU, or on the AMD Ryzen 9 7940HS iGPU (Radeon 780M) through the Prism Vulkan image. There is no CPU image. It keeps a real 27B on 12 GB NVIDIA cards, where Qwen drops to a 9B, and it is the auto-pick on that iGPU. **Qwen3.8-Flash-Next** runs on Strata: Linux, an NVIDIA GPU, and a 48 GB-class box (about 44 GiB or more of system RAM), with weights streamed from disk. Setup auto-picks it on those boxes when the card has 24 GB or more of VRAM. Otherwise it appears only in the `--options` menu, and only when the machine can run it.
 
 Linux context presets, before the vision trim: Bonsai 196,608 on 24 GB, 131,072 on 16 GB, 98,304 on 12 GB, 32,768 on 8 GB. Qwen 196,608 on 24 GB and 180,224 on 16 GB. On a 24 GB card the two match. Bonsai's benefit is fitting a 27B model in less VRAM, not a longer window. Vision is on by default and trims the 24 GB preset to 172,032 for both (a 16 GB card goes to 98,304 for both).
 

@@ -24,7 +24,7 @@ Strata runs on the host, not in Docker. OpenMono installs it on this box:
 
 | | |
 |---|---|
-| **GPU** | NVIDIA only. AMD and other GPUs are not supported yet. |
+| **GPU** | NVIDIA RTX 20/30/40/50 or AMD RX 7900/7800/7700/9060/9070 (XT), AI PRO R9700, RX 6800/6900. **12 GB+ VRAM** |
 | **RAM** | 48 GB-class box (about 44 GiB or more of system RAM). Weights are about 70 GB and stream from disk. |
 | **Disk** | About 80 GB free. An SSD is preferred. |
 | **OS** | Linux. Ubuntu and Ubuntu derivatives (tested on Ubuntu 24.04 LTS), with a current NVIDIA driver. CUDA 13 is installed during setup. |
@@ -235,3 +235,4 @@ Strata engine detail lives in `~/strata/strata-*.log`; the wrapper log is
 - [ ] `openmono agent` chat + tool calls against Strata (SSE streaming, `reasoning_effort` mapping, `/v1/models` catalog).
 - [ ] Dual-box: frpc tunnel → Strata (direct + via Caddy gateway with `docker-compose.strata.yml`), agent box over the relay.
 - [ ] `openmono setup gateway/search/scraper` layering on top of a live Strata backend.
+- [ ] AMD GPU path (Strata compiles its HIP engine on first install, about 10 to 20 min).
