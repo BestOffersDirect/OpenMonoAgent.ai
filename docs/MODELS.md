@@ -33,13 +33,14 @@ runtime preset-switch command yet.
 | 2 | NVIDIA **24 GB+** | **under 44 GB** | Qwen3.8-27B-UD-Q4_K_M | llama.cpp (CUDA) | 196608 / q8_0 | on |
 | 3 | NVIDIA **16 GB** | any | Qwen3.8-27B-UD-IQ3_XXS | llama.cpp (CUDA) | 180224 / q4_0 | on |
 | 4 | NVIDIA **12 GB** | any | Ternary-Bonsai-2-27B **PQ2_0** | Prism (CUDA) | 98304 / q4_0 | on |
-| 5 | AMD **iGPU** (Ryzen 9 7940HS / Radeon 780M) | **32 GB+** | Ternary-Bonsai-2-27B **PQ2_0** | Prism (Vulkan) | 196608 / q8_0 | on |
-| 6 | **none** (CPU) | 24 GB+ | Qwen3.6-35B-A3B-UD-Q4_K_XL | llama.cpp (CPU) | 196608 / q8_0 | on |
+| 5 | **none** (CPU) | about 20 GB | Qwen3.6-35B-A3B-UD-Q4_K_XL | llama.cpp (CPU) | 196608 / q8_0 | on |
+
+AMD GPUs and AMD iGPUs are not supported yet.
 
 The **Context / KV** column lists the tier preset, which is what setup writes when
 vision is turned off. As shipped — with vision on — the encoder's ~1–2 GB of VRAM is
 paid for out of the KV budget, so the README tables show the as-installed numbers:
-196608 → 172032 (168k) on the 24 GB+ and iGPU rows, and 180224 → 98304 (96k) on the
+196608 → 172032 (168k) on the 24 GB+ and CPU rows, and 180224 → 98304 (96k) on the
 16 GB row. The 12 GB Bonsai row is already sized for the encoder, so vision costs it
 nothing.
 
@@ -57,12 +58,8 @@ once firmware and kernel reservations are subtracted.
 Row 3 stays on Qwen3.8-27B: IQ3_XXS (~12 GB) fits a 16 GB card with room for the KV
 cache, so there is no reason to fall back to a ternary quant. Row 4 is where Qwen has
 no 27B option left — a 12 GB card only fits the 9B model — which is exactly where
-PQ2_0 (7.21 GB) buys a real 27B instead. The bucket spans 12–15 GB in the detector but
-is labelled 12 GB because NVIDIA ships no 13–15 GB card. Row 5 uses PQ2_0 rather than
-the smaller PTQ1_0 because the iGPU is UMA: it addresses system RAM, so the extra
-~1.3 GB of weights comes out of the same pool the model already uses — which is why the
-row is documented at 32 GB+ of RAM. Below 32 GB the pick is still Bonsai, because the
-CPU fallback needs ~20 GB and would not load; setup warns instead of downgrading.
+PQ2_0 (7.21 GB) buys a real 27B instead. The bucket spans 12 to 15 GB in the detector but
+is labelled 12 GB because NVIDIA ships no 13 to 15 GB card. AMD GPUs and AMD iGPUs are not supported yet.
 NVIDIA cards below 12 GB are not a supported inference target; those boxes stay on the
 Qwen row that matches their tier.
 
@@ -207,11 +204,9 @@ Token generation is memory-bandwidth bound — **RAM channel count matters as mu
 
 > Halving RAM channels halves throughput. Always fill both DIMM slots.
 
-### AMD iGPU (Vulkan) — Ternary-Bonsai-2-27B PQ2_0
+### AMD iGPU
 
-| Hardware | Memory | tok/s | Notes |
-|----------|--------|-------|-------|
-| Radeon 780M (Ryzen 9 7940HS) | 32 GB+ DDR5 5600, dual-channel, UMA | ~17–20 | The iGPU addresses system RAM over UMA, so throughput tracks the same DDR5 bandwidth as the CPU row above |
+AMD GPUs and AMD iGPUs are not supported yet.
 
 ### Apple Silicon (Metal)
 

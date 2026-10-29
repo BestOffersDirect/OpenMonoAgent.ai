@@ -12,7 +12,7 @@
 
 | | |
 |--|--|
-| **OS** | Ubuntu 26.04 LTS (recommended) · 25.10 · **macOS 14+** (Sonoma/Sequoia) |
+| **OS** | Ubuntu and Ubuntu derivatives (tested on Ubuntu 24.04 LTS) · **macOS 14+** (Sonoma/Sequoia) |
 | **GPU mode** (Linux) | NVIDIA GPU · 12 GB VRAM minimum · 24 GB recommended |
 | **CPU mode** (Linux) | 24 GB RAM |
 | **Apple Silicon** (macOS) | M1+ · **48 GB+ unified memory recommended** (tested) · 24–47 GB and 16–23 GB run Bonsai with a tighter context · 16 GB minimum |
@@ -99,8 +99,9 @@ RAM — first match wins, and the full policy is in [MODELS.md](MODELS.md):
 | NVIDIA 24 GB+ | Qwen3.8-27B-Q4_K_M | ~15.5 GB | Full | 168k |
 | NVIDIA 16 GB | Qwen3.8-27B-UD-IQ3_XXS | ~12 GB | Lower | 96k |
 | NVIDIA 12 GB | Ternary-Bonsai-2-27B **PQ2_0** | ~7.2 GB | 27B (ternary) | 96k |
-| AMD iGPU (7940HS / 780M), 32 GB+ RAM | Ternary-Bonsai-2-27B **PQ2_0** | ~7.2 GB | 27B (ternary) | 168k |
 | CPU | Qwen3.6-35B-A3B-UD-Q4_K_XL | ~17.6 GB | Full | 168k |
+
+AMD and other GPUs are not supported yet. CPU mode is supported (`openmono setup --cpu`).
 
 Model, vision and parallel slots are hardware-defaulted — none of the three is
 asked. Pass `--options` to choose them yourself, or `--model=<name>` to pin one.

@@ -20,21 +20,21 @@ weights (~70 GB, resumable download) live in Strata's own data dir.
 
 ## Requirements
 
-Same box Strata needs (Strata runs host-native, not in Docker):
+Strata runs on the host, not in Docker. OpenMono installs it on this box:
 
 | | |
 |---|---|
-| **GPU** | NVIDIA RTX 20/30/40/50 or AMD RX 7900/7800/7700/9060/9070 (XT), AI PRO R9700, RX 6800/6900 — **12 GB+ VRAM** |
-| **RAM** | 32 GB+ (64 GB runs every size; 32 GB → take the `coder` family) |
-| **Disk** | ~80 GB free, SSD preferred |
-| **OS** | Linux (Ubuntu 22.04/24.04 fully automatic) with a current GPU driver |
+| **GPU** | NVIDIA only. AMD and other GPUs are not supported yet. |
+| **RAM** | 48 GB-class box (about 44 GiB or more of system RAM). Weights are about 70 GB and stream from disk. |
+| **Disk** | About 80 GB free. An SSD is preferred. |
+| **OS** | Linux. Ubuntu and Ubuntu derivatives (tested on Ubuntu 24.04 LTS), with a current NVIDIA driver. CUDA 13 is installed during setup. |
 
-`./setup.sh --check` (via `scripts/strata.sh check`) verifies all of this.
+OpenMono offers Strata on this box. Setup auto-picks it when the NVIDIA card has 24 GB or more of VRAM. On a smaller NVIDIA card with the same RAM, it is in the `openmono setup --options` menu.
 
 ## Single-box install (agent + Strata on one machine)
 
 ```bash
-openmono setup            # picks the Strata backend automatically on Linux
+openmono setup            # picks Strata on a qualifying NVIDIA box
 ```
 
 What that does (roles `full` / `inference`):
@@ -231,8 +231,7 @@ Strata engine detail lives in `~/strata/strata-*.log`; the wrapper log is
 
 ## What still needs a real GPU box to verify
 
-- [ ] End-to-end `openmono setup` (Strata path) on a 12 GB+ VRAM Linux box, including the ~70 GB model download.
+- [ ] End-to-end `openmono setup` (Strata path) on a qualifying NVIDIA box (48 GB-class RAM), including the ~70 GB model download.
 - [ ] `openmono agent` chat + tool calls against Strata (SSE streaming, `reasoning_effort` mapping, `/v1/models` catalog).
 - [ ] Dual-box: frpc tunnel → Strata (direct + via Caddy gateway with `docker-compose.strata.yml`), agent box over the relay.
 - [ ] `openmono setup gateway/search/scraper` layering on top of a live Strata backend.
-- [ ] AMD GPU path (Strata compiles its HIP engine on first install, ~10–20 min).
