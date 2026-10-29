@@ -57,12 +57,8 @@ once firmware and kernel reservations are subtracted.
 Row 3 stays on Qwen3.8-27B: IQ3_XXS (~12 GB) fits a 16 GB card with room for the KV
 cache, so there is no reason to fall back to a ternary quant. Row 4 is where Qwen has
 no 27B option left — a 12 GB card only fits the 9B model — which is exactly where
-PQ2_0 (7.21 GB) buys a real 27B instead. The bucket spans 12–15 GB in the detector but
-is labelled 12 GB because NVIDIA ships no 13–15 GB card. Row 5 uses PQ2_0 rather than
-the smaller PTQ1_0 because the iGPU is UMA: it addresses system RAM, so the extra
-~1.3 GB of weights comes out of the same pool the model already uses — which is why the
-row is documented at 32 GB+ of RAM. Below 32 GB the pick is still Bonsai, because the
-CPU fallback needs ~20 GB and would not load; setup warns instead of downgrading.
+PQ2_0 (7.21 GB) buys a real 27B instead. The bucket spans 12 to 15 GB in the detector but
+is labelled 12 GB because NVIDIA ships no 13 to 15 GB card. Row 5 uses PQ2_0 rather than the smaller PTQ1_0 because the iGPU is UMA: it addresses system RAM, so the extra ~1.3 GB of weights comes out of the same pool the model already uses, which is why the row is documented at 32 GB+ of RAM. Below 32 GB the pick is still Bonsai, because the CPU fallback needs ~20 GB and would not load; setup warns instead of downgrading.
 NVIDIA cards below 12 GB are not a supported inference target; those boxes stay on the
 Qwen row that matches their tier.
 
@@ -207,11 +203,11 @@ Token generation is memory-bandwidth bound — **RAM channel count matters as mu
 
 > Halving RAM channels halves throughput. Always fill both DIMM slots.
 
-### AMD iGPU (Vulkan) — Ternary-Bonsai-2-27B PQ2_0
+### AMD iGPU (Vulkan): Ternary-Bonsai-2-27B PQ2_0
 
 | Hardware | Memory | tok/s | Notes |
 |----------|--------|-------|-------|
-| Radeon 780M (Ryzen 9 7940HS) | 32 GB+ DDR5 5600, dual-channel, UMA | ~17–20 | The iGPU addresses system RAM over UMA, so throughput tracks the same DDR5 bandwidth as the CPU row above |
+| Radeon 780M (Ryzen 9 7940HS) | 32 GB+ DDR5 5600, dual-channel, UMA | ~17 to 20 | The iGPU addresses system RAM over UMA, so throughput tracks the same DDR5 bandwidth as the CPU row above |
 
 ### Apple Silicon (Metal)
 

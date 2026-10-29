@@ -12,7 +12,7 @@
 
 | | |
 |--|--|
-| **OS** | Ubuntu 26.04 LTS (recommended) · 25.10 · **macOS 14+** (Sonoma/Sequoia) |
+| **OS** | Ubuntu and Ubuntu derivatives (tested on Ubuntu 24.04 LTS) · **macOS 14+** (Sonoma/Sequoia) |
 | **GPU mode** (Linux) | NVIDIA GPU · 12 GB VRAM minimum · 24 GB recommended |
 | **CPU mode** (Linux) | 24 GB RAM |
 | **Apple Silicon** (macOS) | M1+ · **48 GB+ unified memory recommended** (tested) · 24–47 GB and 16–23 GB run Bonsai with a tighter context · 16 GB minimum |

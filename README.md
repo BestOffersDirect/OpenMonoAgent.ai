@@ -10,7 +10,7 @@
 <br>
 
 <div align="center">
-  <a href="#quickstart">Quickstart</a> · <a href="#free-course--get-started-with-oma">Free OMA Course</a> · <a href="#whats-shipping">What's shipping</a> · <a href="#how-it-compares">How it compares</a> · <a href="#whats-inside">What's inside</a> · <a href="#supported-hardware">Hardware</a> · <a href="#docs">Docs</a> · <a href="ROADMAP.md">Roadmap</a> · <a href="#contributing">Contributing</a>
+  <a href="#quickstart">Quickstart</a> · <a href="#free-course--get-started-with-oma">Free OMA Course</a> · <a href="#whats-shipping">What's shipping</a> · <a href="#how-it-compares">How it compares</a> · <a href="#whats-inside">What's inside</a> · <a href="#agent-host-whole-machine-mode">Agent Host</a> · <a href="#supported-hardware">Hardware</a> · <a href="#pick-your-model">Models</a> · <a href="#docs">Docs</a> · <a href="ROADMAP.md">Roadmap</a> · <a href="#contributing">Contributing</a>
 </div>
 
 <br>
@@ -39,7 +39,7 @@
 
 ---
 
-OpenMono is a coding agent that runs **entirely on your hardware** — no subscriptions, no data leaving your network, no per-token billing. It pairs a .NET 10 CLI with its own llama.cpp inference server, giving you a full agentic loop with **21 built-in tools**, Docker sandboxing, and deep code intelligence. NVIDIA GPU, AMD APU (integrated Radeon iGPU, unified memory), or Apple Silicon (Metal) — **it auto-configures itself**. You own the model, the compute, and the data.
+OpenMono is a coding agent that runs **entirely on your hardware**. No subscriptions, no data leaving your network, no per-token billing. It pairs a .NET 10 CLI with its own llama.cpp inference server, giving you a full agentic loop with **21 built-in tools**, Docker sandboxing, and deep code intelligence. NVIDIA GPU, AMD APU (Ryzen 9 7940HS / Radeon 780M iGPU, unified memory), CPU, or Apple Silicon (Metal). **It auto-configures itself**. You own the model, the compute, and the data.
 
 ---
 
@@ -58,7 +58,7 @@ OpenMono is a coding agent that runs **entirely on your hardware** — no subscr
 
 ## Quickstart
 
-One command. Auto-detects GPU · APU/iGPU · Apple Silicon. Installs model, runtime, and Docker containers.
+One command. Auto-detects an NVIDIA GPU, the AMD Ryzen 9 7940HS iGPU (Radeon 780M), CPU, or Apple Silicon. Installs model, runtime, and Docker containers.
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/StartupHakk/OpenMonoAgent.ai/refs/heads/main/get-openmono.sh)
@@ -71,7 +71,7 @@ openmono agent            # TUI mode (default)
 openmono agent --classic  # classic scrolling terminal
 ```
 
-<sub><a href="docs/SETUP.md">→ Full command reference</a> — daily commands, setup flags, GPU/iGPU options · <a href="https://openmonoagent.ai/contact">Need help? Book a call</a></sub>
+<sub><a href="docs/SETUP.md">→ Full command reference</a>. Daily commands, setup flags, GPU/iGPU options · <a href="https://openmonoagent.ai/contact">Need help? Book a call</a></sub>
 
 <br/>
 
@@ -117,7 +117,7 @@ llama.cpp ships inside Docker. Installer detects your hardware and picks the rig
 
 `GPU` Qwen3.8-27B dense · ~60 tok/s  
 `iGPU` Qwen3.6-35B-A3B MoE · APU unified memory · ~20 tok/s  
-`Mac` Qwen3.6-35B-A3B MoE · Metal · ~45–48 tok/s
+`Mac` Qwen3.6-35B-A3B MoE · Metal · ~45 to 48 tok/s
 
 → [Models & reasoning mode](docs/MODELS.md)
 
@@ -153,7 +153,7 @@ Isolated sessions with locked tool sets and turn budgets:
 <td valign="top">
 
 <strong style="color:#A3FF66;">05</strong> · **Docker sandbox**  
-In sandbox mode the project mounts as `/workspace`. The agent reads and writes your real files — that's the blast radius; nothing outside that mount is visible. Host mode is the explicit exception: machine-level actions run only through approved `HostExec` calls.
+In sandbox mode the project mounts as `/workspace`. The agent reads and writes your real files. That mount is the blast radius; nothing outside it is visible. [Agent Host](#agent-host-whole-machine-mode) is the explicit exception: machine-level actions run only through approved `HostExec` calls.
 
 </td>
 <td valign="top">
@@ -227,11 +227,36 @@ The full agent loop in your editor sidebar — streaming responses, live Markdow
 
 ---
 
+<!--  ── AGENT HOST ──────────────────────────────────────────── -->
+## Agent Host (whole-machine mode)
+
+HostExec is a first-class tool, backed by a host-bridge daemon that runs the command on the machine. It is opt-in. `openmono setup` offers it, and the default is No, because it breaks the container sandbox's isolation by design. Add it later with `bash scripts/install-host-bridge.sh`. Non-interactive:
+
+```bash
+OPENMONO_HOST_BRIDGE=1 OPENMONO_HOST_EXEC_DEFAULT=ask openmono setup --agent
+```
+
+Drop `--agent` for the full role. Set `OPENMONO_HOST_EXEC_DEFAULT=allow` to skip the per-command prompt. The deny list, sudo policy, and audit log still apply.
+
+`openmono upgrade` updates the checkout and rebuilds the agent image. `openmono upgrade --check` previews and does not apply. `openmono agent --host` starts the daemon, then the agent. Manage it with `openmono host daemon`, `status`, `stop`, `requests`, `approve <id>`, `deny <id>`, and `invite`. Inside the agent: `/host status`, `/host on`, `/host off`.
+
+HostExec is available only while the session is paired. Parameters: `command`, `timeout_ms` (default 300000, max 600000), `background`, `as_root`. The default permission is Ask. The HostExec permission card is Allow, Allow all, Deny, or Deny all. A HOST EXECUTION card accepts allow once, allow all for this session, allow 30 minutes, allow today, deny, and deny all. A blanket allow never covers root. `host.sudo_policy` defaults to ask. The daemon that `openmono agent --host` starts has no one to prompt, so an ask policy fails closed: `as_root` runs only when `host.sudo_policy` is allow. The operator bridge prompts for each escalation when the policy is ask.
+
+Settings live in `~/.openmono/host-bridge.json` (mode 0600): `host.exec_default` (ask, allow, or deny; default ask), `host.sudo_policy` (ask, allow, or deny; default ask), `host.run_as`, `host.allow_list`, `host.deny_list` (checked first), `host.timeout_ms`. Every command is audited under `~/.openmono/logs/`.
+
+The daemon binds `127.0.0.1:7476` (`OPENMONO_HOST_DAEMON_PORT` overrides) plus the Docker bridge IP on Linux, and the vmnet bridge on macOS for Colima or Lima. It never binds `0.0.0.0`. Pair with the pair secret, a launcher invite, or an approval request you accept with `openmono host approve`. Invites are TTL-bounded, not single-use (default 900 seconds, range 30 seconds to 86,400 seconds). An idle pairing token expires after 2 hours.
+
+Stand up a server, trace a crash from system logs, or install and configure software. You decide per call how far it reaches.
+
+→ [Host bridge settings](docs/CONFIG.md#host-bridge-openmono-agent---host)
+
+---
+
 <!--  ── SUPPORTED HARDWARE ──────────────────────────────────── -->
 ## Supported Hardware
 
 <div align="center">
-  <img src="docs/assets/table-hardware-linux.svg" alt="Linux — NVIDIA GPU and AMD iGPU: the auto-selected model, context size, and speed for each VRAM and RAM configuration" width="800" />
+  <img src="docs/assets/table-hardware-linux.svg" alt="Linux. NVIDIA GPU and AMD iGPU (Ryzen 9 7940HS / Radeon 780M): the auto-selected model, context size, and speed for each VRAM and RAM configuration" width="800" />
 </div>
 
 <br/>
@@ -240,8 +265,15 @@ The full agent loop in your editor sidebar — streaming responses, live Markdow
   <img src="docs/assets/table-hardware-macos.svg" alt="macOS — Apple Silicon (Metal): the auto-selected model, context size, and speed for each unified-memory size" width="800" />
 </div>
 
-<sub>Setup auto-detects GPU · iGPU/APU · no config needed and picks the best model your hardware can run — no prompts. Pass <code>--options</code> to choose the model, vision, and parallel slots yourself, or <code>--model=&lt;name&gt;</code> to pin one. The pick depends on VRAM <em>and</em> system RAM: on Linux a 24 GB+ card gets Qwen3.8-Flash-Next (Strata) on a 48 GB-class box and Qwen3.8-27B below that, a 16 GB card keeps Qwen3.8-27B, a 12 GB card and AMD 780M iGPUs (32 GB+ RAM) get Ternary-Bonsai-2-27B via Prism. Requires Ubuntu 26.04 LTS (recommended) or 25.10. On macOS, the full and inference roles require Apple Silicon (M1+); 48 GB+ unified memory is the recommended, tested configuration. 24–47 GB and 16–23 GB Macs run Ternary-Bonsai (PQ2_0 / PTQ1_0) with a tighter context window. Intel Macs: agent-only mode. macOS 14+ (Sonoma/Sequoia) recommended.</sub>
+<sub>Setup auto-detects GPU, iGPU/APU, and Apple Silicon. No prompts. Pass <code>--options</code> to choose the model, vision, and parallel slots yourself, or <code>--model=&lt;name&gt;</code> to pin one. See <a href="#pick-your-model">Pick your model</a> for the menu, flags, and Linux context presets. The pick depends on VRAM <em>and</em> system RAM: on Linux a 24 GB+ card gets Qwen3.8-Flash-Next (Strata) on a 48 GB-class box and Qwen3.8-27B below that, a 16 GB card keeps Qwen3.8-27B, and a 12 GB card and AMD 780M iGPUs (Ryzen 9 7940HS, 32 GB+ RAM) get Ternary-Bonsai-2-27B via Prism. CPU mode runs Qwen on stock llama.cpp (about 20 GB RAM). Linux setup is for Ubuntu and Ubuntu derivatives, tested on Ubuntu 24.04 LTS. On macOS, the full and inference roles require Apple Silicon (M1+); 48 GB+ unified memory is the recommended, tested configuration. 24 to 47 GB and 16 to 23 GB Macs run Ternary-Bonsai (PQ2_0 / PTQ1_0) with a tighter context window. Intel Macs: agent-only mode. macOS 14+ (Sonoma/Sequoia) recommended.</sub>
 
+### Pick your model
+
+By default, setup picks a model for the hardware and does not ask. On a terminal, `openmono setup --options` shows a menu of what this machine can run. The default answer is 1, Qwen on stock llama.cpp (always available, the safe default). Pin one with `--model=qwen|bonsai-pq2|bonsai-ptq1|flash-next`. Shorthands: `--qwen`, `--bonsai`, `--bonsai-ptq1`, `--flash-next`.
+
+**Qwen** is stock llama.cpp, including CPU mode (about 20 GB RAM). **Bonsai 2 27B** is a ternary build on the PrismML llama.cpp fork (PQ2_0 about 7.2 GB, PTQ1_0 about 5.9 GB). On Linux it runs on an NVIDIA GPU, or on the AMD Ryzen 9 7940HS iGPU (Radeon 780M) through the Prism Vulkan image. There is no CPU image. It keeps a real 27B on 12 GB NVIDIA cards, where Qwen drops to a 9B, and it is the auto-pick on that iGPU. **Qwen3.8-Flash-Next** runs on Strata: Linux, an NVIDIA GPU, and a 48 GB-class box (about 44 GiB or more of system RAM), with weights streamed from disk. Setup auto-picks it on those boxes when the card has 24 GB or more of VRAM. Otherwise it appears only in the `--options` menu, and only when the machine can run it.
+
+Linux context presets, before the vision trim: Bonsai 196,608 on 24 GB, 131,072 on 16 GB, 98,304 on 12 GB, 32,768 on 8 GB. Qwen 196,608 on 24 GB and 180,224 on 16 GB. On a 24 GB card the two match. Bonsai's benefit is fitting a 27B model in less VRAM, not a longer window. Vision is on by default and trims the 24 GB preset to 172,032 for both (a 16 GB card goes to 98,304 for both).
 
 ---
 
@@ -285,6 +317,10 @@ Stuck on setup, or want OpenMono on your own servers? We install and support pri
   <tr>
     <td style="padding:9px 16px;border-bottom:1px solid #1A1A1A;border-right:1px solid #232323;"><a href="docs/CONFIG.md"><code style="font-size:12px;">Configuration</code></a></td>
     <td style="padding:9px 16px;border-bottom:1px solid #1A1A1A;"><sub style="color:#C8C8C0;">settings.json, providers, permissions, MCP servers</sub></td>
+  </tr>
+  <tr>
+    <td style="padding:9px 16px;border-bottom:1px solid #1A1A1A;border-right:1px solid #232323;"><a href="docs/CONFIG.md#host-bridge-openmono-agent---host"><code style="font-size:12px;">Host bridge</code></a></td>
+    <td style="padding:9px 16px;border-bottom:1px solid #1A1A1A;"><sub style="color:#C8C8C0;">Whole-machine mode: consent, daemon, host-bridge.json</sub></td>
   </tr>
   <tr>
     <td style="padding:9px 16px;border-bottom:1px solid #1A1A1A;border-right:1px solid #232323;"><a href="docs/PLAYBOOKS.md"><code style="font-size:12px;">Playbooks</code></a></td>

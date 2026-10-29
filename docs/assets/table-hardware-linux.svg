@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="800" height="306" viewBox="0 0 800 306" role="img" aria-label="Linux NVIDIA GPU / AMD iGPU support">
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="306" viewBox="0 0 800 306" role="img" aria-label="Linux NVIDIA GPU and AMD iGPU support">
   <defs>
     <style>
       .mono { font-family: 'JetBrains Mono','Cascadia Code','Fira Code',ui-monospace,monospace; }
@@ -38,7 +38,7 @@
   <text x="164" y="119" class="mono spec" fill="#ADFF8F">48 GB+</text>
   <text x="262" y="119" class="mono val">Qwen3.8-Flash-Next</text>
   <text x="560" y="119" class="mono val">auto</text>
-  <text x="662" y="119" class="mono val">~80–160 tok/s</text>
+  <text x="662" y="119" class="mono val">~80 to 160 tok/s</text>
   <line x1="22" y1="132" x2="778" y2="132" stroke="#141A12" stroke-width="1"/>
 
   <!-- row 2 · same card, under 48GB RAM → full-accuracy Qwen3.8-27B -->
@@ -46,7 +46,7 @@
   <text x="164" y="155" class="mono val-dim">under 48 GB</text>
   <text x="262" y="155" class="mono val-dim">Qwen3.8-27B-UD-Q4_K_M</text>
   <text x="560" y="155" class="mono val-dim">168k</text>
-  <text x="662" y="155" class="mono val-dim">~45–70 tok/s</text>
+  <text x="662" y="155" class="mono val-dim">~45 to 70 tok/s</text>
   <line x1="22" y1="168" x2="778" y2="168" stroke="#141A12" stroke-width="1"/>
 
   <!-- row 3 · 16GB VRAM → Qwen3.8-27B IQ3_XXS -->
@@ -54,7 +54,7 @@
   <text x="164" y="191" class="mono val-dim">any</text>
   <text x="262" y="191" class="mono val-dim">Qwen3.8-27B-UD-IQ3_XXS</text>
   <text x="560" y="191" class="mono val-dim">96k</text>
-  <text x="662" y="191" class="mono val-dim">~20–42 tok/s</text>
+  <text x="662" y="191" class="mono val-dim">~20 to 42 tok/s</text>
   <line x1="22" y1="204" x2="778" y2="204" stroke="#141A12" stroke-width="1"/>
 
   <!-- row 4 · 12GB VRAM → Bonsai PQ2_0 -->
@@ -62,7 +62,7 @@
   <text x="164" y="227" class="mono val-dim">any</text>
   <text x="262" y="227" class="mono val-dim">Ternary-Bonsai-2-27B PQ2_0</text>
   <text x="560" y="227" class="mono val-dim">96k</text>
-  <text x="662" y="227" class="mono val-dim">~28–32 tok/s</text>
+  <text x="662" y="227" class="mono val-dim">~28 to 32 tok/s</text>
   <line x1="22" y1="240" x2="778" y2="240" stroke="#141A12" stroke-width="1"/>
 
   <!-- row 5 · AMD iGPU (UMA) → Bonsai PQ2_0 -->
@@ -70,8 +70,8 @@
   <text x="164" y="263" class="mono val-dim">32 GB+</text>
   <text x="262" y="263" class="mono val-dim">Ternary-Bonsai-2-27B PQ2_0</text>
   <text x="560" y="263" class="mono val-dim">168k</text>
-  <text x="662" y="263" class="mono val-dim">~17–20 tok/s</text>
+  <text x="662" y="263" class="mono val-dim">~17 to 20 tok/s</text>
 
   <line x1="22" y1="276" x2="778" y2="276" stroke="#1C231A" stroke-width="1"/>
-  <text x="34" y="292" class="mono foot">Contexts are as shipped, with vision on — declining it restores the full tier context.</text>
+  <text x="34" y="292" class="mono foot">Contexts are as shipped, with vision on. Declining it restores the full tier context.</text>
 </svg>
